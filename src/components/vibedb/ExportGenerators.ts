@@ -76,6 +76,76 @@ export function sanitizeColumnsForSQL(columns: Column[]): Column[] {
   return fixed;
 }
 
+// ─── Index deduplication utilities ───────────────────────
+
+/** Normalize index columns to a canonical key for comparison */
+export function indexColumnKey(columns: string[]): string {
+  return columns.map(c => c.toLowerCase().trim()).sort().join(",");
+}
+
+/** Check if an index with the same columns already exists */
+export function findDuplicateIndex(
+  existingIndexes: { name: string; columns: string[]; unique: boolean }[] | undefined,
+  newColumns: string[]
+): { name: string; columns: string[]; unique: boolean } | null {
+  if (!existingIndexes || existingIndexes.length === 0) return null;
+  const newKey = indexColumnKey(newColumns);
+  return existingIndexes.find(idx => indexColumnKey(idx.columns) === newKey) || null;
+}
+
+/** Scan all tables and remove duplicate indexes and columns */
+export function deduplicateSchema(tables: TableNode[]): {
+  fixedItems: TableNode[];
+  duplicateIndexesRemoved: number;
+  duplicateColumnsRemoved: number;
+} {
+  let duplicateIndexesRemoved = 0;
+  let duplicateColumnsRemoved = 0;
+
+  const fixedItems = tables.map(t => {
+    // Deduplicate columns
+    const seenCols = new Set<string>();
+    const dedupedCols: Column[] = [];
+    for (const col of t.columns) {
+      const key = col.name.toLowerCase();
+      if (!key || seenCols.has(key)) {
+        if (key) duplicateColumnsRemoved++;
+        continue;
+      }
+      seenCols.add(key);
+      dedupedCols.push(col);
+    }
+
+    // Deduplicate indexes — keep unique over non-unique when same columns
+    const seenIdxKeys = new Map<string, number>(); // key → index in dedupedIndexes
+    const dedupedIndexes: typeof t.indexes = [];
+    if (t.indexes) {
+      for (const idx of t.indexes) {
+        const key = indexColumnKey(idx.columns);
+        const existingPos = seenIdxKeys.get(key);
+        if (existingPos !== undefined) {
+          // Duplicate — if new one is unique and old isn't, replace
+          if (idx.unique && !dedupedIndexes[existingPos]!.unique) {
+            dedupedIndexes[existingPos] = idx;
+          }
+          duplicateIndexesRemoved++;
+        } else {
+          seenIdxKeys.set(key, dedupedIndexes.length);
+          dedupedIndexes.push(idx);
+        }
+      }
+    }
+
+    return {
+      ...t,
+      columns: dedupedCols,
+      indexes: dedupedIndexes.length > 0 ? dedupedIndexes : t.indexes,
+    };
+  });
+
+  return { fixedItems, duplicateIndexesRemoved, duplicateColumnsRemoved };
+}
+
 // ─── Detect FK references to tables that don't exist in the schema ───
 export function detectMissingFKTargets(tables: TableNode[]): { table: string; column: string; missingRef: string }[] {
   const tableNames = new Set(tables.map(t => t.name.toLowerCase()));

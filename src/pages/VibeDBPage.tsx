@@ -22,6 +22,7 @@ import {
   generateSQL, generateSQLDeferred, generatePrismaSchema, generateDrizzleSchema,
   generateGraphQLTypes, generateCSV, detectMissingFKTargets,
   diagnoseAndFixSchema, preDeployValidateSchema, type FixResult,
+  findDuplicateIndex, deduplicateSchema,
 } from "@/components/vibedb/ExportGenerators";
 
 // ─── Types ──────────────────────────────────────────────
@@ -944,7 +945,10 @@ const VibeDBPage = () => {
           if (c.isForeignKey && c.linkedTable) s += ` FK->${c.linkedTable}.${c.linkedColumn || "id"}`;
           return s;
         }).join(", ");
-        return `${t.name}(${cols})`;
+        const idxStr = t.indexes && t.indexes.length > 0
+          ? ` | IDX: ${t.indexes.map(idx => `${idx.name}(${idx.columns.join(",")})${idx.unique ? " UQ" : ""}`).join("; ")}`
+          : "";
+        return `${t.name}(${cols})${idxStr}`;
       }).join("\n");
       const contextStr = `Tables:\n${compactSchema}${lintIssues.length > 0 ? `\n\nLint issues:\n${lintIssues.map(i => i.message).join("\n")}` : ""}${fkIssues.length > 0 ? `\n\nFK issues:\n${fkIssues.map(i => i.message).join("\n")}` : ""}`;
       const resultStr = await callAI("inspect-schema", "Inspect this schema thoroughly", contextStr);
@@ -952,6 +956,18 @@ const VibeDBPage = () => {
       setAuditReport({ ...result, lintIssues, fkIssues });
     } catch (err: any) { addToast(err?.message || "Audit failed", "error"); setAuditReport({ lintIssues: [], fkIssues: [], issues: [{ severity: "error", message: err?.message || "Failed to run AI audit" }] }); }
     finally { setIsAuditing(false); }
+  };
+
+  const handleDeduplicate = () => {
+    if (canvasItems.length === 0) { addToast("No tables to deduplicate", "info"); return; }
+    const { fixedItems, duplicateIndexesRemoved, duplicateColumnsRemoved } = deduplicateSchema(canvasItems);
+    const total = duplicateIndexesRemoved + duplicateColumnsRemoved;
+    if (total === 0) { addToast("No duplicates found", "info"); return; }
+    setCanvasItems(fixedItems);
+    const parts: string[] = [];
+    if (duplicateIndexesRemoved > 0) parts.push(`${duplicateIndexesRemoved} duplicate index${duplicateIndexesRemoved !== 1 ? "es" : ""}`);
+    if (duplicateColumnsRemoved > 0) parts.push(`${duplicateColumnsRemoved} duplicate column${duplicateColumnsRemoved !== 1 ? "s" : ""}`);
+    addToast(`Removed ${parts.join(" and ")}`, "success");
   };
 
   const handleApplySuggestion = (suggestion: any, silent = false) => {
@@ -985,6 +1001,12 @@ const VibeDBPage = () => {
         }
         case "add_index": {
           const idxCols = payload.columns || [];
+          const targetT = canvasItems.find(t => t.name.toLowerCase() === targetTable.toLowerCase());
+          const existingDup = findDuplicateIndex(targetT?.indexes, idxCols);
+          if (existingDup) {
+            if (!silent) addToast(`Index on ${targetTable}(${idxCols.join(", ")}) already exists — skipped`, "info");
+            break;
+          }
           setCanvasItems(prev => prev.map(t => {
             if (t.name.toLowerCase() !== targetTable.toLowerCase()) return t;
             const newIdx = { name: `idx_${t.name}_${idxCols.join("_")}`, columns: idxCols, type: "btree", unique: payload.unique || false };
@@ -1201,9 +1223,12 @@ const VibeDBPage = () => {
               break;
             }
             case "add_index": {
+              const batchIdxCols = c.columns || [];
+              const batchTargetT = canvasItems.find(t => t.name.toLowerCase() === target);
+              if (findDuplicateIndex(batchTargetT?.indexes, batchIdxCols)) break;
               setCanvasItems(prev => prev.map(t => {
                 if (t.name.toLowerCase() !== target) return t;
-                return { ...t, indexes: [...(t.indexes || []), { name: c.name || `idx_${t.name}_${(c.columns || []).join("_")}`, columns: c.columns || [], type: "btree", unique: c.unique || false }] };
+                return { ...t, indexes: [...(t.indexes || []), { name: c.name || `idx_${t.name}_${batchIdxCols.join("_")}`, columns: batchIdxCols, type: "btree", unique: c.unique || false }] };
               }));
               applied++;
               break;
@@ -1635,6 +1660,9 @@ const VibeDBPage = () => {
         <button onClick={() => setShowBatchModal(true)} className="flex items-center gap-1.5 rounded-lg bg-secondary px-3 py-1.5 text-xs font-semibold text-secondary-foreground hover:bg-secondary/80 transition"><Edit3 size={14} /> Batch Edit</button>
         <button onClick={handleAudit} className="flex items-center gap-1.5 rounded-lg bg-secondary px-3 py-1.5 text-xs font-semibold text-secondary-foreground hover:bg-secondary/80 transition">
           {isAuditing ? <Loader2 size={14} className="animate-spin" /> : <ShieldCheck size={14} />} Audit
+        </button>
+        <button onClick={handleDeduplicate} className="flex items-center gap-1.5 rounded-lg bg-secondary px-3 py-1.5 text-xs font-semibold text-secondary-foreground hover:bg-secondary/80 transition">
+          <RefreshCw size={14} /> Dedup
         </button>
         <button onClick={handleGenerateMockData} className="flex items-center gap-1.5 rounded-lg bg-secondary px-3 py-1.5 text-xs font-semibold text-secondary-foreground hover:bg-secondary/80 transition"><DatabaseZap size={14} /> Seed Data</button>
 

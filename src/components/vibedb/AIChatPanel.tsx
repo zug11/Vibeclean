@@ -2,6 +2,7 @@ import React, { useState, useRef, useEffect, useCallback } from "react";
 import { AnimatePresence, motion } from "framer-motion";
 import { MessageCircle, Send, X, Loader2, CheckCircle2, Sparkles, ChevronRight, AlertCircle } from "lucide-react";
 import { v4 as uuidv4 } from "uuid";
+import { findDuplicateIndex } from "@/components/vibedb/ExportGenerators";
 
 // ─── Types ───────────────────────────────────────────────
 
@@ -444,6 +445,8 @@ const AIChatPanel: React.FC<AIChatPanelProps> = ({
           break;
         }
         case "add_index": {
+          const chatTargetT = canvasItems.find(t => t.name.toLowerCase() === p.targetTable.toLowerCase());
+          if (findDuplicateIndex(chatTargetT?.indexes, p.columns)) break;
           setCanvasItems((prev: TableNode[]) => prev.map(t => {
             if (t.name.toLowerCase() !== p.targetTable.toLowerCase()) return t;
             const newIdx = {
