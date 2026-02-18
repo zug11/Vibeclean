@@ -1,0 +1,20 @@
+[functions.create-checkout]
+verify_jwt = false
+
+[functions.check-subscription]
+verify_jwt = false
+
+[functions.customer-portal]
+verify_jwt = false
+
+[functions.buy-credits]
+verify_jwt = false
+
+[functions.stripe-webhook]
+verify_jwt = false
+
+[functions.vibedb-ai]
+verify_jwt = false
+
+[functions.vibedb-deploy]
+verify_jwt = false

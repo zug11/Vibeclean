@@ -1,0 +1,7 @@
+node_modules/
+dist/
+.env
+.env.save
+.DS_Store
+Terminal Saved Output.txt
+supabase/.temp/
