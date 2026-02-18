@@ -264,4 +264,4 @@ vibedb/
 
 ## License
 
-MIT
+BSL
