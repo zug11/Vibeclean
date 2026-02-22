@@ -20,6 +20,7 @@ interface TableNode {
   y: number;
   indexes?: { name: string; columns: string[]; type: string; unique: boolean; where?: string }[];
   checkConstraints?: { name: string; expression: string }[];
+  dataRows?: Record<string, string>[];
 }
 
 export interface SchemaEnum {
@@ -46,34 +47,25 @@ export function sanitizeColumnsForSQL(columns: Column[]): Column[] {
     deduped.push(col);
   }
 
-  // Ensure 'id' column exists — if missing, prepend one (FKs default to referencing id)
-  const hasId = deduped.some(c => c.name.toLowerCase() === "id");
-  if (!hasId) {
-    deduped.unshift({
-      id: "sanitize-" + Math.random().toString(36).slice(2, 9),
-      name: "id",
-      type: "uuid",
-      constraints: [{ type: "primary" }, { type: "notNull" }],
-    });
+  // Check if user has explicitly defined any primary keys
+  const userDefinedPKs = deduped.filter(col => col.constraints?.some(c => c.type === "primary"));
+
+  // If no PKs exist, ensure an 'id' column exists and is the PK
+  if (userDefinedPKs.length === 0) {
+    const idCol = deduped.find(c => c.name.toLowerCase() === "id");
+    if (idCol) {
+      idCol.constraints = [{ type: "primary" }, ...(idCol.constraints || []).filter(c => c.type !== "primary")];
+    } else {
+      deduped.unshift({
+        id: simpleId(),
+        name: "id",
+        type: "uuid",
+        constraints: [{ type: "primary" }, { type: "notNull" }],
+      });
+    }
   }
 
-  // Ensure exactly one PK: should be on 'id' column
-  const fixed = deduped.map(col => {
-    const isPK = col.constraints?.some(c => c.type === "primary");
-    if (col.name.toLowerCase() === "id") {
-      if (!isPK) {
-        return { ...col, constraints: [{ type: "primary" }, ...(col.constraints || []).filter(c => c.type !== "primary")] };
-      }
-      return col;
-    }
-    // Remove PK from non-id columns to avoid "multiple primary keys" error
-    if (isPK) {
-      return { ...col, constraints: (col.constraints || []).filter(c => c.type !== "primary") };
-    }
-    return col;
-  });
-
-  return fixed;
+  return deduped;
 }
 
 // ─── Index deduplication utilities ───────────────────────
@@ -193,6 +185,8 @@ export interface FixResult {
   actions: FixAction[];
   hasUnfixable: boolean;
   deferForeignKeys?: boolean; // Signal to regenerate SQL with deferred FK constraints
+  forceRegenerate?: boolean; // SQL must be regenerated even if schema unchanged
+  initialErrors?: { statement: string; success: boolean; error?: string }[]; // The errors that triggered this fix pass
 }
 
 // Extract table name from a CREATE TABLE statement (may be truncated to 80 chars)
@@ -366,6 +360,9 @@ function classifyDeployError(result: { statement: string; success: boolean; erro
 
 // Simple UUID generator (avoids importing uuid in this utility file)
 function simpleId(): string {
+  if (typeof crypto !== "undefined" && crypto.randomUUID) {
+    return "fix-" + crypto.randomUUID();
+  }
   return "fix-" + Math.random().toString(36).slice(2, 11) + "-" + Date.now().toString(36);
 }
 
@@ -411,15 +408,7 @@ export function preDeployValidateSchema(
       colNames.add(key);
     }
 
-    // Check for multiple primary keys
-    const pkCols = t.columns.filter(c => c.constraints?.some(x => x.type === "primary"));
-    if (pkCols.length > 1) {
-      syntheticErrors.push({
-        statement: stmt,
-        success: false,
-        error: JSON.stringify({ code: "42P16", message: `multiple primary keys for table "${t.name}" are not allowed` }),
-      });
-    }
+    // Multiple primary keys are allowed and handled via table-level constraints during generation
   }
 
   return syntheticErrors;
@@ -458,11 +447,13 @@ export function diagnoseAndFixSchema(
 
   if (classified.length === 0) {
     console.warn("[VibeDB Fix] No errors classified — returning 0 fixes. This is likely a parsing bug.");
-    return { fixedItems: canvasItems, actions: [], hasUnfixable: false };
+    return { fixedItems: canvasItems, actions: [], hasUnfixable: false, initialErrors: deployResults };
   }
 
   // 2. Deep clone canvas items
-  const fixedItems: TableNode[] = JSON.parse(JSON.stringify(canvasItems));
+  const fixedItems: TableNode[] = typeof structuredClone === "function"
+    ? structuredClone(canvasItems)
+    : JSON.parse(JSON.stringify(canvasItems));
   const actions: FixAction[] = [];
   const existingTableNames = new Set(fixedItems.map(t => t.name.toLowerCase()));
   const createdTableNames = new Set<string>();
@@ -569,7 +560,7 @@ export function diagnoseAndFixSchema(
     }
   }
 
-  // 5. Process MULTIPLE_PKS errors — fix primary key constraints
+  // 5. Process MULTIPLE_PKS errors
   const multiPkErrors = classified.filter(e => e.code === "MULTIPLE_PKS");
   const multiPkTableNames = new Set(multiPkErrors.map(e => e.tableName).filter(Boolean) as string[]);
 
@@ -578,37 +569,27 @@ export function diagnoseAndFixSchema(
     if (tableIdx === -1) continue;
 
     const table = fixedItems[tableIdx];
-    let hasId = false;
+    const pkCols = table.columns.filter(c => c.constraints?.some(x => x.type === "primary"));
 
-    table.columns = table.columns.map(col => {
-      const isPK = col.constraints?.some(c => c.type === "primary");
-      if (col.name.toLowerCase() === "id") {
-        hasId = true;
-        if (!isPK) {
-          return { ...col, constraints: [{ type: "primary" }, { type: "notNull" }, ...(col.constraints || []).filter(c => c.type !== "primary" && c.type !== "notNull")] };
-        }
-        return col;
-      }
-      if (isPK) {
-        return { ...col, constraints: (col.constraints || []).filter(c => c.type !== "primary") };
-      }
-      return col;
-    });
-
-    // If no id column, prepend one
-    if (!hasId) {
-      table.columns.unshift({
-        id: simpleId(), name: "id", type: "uuid",
-        constraints: [{ type: "primary" }, { type: "notNull" }],
-        fkStatus: "resolved",
+    if (pkCols.length > 1) {
+      // Composite PK — generator handles this via table-level constraint.
+      // Signal that SQL must be regenerated for the fix to take effect.
+      needsDeferredFKs = true; // forces generateSQLDeferred which handles composite PKs
+      actions.push({
+        type: "fix_pks",
+        tableName,
+        description: `Composite PK on (${pkCols.map(c => c.name).join(", ")}) — SQL regenerated with table-level constraint`,
       });
+    } else if (pkCols.length === 0) {
+      // No PK at all — add one to id or prepend id
+      const idCol = table.columns.find(c => c.name.toLowerCase() === "id");
+      if (idCol) {
+        idCol.constraints = [{ type: "primary" }, ...(idCol.constraints || []).filter(c => c.type !== "primary")];
+      } else {
+        table.columns.unshift({ id: simpleId(), name: "id", type: "uuid", constraints: [{ type: "primary" }, { type: "notNull" }], fkStatus: "resolved" });
+      }
+      actions.push({ type: "fix_pks", tableName, description: "No PK found — added id as primary key" });
     }
-
-    actions.push({
-      type: "fix_pks",
-      tableName,
-      description: "Fixed to single primary key on id column",
-    });
   }
 
   // 5b. Process MISSING_FK_COLUMN errors — the FK target table doesn't have the referenced column (usually "id")
@@ -670,11 +651,21 @@ export function diagnoseAndFixSchema(
     }
   }
 
-  // If we have MISSING_FK_COLUMN errors but couldn't identify specific targets,
-  // ensure ALL tables in the schema have an id column (safe broad fix)
+  // Intelligent fallback: Scan all foreign keys on the canvas and verify their targets actually exist
   if (missingFKColErrors.length > 0 && missingFKColTableNames.size === 0) {
     for (const t of fixedItems) {
-      missingFKColTableNames.add(t.name.toLowerCase());
+      for (const c of t.columns) {
+        if (c.isForeignKey && c.linkedTable) {
+          const targetTable = fixedItems.find(x => x.name.toLowerCase() === c.linkedTable!.toLowerCase());
+          if (targetTable) {
+            const targetColName = c.linkedColumn || findPKColumn(fixedItems, targetTable.name);
+            const hasTargetCol = targetTable.columns.some(tc => tc.name.toLowerCase() === targetColName.toLowerCase());
+            if (!hasTargetCol) {
+              missingFKColTableNames.add(targetTable.name.toLowerCase());
+            }
+          }
+        }
+      }
     }
   }
 
@@ -736,11 +727,17 @@ export function diagnoseAndFixSchema(
     t.columns = sanitizeColumnsForSQL(t.columns);
   }
 
+  const schemaChangingActions: FixAction["type"][] = [
+    "create_table", "dedup_columns", "fix_pks", "fix_missing_pk_col", "reorder_fks"
+  ];
+
   return {
     fixedItems,
     actions,
     hasUnfixable: unknownErrors.length > 0,
     deferForeignKeys: needsDeferredFKs,
+    forceRegenerate: needsDeferredFKs || actions.some(a => schemaChangingActions.includes(a.type)),
+    initialErrors: deployResults,
   };
 }
 
@@ -762,6 +759,22 @@ function findPKColumn(tables: TableNode[], tableName: string): string {
   if (!table) return "id";
   const pkCol = table.columns.find(c => c.constraints?.some(con => con.type === "primary"));
   return pkCol ? pkCol.name : "id";
+}
+
+// Deduplicate values inside IN (...) lists in a CHECK constraint expression.
+// Handles AI-generated constraints that may contain repeated enum values (e.g. 'plague' twice).
+function deduplicateInListExpression(expression: string): string {
+  return expression.replace(/\bIN\s*\(([^)]+)\)/gi, (_match, inner: string) => {
+    const values = inner.split(",").map((v: string) => v.trim());
+    const seen = new Set<string>();
+    const deduped = values.filter((v: string) => {
+      const key = v.toLowerCase();
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+    return `IN (${deduped.join(", ")})`;
+  });
 }
 
 function generateSQLInternal(tables: TableNode[], deferFKs: boolean, enums?: SchemaEnum[], functions?: SchemaFunction[]): string {
@@ -819,10 +832,12 @@ function generateSQLInternal(tables: TableNode[], deferFKs: boolean, enums?: Sch
 
     sql += `CREATE TABLE ${t.name} (\n`;
     const lines: string[] = [];
+    const pkCols = cleanColumns.filter(c => c.constraints?.some(con => con.type === "primary"));
+
     cleanColumns.forEach(col => {
       let line = `  ${col.name} ${col.type.toUpperCase()}`;
       col.constraints?.forEach(c => {
-        if (c.type === "primary") line += " PRIMARY KEY";
+        if (c.type === "primary" && pkCols.length === 1) line += " PRIMARY KEY";
         if (c.type === "notNull") line += " NOT NULL";
         if (c.type === "unique") line += " UNIQUE";
         if (c.type === "default" && c.value) {
@@ -856,6 +871,12 @@ function generateSQLInternal(tables: TableNode[], deferFKs: boolean, enums?: Sch
       }
       lines.push(line);
     });
+
+    // Add table-level composite primary key if multiple PKs defined
+    if (pkCols.length > 1) {
+      lines.push(`  PRIMARY KEY (${pkCols.map(c => c.name).join(", ")})`);
+    }
+
     sql += lines.join(",\n");
     sql += "\n);\n\n";
   });
@@ -876,7 +897,7 @@ function generateSQLInternal(tables: TableNode[], deferFKs: boolean, enums?: Sch
     sql += "-- CHECK Constraints\n";
     for (const t of allChecks) {
       for (const chk of t.checkConstraints!) {
-        sql += `ALTER TABLE ${t.name} ADD CONSTRAINT ${chk.name} CHECK (${chk.expression});\n`;
+        sql += `ALTER TABLE ${t.name} ADD CONSTRAINT ${chk.name} CHECK (${deduplicateInListExpression(chk.expression)});\n`;
       }
     }
     sql += "\n";
@@ -901,6 +922,38 @@ function generateSQLInternal(tables: TableNode[], deferFKs: boolean, enums?: Sch
     sql += "-- Functions & Triggers\n";
     for (const fn of functions) {
       sql += fn.body + "\n\n";
+    }
+  }
+
+  // Initial Data Insertion
+  const tablesWithData = sorted.filter(t => t.dataRows && t.dataRows.length > 0);
+  if (tablesWithData.length > 0) {
+    sql += "-- Initial Data / Seeds\n";
+    for (const t of tablesWithData) {
+      for (const row of t.dataRows!) {
+        const columns = Object.keys(row);
+        // Only include columns that belong to the table schema (just in case)
+        const validColumns = columns.filter(c => t.columns.some(tc => tc.name === c));
+        if (validColumns.length === 0) continue;
+
+        const vals = validColumns.map(col => {
+          const val = row[col];
+          if (val === null || val === undefined || val === "") return "NULL";
+          // Basic check if it's a number/boolean that doesn't need quotes
+          const colDef = t.columns.find(tc => tc.name === col);
+          const type = colDef?.type.toLowerCase() || "varchar";
+          if ((type === "int" || type === "numeric" || type === "float" || type === "decimal") && !isNaN(Number(val))) {
+            return val;
+          }
+          if (type === "boolean" && (val.toLowerCase() === "true" || val.toLowerCase() === "false")) {
+            return val.toLowerCase();
+          }
+          // Wrap in single quotes and escape existing single quotes
+          return `'${val.replace(/'/g, "''")}'`;
+        });
+        sql += `INSERT INTO ${t.name} (${validColumns.join(", ")}) VALUES (${vals.join(", ")});\n`;
+      }
+      sql += "\n";
     }
   }
 
@@ -932,7 +985,9 @@ function topologicalSort(tables: TableNode[]): TableNode[] {
 
   function visit(name: string) {
     if (visited.has(name)) return;
-    if (visiting.has(name)) return;
+    if (visiting.has(name)) {
+      throw new Error(`Circular dependency detected involving table "${name}". Please use Deferred FK constraints.`);
+    }
     visiting.add(name);
     const tableDeps = deps.get(name);
     if (tableDeps) {

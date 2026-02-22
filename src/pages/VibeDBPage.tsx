@@ -49,6 +49,11 @@ interface TableNode {
   checkConstraints?: { name: string; expression: string }[];
   description?: string;
   isReordering?: boolean;
+  dataRows?: Record<string, string>[];
+  importedData?: {
+    headers: string[];
+    rows: string[][];
+  };
 }
 
 // Schema-level objects (enums, functions/triggers) stored alongside canvas items
@@ -113,6 +118,221 @@ function lintSchema(tables: TableNode[], convention = "snake_case") {
   return issues;
 }
 
+// ─── CSV Parser ──────────────────────────────────────────
+function parseCSVData(csvText: string, tableName = "imported_table"): { tables: Omit<TableNode, "x" | "y">[] } {
+  const lines = csvText.trim().split(/\r?\n/);
+  if (lines.length < 2) throw new Error("CSV must have at least a header row and one data row.");
+
+  function splitCSVRow(line: string) {
+    const values: string[] = [];
+    let cur = "";
+    let inQuote = false;
+    // Check if it's tab separated
+    const isTSV = line.includes('\t') && !line.includes('","');
+    const separator = isTSV ? '\t' : ',';
+
+    for (let i = 0; i < line.length; i++) {
+      if (line[i] === '"') {
+        inQuote = !inQuote;
+      } else if (line[i] === separator && !inQuote) {
+        values.push(cur);
+        cur = "";
+      } else {
+        cur += line[i];
+      }
+    }
+    values.push(cur);
+    return values.map(v => v.trim());
+  }
+
+  const headers = splitCSVRow(lines[0]).map(h => h.toLowerCase().trim());
+  const dataRows = lines.slice(1).map(splitCSVRow).filter(r => r.length === headers.length || r.some(c => c !== ""));
+
+  // Check if this is a Schema CSV Export (Table, Column, Type, Constraints, Foreign Key)
+  const isSchemaCSV = headers.includes("table") && headers.includes("column") && headers.includes("type");
+
+  if (isSchemaCSV) {
+    const tableMap = new Map<string, Omit<TableNode, "x" | "y">>();
+
+    // Find index of headers
+    const tIdx = headers.indexOf("table");
+    const cIdx = headers.indexOf("column");
+    const typeIdx = headers.indexOf("type");
+    const constrIdx = headers.indexOf("constraints");
+    const fkIdx = headers.indexOf("foreign key");
+
+    for (const row of dataRows) {
+      if (row.length <= Math.max(tIdx, cIdx, typeIdx)) continue;
+      const tName = row[tIdx] || "unknown_table";
+      const cName = row[cIdx];
+      const colType = row[typeIdx] || "varchar";
+      const constraintsStr = constrIdx >= 0 ? row[constrIdx] : "";
+      const fkStr = fkIdx >= 0 ? row[fkIdx] : "";
+
+      if (!cName) continue;
+
+      if (!tableMap.has(tName)) {
+        tableMap.set(tName, {
+          id: uuidv4(),
+          name: tName,
+          columns: []
+        });
+      }
+
+      const table = tableMap.get(tName)!;
+
+      const constraints: { type: string; value?: string }[] = [];
+      if (constraintsStr) {
+        const parts = constraintsStr.split("|").map(s => s.trim().toLowerCase());
+        if (parts.includes("primary")) constraints.push({ type: "primary" });
+        if (parts.includes("notnull")) constraints.push({ type: "notNull" });
+        if (parts.includes("unique")) constraints.push({ type: "unique" });
+        if (parts.includes("default")) constraints.push({ type: "default" }); // simplistic default extraction
+      }
+
+      let isForeignKey = false;
+      let linkedTable: string | undefined = undefined;
+      let linkedColumn: string | undefined = undefined;
+
+      if (fkIdx >= 0) {
+        if (fkStr && fkStr.toLowerCase().startsWith("ref:")) {
+          isForeignKey = true;
+          const refParts = fkStr.substring(4).trim().split(".");
+          if (refParts.length === 2) {
+            linkedTable = refParts[0];
+            linkedColumn = refParts[1];
+          } else {
+            linkedTable = fkStr.substring(4).trim();
+            linkedColumn = "id";
+          }
+        }
+      } else if (cName.toLowerCase().endsWith("_id")) {
+        // Fallback heuristic if not explicitly defined in a non FK explicit schema
+        isForeignKey = true;
+        linkedTable = cName.toLowerCase().replace("_id", "");
+        if (linkedTable.endsWith("s")) linkedTable = linkedTable.slice(0, -1);
+        linkedTable = linkedTable + "s";
+        linkedColumn = "id";
+      }
+
+      table.columns.push({
+        id: uuidv4(),
+        name: cName,
+        type: colType,
+        isForeignKey,
+        linkedTable,
+        linkedColumn,
+        fkStatus: isForeignKey ? "unresolved" : "resolved",
+        constraints
+      });
+    }
+
+    return { tables: Array.from(tableMap.values()) };
+  }
+
+  // Otherwise, fallback to generic Data row inference for a single flat table
+  const columns = headers.map((header, colIndex) => {
+    let type = "varchar";
+    let isForeignKey = false;
+    let linkedTable: string | undefined = undefined;
+
+    const lowerHeader = header.toLowerCase();
+    if (lowerHeader.endsWith("_id")) {
+      isForeignKey = true;
+      linkedTable = lowerHeader.replace("_id", "");
+      if (linkedTable.endsWith("s")) linkedTable = linkedTable.slice(0, -1);
+      linkedTable = linkedTable + "s";
+    }
+
+    let isUuid = true;
+    let isBoolean = true;
+    let isInteger = true;
+    let isNumeric = true;
+    let isTimestamp = true;
+    let isJsonb = true;
+
+    for (const row of dataRows) {
+      if (!row[colIndex]) {
+        continue;
+      }
+      const val = row[colIndex];
+      const ln = val.toLowerCase();
+
+      if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(val)) isUuid = false;
+      if (ln !== "true" && ln !== "false" && ln !== "1" && ln !== "0") isBoolean = false;
+      if (!/^-?\d+$/.test(val)) isInteger = false;
+      if (!/^-?\d+(\.\d+)?$/.test(val)) isNumeric = false;
+      if (isNaN(Date.parse(val)) || /^\d+$/.test(val)) isTimestamp = false;
+      if (typeof val === 'string' && (!val.startsWith('{') && !val.startsWith('['))) isJsonb = false;
+      try {
+        if (isJsonb) JSON.parse(val);
+      } catch (e) {
+        isJsonb = false;
+      }
+    }
+
+    if (isUuid) type = "uuid";
+    else if (isBoolean) type = "boolean";
+    else if (isInteger) type = "int";
+    else if (isNumeric) type = "numeric";
+    else if (isTimestamp) type = "timestamp";
+    else if (isJsonb) type = "jsonb";
+
+    const cleanName = header.toLowerCase().replace(/[^a-z0-9_]/g, "_");
+
+    return {
+      id: uuidv4(),
+      name: cleanName || `col_${colIndex}`,
+      type: type,
+      isForeignKey,
+      linkedTable,
+      fkStatus: isForeignKey ? "unresolved" : "resolved",
+      constraints: cleanName === "id" ? [{ type: "primary" }, { type: "notNull" }] : []
+    };
+  });
+
+  if (!columns.some(c => c.name === "id")) {
+    columns.unshift({
+      id: uuidv4(),
+      name: "id",
+      type: "uuid",
+      constraints: [{ type: "primary" }, { type: "notNull" }],
+      fkStatus: "resolved",
+      isForeignKey: false,
+      linkedTable: undefined
+    });
+  }
+
+  const generatedRows = dataRows.map((row, rIdx) => {
+    const obj: Record<string, string> = {};
+    let hasIdVal = false;
+    headers.forEach((h, i) => {
+      const colName = h.toLowerCase().replace(/[^a-z0-9_]/g, "_") || `col_${i}`;
+      if (colName === 'id') hasIdVal = !!row[i];
+      obj[colName] = row[i];
+    });
+    // Ensure every row has an 'id' if we added the 'id' column
+    if (!hasIdVal) {
+      // If we didn't have an ID column in the CSV, just generate one for the dataRow
+      obj['id'] = uuidv4();
+    }
+    return obj;
+  });
+
+  const table: Omit<TableNode, "x" | "y"> = {
+    id: uuidv4(),
+    name: tableName,
+    columns,
+    dataRows: generatedRows,
+    importedData: {
+      headers: headers,
+      rows: dataRows
+    }
+  };
+
+  return { tables: [table] };
+}
+
 // ─── SQL DDL Parser ─────────────────────────────────────
 function parseSQLDDL(sql: string): { tables: Omit<TableNode, "x" | "y">[] } {
   const tables: Omit<TableNode, "x" | "y">[] = [];
@@ -171,7 +391,7 @@ function robustJsonParse(str: string): any {
   str = str.replace(/```json\n?/gi, "").replace(/```sql\n?/gi, "").replace(/```\n?/g, "").trim();
 
   // Step 2: Try direct parse first
-  try { return JSON.parse(str); } catch {}
+  try { return JSON.parse(str); } catch { }
 
   // Step 3: Extract JSON object/array from surrounding text
   const firstBrace = str.search(/[{\[]/);
@@ -179,7 +399,7 @@ function robustJsonParse(str: string): any {
   if (firstBrace !== -1 && lastClose > firstBrace) {
     str = str.substring(firstBrace, lastClose + 1);
   }
-  try { return JSON.parse(str); } catch {}
+  try { return JSON.parse(str); } catch { }
 
   // Step 4: Fix common issues
   let cleaned = str;
@@ -192,7 +412,7 @@ function robustJsonParse(str: string): any {
   cleaned = cleaned.replace(/:\s*'([^']*)'/g, ': "$1"');
   // Remove control characters inside strings
   cleaned = cleaned.replace(/[\x00-\x1f]/g, (ch) => ch === "\n" || ch === "\r" || ch === "\t" ? " " : "");
-  try { return JSON.parse(cleaned); } catch {}
+  try { return JSON.parse(cleaned); } catch { }
 
   // Step 5: Try to fix truncated JSON by closing open brackets
   let fixed = cleaned;
@@ -212,7 +432,7 @@ function robustJsonParse(str: string): any {
   fixed = fixed.replace(/,\s*$/, "");
   for (let i = 0; i < openBrackets; i++) fixed += "]";
   for (let i = 0; i < openBraces; i++) fixed += "}";
-  try { return JSON.parse(fixed); } catch {}
+  try { return JSON.parse(fixed); } catch { }
 
   // Give up
   throw new Error("Failed to parse AI response as JSON");
@@ -272,19 +492,30 @@ function sanitizeGeneratedTables(tables: any[]): any[] {
 async function callAI(type: string, prompt: string, context?: string) {
   const supabaseUrl = import.meta.env.VITE_SUPABASE_URL;
   const supabaseKey = import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY;
-  const res = await fetch(`${supabaseUrl}/functions/v1/vibedb-ai`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "Authorization": `Bearer ${supabaseKey}`,
-    },
-    body: JSON.stringify({ type, prompt, context }),
-  });
-  const data = await res.json();
-  if (!res.ok) throw new Error(data?.error || `AI service error (${res.status})`);
-  if (data?.error) throw new Error(data.error);
-  const result = data?.result || "";
-  return result.replace(/```json\n?/g, "").replace(/```sql\n?/g, "").replace(/```\n?/g, "").trim();
+  const controller = new AbortController();
+  const timeoutMs = type === "generate-schema" ? 300000 : 120000; // 5 min for schema gen, 2 min otherwise
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const res = await fetch(`${supabaseUrl}/functions/v1/vibedb-ai`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${supabaseKey}`,
+      },
+      body: JSON.stringify({ type, prompt, context }),
+      signal: controller.signal,
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data?.error || `AI service error (${res.status})`);
+    if (data?.error) throw new Error(data.error);
+    const result = data?.result || "";
+    return result.replace(/```json\n?/g, "").replace(/```sql\n?/g, "").replace(/```\n?/g, "").trim();
+  } catch (err: any) {
+    if (err.name === "AbortError") throw new Error("Request timed out — try a simpler prompt or generate in parts");
+    throw err;
+  } finally {
+    clearTimeout(timeout);
+  }
 }
 
 // ─── Force Layout ───────────────────────────────────────
@@ -375,6 +606,29 @@ const UserMenu = () => {
     </div>
   );
 };
+
+// ─── Thinking Animation (cycling steps during generation) ─
+const THINKING_STEPS = [
+  "Analyzing your requirements...",
+  "Identifying core entities and relationships...",
+  "Designing table structure and columns...",
+  "Planning foreign key relationships...",
+  "Adding constraints and indexes...",
+  "Optimizing schema for production...",
+];
+
+function ThinkingAnimation() {
+  const [step, setStep] = useState(0);
+  useEffect(() => {
+    const interval = setInterval(() => setStep(s => (s + 1) % THINKING_STEPS.length), 2000);
+    return () => clearInterval(interval);
+  }, []);
+  return (
+    <motion.span key={step} initial={{ opacity: 0, y: 6 }} animate={{ opacity: 1, y: 0 }} className="block">
+      {THINKING_STEPS[step]}
+    </motion.span>
+  );
+}
 
 // ─── Main Component ─────────────────────────────────────
 const VibeDBPage = () => {
@@ -541,6 +795,10 @@ const VibeDBPage = () => {
   const [isGeneratingSidebar, setIsGeneratingSidebar] = useState(false);
   const [showChatPanel, setShowChatPanel] = useState(false);
 
+  // AI Thinking
+  const [generationThinking, setGenerationThinking] = useState<string>("");
+  const [thinkingExpanded, setThinkingExpanded] = useState(false);
+
   // Deploy
   const [showDeployModal, setShowDeployModal] = useState(false);
   const [deployUrl, setDeployUrl] = useState(() => localStorage.getItem("vibedb_deploy_url") || "");
@@ -596,23 +854,35 @@ const VibeDBPage = () => {
     setIsGenerating(true);
     setSidebarItems([]);
     setAuditReport(null);
+    setThinkingExpanded(true);
     try {
       const resultStr = await callAI("generate-schema", prompt);
-      const result = robustJsonParse(resultStr);
-      if (result?.tables) {
+      let result = robustJsonParse(resultStr);
+      // Handle AI returning an array instead of { tables: [...] }
+      if (Array.isArray(result)) {
+        result = { tables: result };
+      }
+      if (result?.tables && result.tables.length > 0) {
         const sanitized = sanitizeGeneratedTables(result.tables);
-        const tables = sanitized.map((t: any) => ({
+        const tables = sanitized.map((t: any, i: number) => ({
           ...t,
           id: t.id || uuidv4(),
+          x: 100 + (i % 4) * 350,
+          y: 100 + Math.floor(i / 4) * 400,
           columns: (t.columns || []).map((c: any) => ({
             ...c, id: c.id || uuidv4(), fkStatus: c.isForeignKey ? "resolved" : "resolved", constraints: c.constraints || [],
           })),
         }));
-        setSidebarItems(tables);
-        addToast(`Generated ${tables.length} tables — drag to canvas`, "success");
+        setCanvasItems(prev => [...prev, ...tables]);
+        addToast(`Generated ${tables.length} tables on canvas`, "success");
+      } else {
+        addToast("No tables generated — try a more specific prompt", "warning");
       }
     } catch (err: any) {
-      addToast(err.message || "Failed to generate schema", "error");
+      const msg = err.message?.includes("Failed to fetch") || err.message?.includes("timed out")
+        ? "Generation timed out — the AI is still working. Try again or use a simpler prompt."
+        : err.message || "Failed to generate schema";
+      addToast(msg, "error");
     } finally {
       setIsGenerating(false);
     }
@@ -789,6 +1059,27 @@ const VibeDBPage = () => {
       setDeployResults(data.results || []);
       if (data.success) {
         addToast("Schema deployed successfully!", "success");
+
+        // Self-Healing Telemetry: If this successful deploy immediately followed an auto-fix, log it.
+        if (deployFixResult && deployFixResult.initialErrors && deployFixResult.initialErrors.length > 0) {
+          // Fire and forget telemetry
+          fetch(`${import.meta.env.VITE_SUPABASE_URL}/functions/v1/vibedb-telemetry`, {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              "Authorization": `Bearer ${import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY}`,
+            },
+            body: JSON.stringify({
+              event: "schema_auto_fix_success",
+              initialErrors: deployFixResult.initialErrors,
+              appliedFixes: deployFixResult.actions,
+              finalSql: sql
+            }),
+          }).catch(err => console.error("[VibeDB Telemetry] Failed to log telemetry:", err));
+
+          // Clear the fix result so we don't double log on next deploy
+          setDeployFixResult(null);
+        }
       } else {
         addToast(data.message || "Deploy had errors", "warning");
       }
@@ -847,7 +1138,7 @@ const VibeDBPage = () => {
     const fixableCount = result.actions.filter(a => a.type !== "unfixable" && a.type !== "skip_existing").length;
     addToast(
       `Fixed ${fixableCount} issue${fixableCount !== 1 ? "s" : ""}` +
-        (result.hasUnfixable ? ` (${result.actions.filter(a => a.type === "unfixable").length} unfixable)` : ""),
+      (result.hasUnfixable ? ` (${result.actions.filter(a => a.type === "unfixable").length} unfixable)` : ""),
       result.hasUnfixable ? "warning" : "success"
     );
   };
@@ -898,8 +1189,21 @@ const VibeDBPage = () => {
   // ─── SQL Import ───────────────────────────────────────
   const handleImport = () => {
     try {
-      const result = parseSQLDDL(importText);
-      if (result.tables.length === 0) { addToast("No tables found in SQL", "error"); return; }
+      let result;
+      // Simple heuristic: if it has CREATE TABLE, treat as SQL, else try CSV first
+      if (/CREATE\s+TABLE/i.test(importText)) {
+        result = parseSQLDDL(importText);
+        if (result.tables.length === 0) { addToast("No tables found in SQL", "error"); return; }
+      } else {
+        try {
+          result = parseCSVData(importText);
+        } catch (csvErr) {
+          // fallback to SQL parse if CSV failed
+          result = parseSQLDDL(importText);
+          if (result.tables.length === 0) { addToast("No tables found in input", "error"); return; }
+        }
+      }
+
       const processed = result.tables.map((t, i) => ({
         ...t, x: (-view.x / view.zoom) + 100 + (i % 3) * 300, y: (-view.y / view.zoom) + 100 + Math.floor(i / 3) * 300,
       })) as TableNode[];
@@ -1634,6 +1938,57 @@ const VibeDBPage = () => {
         <UserMenu />
       </div>
 
+      {/* AI Thinking Dropdown */}
+      <AnimatePresence>
+        {(isGenerating || generationThinking) && (
+          <motion.div
+            initial={{ height: 0, opacity: 0 }}
+            animate={{ height: "auto", opacity: 1 }}
+            exit={{ height: 0, opacity: 0 }}
+            transition={{ duration: 0.2 }}
+            className="overflow-hidden border-b border-border bg-secondary/20"
+          >
+            <div className="px-4 py-2">
+              <button
+                onClick={() => setThinkingExpanded(!thinkingExpanded)}
+                className="flex items-center gap-2 text-xs text-muted-foreground hover:text-foreground transition"
+              >
+                <ChevronDown size={12} className={`transition-transform ${thinkingExpanded ? "" : "-rotate-90"}`} />
+                {isGenerating && <Loader2 size={12} className="animate-spin text-accent" />}
+                {isGenerating ? (
+                  <span className="font-medium text-accent">AI is thinking...</span>
+                ) : (
+                  <span className="font-medium">View AI reasoning</span>
+                )}
+                {!isGenerating && generationThinking && (
+                  <button
+                    onClick={(e) => { e.stopPropagation(); setGenerationThinking(""); setThinkingExpanded(false); }}
+                    className="ml-2 text-muted-foreground/50 hover:text-muted-foreground"
+                  >
+                    <X size={10} />
+                  </button>
+                )}
+              </button>
+              <AnimatePresence>
+                {thinkingExpanded && (
+                  <motion.div
+                    initial={{ height: 0, opacity: 0 }}
+                    animate={{ height: "auto", opacity: 1 }}
+                    exit={{ height: 0, opacity: 0 }}
+                    transition={{ duration: 0.15 }}
+                    className="overflow-hidden"
+                  >
+                    <div className="mt-2 max-h-48 overflow-y-auto rounded-lg bg-background/60 border border-border/50 p-3 text-xs text-muted-foreground whitespace-pre-wrap font-mono leading-relaxed">
+                      {isGenerating ? <ThinkingAnimation /> : generationThinking}
+                    </div>
+                  </motion.div>
+                )}
+              </AnimatePresence>
+            </div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
       {/* Toolbar */}
       <div className="flex items-center gap-2 border-b border-border px-4 py-2">
         <div className="relative">
@@ -1697,9 +2052,8 @@ const VibeDBPage = () => {
         </div>
         <button
           onClick={() => setShowChatPanel(!showChatPanel)}
-          className={`flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-xs font-semibold transition ${
-            showChatPanel ? "bg-accent text-accent-foreground" : "bg-secondary text-secondary-foreground hover:bg-secondary/80"
-          }`}
+          className={`flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-xs font-semibold transition ${showChatPanel ? "bg-accent text-accent-foreground" : "bg-secondary text-secondary-foreground hover:bg-secondary/80"
+            }`}
         >
           <MessageCircle size={14} /> AI Chat
         </button>
@@ -1731,11 +2085,10 @@ const VibeDBPage = () => {
               {projects.map(project => (
                 <div
                   key={project.id}
-                  className={`group rounded-lg border p-2.5 cursor-pointer transition-colors ${
-                    currentProjectId === project.id
-                      ? "border-primary bg-primary/5"
-                      : "border-border hover:border-accent/50 bg-background"
-                  }`}
+                  className={`group rounded-lg border p-2.5 cursor-pointer transition-colors ${currentProjectId === project.id
+                    ? "border-primary bg-primary/5"
+                    : "border-border hover:border-accent/50 bg-background"
+                    }`}
                   onClick={() => loadProject(project)}
                 >
                   <div className="flex items-center justify-between">
@@ -1808,7 +2161,8 @@ const VibeDBPage = () => {
                 onMouseEnter={() => setHoveredTableId(table.id)}
                 onMouseLeave={() => setHoveredTableId(null)}
                 className="absolute cursor-grab select-none rounded-xl border border-border bg-card shadow-sm transition-all hover:shadow-md active:cursor-grabbing"
-                style={{ left: table.x, top: table.y, width: TABLE_WIDTH, opacity: getTableOpacity(table.id), zIndex: hoveredTableId === table.id ? 50 : 10,
+                style={{
+                  left: table.x, top: table.y, width: TABLE_WIDTH, opacity: getTableOpacity(table.id), zIndex: hoveredTableId === table.id ? 50 : 10,
                   boxShadow: hoveredTableId === table.id ? "0 0 0 2px hsl(var(--accent)), 0 20px 25px -5px rgb(0 0 0 / 0.1)" : undefined,
                 }}
               >
@@ -1817,7 +2171,7 @@ const VibeDBPage = () => {
                   onMouseDown={e => { if (editingTable === table.id || (e.target as HTMLElement).closest('button')) e.stopPropagation(); }}>
                   {editingTable === table.id ? (
                     <input autoFocus value={editingTableName} onChange={e => setEditingTableName(e.target.value)}
-                      onBlur={() => { updateTableName(table.id, editingTableName); setEditingTable(null); }} 
+                      onBlur={() => { updateTableName(table.id, editingTableName); setEditingTable(null); }}
                       onKeyDown={e => { if (e.key === "Enter") { updateTableName(table.id, editingTableName); setEditingTable(null); } e.stopPropagation(); }}
                       onMouseDown={e => e.stopPropagation()}
                       className="w-full border-none bg-transparent text-sm font-bold outline-none" onClick={e => e.stopPropagation()} />
@@ -1993,16 +2347,39 @@ const VibeDBPage = () => {
           <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} className="fixed inset-0 z-50 flex items-center justify-center bg-foreground/20 backdrop-blur-sm" onClick={() => setShowImportModal(false)}>
             <motion.div initial={{ scale: 0.95 }} animate={{ scale: 1 }} exit={{ scale: 0.95 }} className="mx-4 w-full max-w-2xl rounded-2xl bg-card p-6 shadow-xl" onClick={e => e.stopPropagation()}>
               <div className="mb-4 flex items-center justify-between">
-                <h2 className="text-lg font-bold flex items-center gap-2"><Upload size={18} /> Import SQL</h2>
+                <h2 className="text-lg font-bold flex items-center gap-2"><Upload size={18} /> Import SQL or CSV</h2>
                 <button onClick={() => setShowImportModal(false)} className="flex h-8 w-8 items-center justify-center rounded-lg bg-secondary"><X size={16} /></button>
               </div>
-              <p className="mb-3 text-sm text-muted-foreground">Paste your SQL CREATE TABLE statements below.</p>
+              <p className="mb-3 text-sm text-muted-foreground">Paste your SQL CREATE TABLE statements or CSV data below. CSVs will automatically build a schema and insert data.</p>
               <textarea value={importText} onChange={e => setImportText(e.target.value)}
-                placeholder={`CREATE TABLE users (\n  id UUID PRIMARY KEY,\n  name VARCHAR NOT NULL\n);`}
+                placeholder={`CREATE TABLE users (\n  id UUID PRIMARY KEY,\n  name VARCHAR NOT NULL\n);\n\n-- OR --\n\nid,name,email\n1,Alice,alice@example.com`}
                 className="w-full rounded-xl border border-border bg-background p-4 font-mono text-xs leading-relaxed outline-none focus:border-primary resize-none" rows={12} />
-              <div className="mt-4 flex justify-end gap-2">
-                <button onClick={() => setShowImportModal(false)} className="rounded-lg bg-secondary px-4 py-2 text-sm font-semibold hover:bg-secondary/80">Cancel</button>
-                <button onClick={handleImport} disabled={!importText.trim()} className="flex items-center gap-2 rounded-lg bg-accent px-4 py-2 text-sm font-semibold text-accent-foreground disabled:opacity-50"><Upload size={14} /> Import</button>
+              <div className="mt-4 flex items-center justify-between">
+                <div>
+                  <input
+                    type="file"
+                    accept=".csv,.tsv,.sql,.txt"
+                    className="hidden"
+                    id="import-file-upload"
+                    onChange={(e) => {
+                      const file = e.target.files?.[0];
+                      if (!file) return;
+                      const reader = new FileReader();
+                      reader.onload = (event) => setImportText(event.target?.result as string);
+                      reader.readAsText(file);
+                    }}
+                  />
+                  <label
+                    htmlFor="import-file-upload"
+                    className="flex cursor-pointer items-center gap-2 rounded-lg bg-secondary px-4 py-2 text-sm font-semibold hover:bg-secondary/80"
+                  >
+                    <Upload size={14} /> Upload File
+                  </label>
+                </div>
+                <div className="flex gap-2">
+                  <button onClick={() => setShowImportModal(false)} className="rounded-lg bg-secondary px-4 py-2 text-sm font-semibold hover:bg-secondary/80">Cancel</button>
+                  <button onClick={handleImport} disabled={!importText.trim()} className="flex items-center gap-2 rounded-lg bg-accent px-4 py-2 text-sm font-semibold text-accent-foreground disabled:opacity-50"><Upload size={14} /> Import</button>
+                </div>
               </div>
             </motion.div>
           </motion.div>
@@ -2177,16 +2554,15 @@ $$ LANGUAGE plpgsql SECURITY DEFINER;`}</pre>
                       </div>
                       <div className="max-h-32 overflow-auto space-y-1">
                         {deployFixResult.actions.map((action, i) => (
-                          <div key={i} className={`text-xs flex items-start gap-2 ${
-                            action.type === "unfixable" ? "text-destructive" :
+                          <div key={i} className={`text-xs flex items-start gap-2 ${action.type === "unfixable" ? "text-destructive" :
                             action.type === "skip_existing" ? "text-muted-foreground" :
-                            "text-accent"
-                          }`}>
+                              "text-accent"
+                            }`}>
                             {action.type === "unfixable"
                               ? <AlertCircle size={12} className="mt-0.5 shrink-0" />
                               : action.type === "skip_existing"
-                              ? <Eye size={12} className="mt-0.5 shrink-0" />
-                              : <CheckCircle2 size={12} className="mt-0.5 shrink-0" />
+                                ? <Eye size={12} className="mt-0.5 shrink-0" />
+                                : <CheckCircle2 size={12} className="mt-0.5 shrink-0" />
                             }
                             <span className="break-all">
                               <span className="font-semibold font-mono">{action.tableName}</span> — {action.description}
@@ -2249,12 +2625,11 @@ $$ LANGUAGE plpgsql SECURITY DEFINER;`}</pre>
         <AnimatePresence>
           {toasts.map(t => (
             <motion.div key={t.id} initial={{ opacity: 0, x: 50 }} animate={{ opacity: 1, x: 0 }} exit={{ opacity: 0, x: 50 }}
-              className={`rounded-xl px-4 py-2.5 text-sm font-medium shadow-lg ${
-                t.type === "success" ? "bg-accent text-accent-foreground" :
+              className={`rounded-xl px-4 py-2.5 text-sm font-medium shadow-lg ${t.type === "success" ? "bg-accent text-accent-foreground" :
                 t.type === "error" ? "bg-destructive text-destructive-foreground" :
-                t.type === "warning" ? "bg-primary/20 text-primary border border-primary/30" :
-                "bg-card text-card-foreground border border-border"
-              }`}>
+                  t.type === "warning" ? "bg-primary/20 text-primary border border-primary/30" :
+                    "bg-card text-card-foreground border border-border"
+                }`}>
               {t.message}
             </motion.div>
           ))}

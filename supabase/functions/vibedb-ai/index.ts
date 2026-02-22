@@ -1,9 +1,90 @@
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
+import { createClient } from "npm:@supabase/supabase-js@2.57.2";
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type, x-supabase-client-platform, x-supabase-client-platform-version, x-supabase-client-runtime, x-supabase-client-runtime-version",
 };
+
+// Credit costs per action type
+const CREDIT_COSTS: Record<string, number> = {
+  "generate-schema": 3,
+  "batch-command": 3,
+  "inspect-schema": 2,
+  "generate-sql": 1,
+  "generate-mock-data": 1,
+  "generate-query": 1,
+  "smart-add-column": 1,
+  "schema-chat": 1,
+};
+
+// Retryable HTTP status codes
+const RETRYABLE = new Set([429, 500, 502, 503, 529]);
+const MAX_RETRIES = 4; // up to 4 attempts (initial + 3 retries)
+
+// ─── Resilient Claude API caller ────────────────────────
+// Retries the SAME model with exponential backoff on transient failures.
+// No fallback to weaker models — the user pays for Sonnet, they get Sonnet.
+async function callClaudeWithRetry(
+  apiKey: string,
+  systemPrompt: string,
+  userPrompt: string,
+  model: string,
+  maxTokens: number,
+): Promise<{ content: string; stopReason: string; modelUsed: string }> {
+  let lastError = "";
+
+  for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
+    try {
+      const response = await fetch("https://api.anthropic.com/v1/messages", {
+        method: "POST",
+        headers: {
+          "x-api-key": apiKey,
+          "anthropic-version": "2023-06-01",
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          model,
+          max_tokens: maxTokens,
+          system: systemPrompt,
+          messages: [{ role: "user", content: userPrompt }],
+        }),
+      });
+
+      if (response.ok) {
+        const data = await response.json();
+        const content = data.content?.[0]?.text || "";
+        const stopReason = data.stop_reason || "end_turn";
+        if (attempt > 0) console.log(`[RECOVERED] ${model} succeeded on attempt ${attempt + 1}`);
+        return { content, stopReason, modelUsed: model };
+      }
+
+      const status = response.status;
+      const errBody = await response.text();
+      lastError = `${status}: ${errBody.substring(0, 200)}`;
+
+      if (!RETRYABLE.has(status)) {
+        // Non-retryable (400, 401, 403, 404) — no point retrying
+        throw new Error(`Claude API error ${status}`);
+      }
+
+      // Retryable — exponential backoff with jitter
+      const backoffMs = Math.min(1000 * Math.pow(2, attempt), 16000) + Math.random() * 1000;
+      console.warn(`[RETRY ${attempt + 1}/${MAX_RETRIES}] ${model} returned ${status}, waiting ${Math.round(backoffMs)}ms`);
+      await new Promise(r => setTimeout(r, backoffMs));
+
+    } catch (err) {
+      if (err instanceof Error && err.message.startsWith("Claude API error")) throw err;
+      // Network-level failure — retry
+      lastError = String(err);
+      const backoffMs = Math.min(1000 * Math.pow(2, attempt), 16000) + Math.random() * 1000;
+      console.warn(`[RETRY ${attempt + 1}/${MAX_RETRIES}] ${model} network error, waiting ${Math.round(backoffMs)}ms`);
+      await new Promise(r => setTimeout(r, backoffMs));
+    }
+  }
+
+  throw new Error(`${model} failed after ${MAX_RETRIES} attempts: ${lastError}`);
+}
 
 serve(async (req) => {
   if (req.method === "OPTIONS") return new Response(null, { headers: corsHeaders });
@@ -12,6 +93,56 @@ serve(async (req) => {
     const { prompt, type, context } = await req.json();
     const ANTHROPIC_API_KEY = Deno.env.get("ANTHROPIC_API_KEY");
     if (!ANTHROPIC_API_KEY) throw new Error("ANTHROPIC_API_KEY is not configured");
+
+    // ─── Credit gate (check BEFORE, deduct AFTER success) ─
+    const authHeader = req.headers.get("Authorization");
+    let userId: string | null = null;
+    let currentCredits = 0;
+
+    if (authHeader) {
+      const supabaseAdmin = createClient(
+        Deno.env.get("SUPABASE_URL") ?? "",
+        Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ?? "",
+        { auth: { persistSession: false } }
+      );
+
+      const token = authHeader.replace("Bearer ", "");
+      const { data: userData } = await supabaseAdmin.auth.getUser(token);
+      userId = userData.user?.id ?? null;
+
+      if (userId) {
+        const creditCost = CREDIT_COSTS[type] ?? 1;
+
+        const { data: profile } = await supabaseAdmin
+          .from("profiles")
+          .select("ai_credits, subscription_tier")
+          .eq("user_id", userId)
+          .maybeSingle();
+
+        if (!profile || profile.subscription_tier === "none") {
+          return new Response(JSON.stringify({
+            error: "Active subscription required. Please subscribe to use AI features.",
+            code: "NO_SUBSCRIPTION",
+          }), {
+            status: 403,
+            headers: { ...corsHeaders, "Content-Type": "application/json" },
+          });
+        }
+
+        currentCredits = profile.ai_credits ?? 0;
+        if (currentCredits < creditCost) {
+          return new Response(JSON.stringify({
+            error: `Not enough credits. This action costs ${creditCost} credit${creditCost > 1 ? "s" : ""}. You have ${currentCredits}.`,
+            code: "NO_CREDITS",
+            credits_remaining: currentCredits,
+            credits_required: creditCost,
+          }), {
+            status: 402,
+            headers: { ...corsHeaders, "Content-Type": "application/json" },
+          });
+        }
+      }
+    }
 
     // ─── Build prompts ──────────────────────────────────
     let systemPrompt = "";
@@ -23,7 +154,7 @@ serve(async (req) => {
 CRITICAL: Your entire response must be a single valid JSON object. No text before or after. No markdown. No comments. No explanation.
 
 The JSON must have this exact structure:
-{"tables":[{"name":"string","columns":[{"name":"string","type":"string","isForeignKey":false,"linkedTable":"","linkedColumn":"","constraints":[]}]}]}
+{"tables":[{"name":"string","columns":[{"name":"string","type":"string","isForeignKey":false,"linkedTable":"","linkedColumn":"","constraints":[]}],"indexes":[{"name":"string","columns":["string"],"type":"btree","unique":false,"where":"optional filter"}],"checkConstraints":[{"name":"string","expression":"column_name > 0"}]}]}
 
 Column types: uuid, varchar, int, timestamp, boolean, numeric, text, jsonb, decimal, float.
 Constraints: [{"type":"primary"},{"type":"notNull"},{"type":"unique"},{"type":"default","value":"now()"}]
@@ -36,9 +167,15 @@ MANDATORY RULES — violating these makes the schema invalid:
 5. Foreign key columns must reference a column that EXISTS. Always reference "id" on the target table.
 6. Use snake_case for all table and column names.
 7. Foreign key columns should be named like: user_id, project_id, etc.
+8. Generate INDEXES for: every FK column, columns commonly used in WHERE/ORDER BY, composite indexes for multi-column queries, partial indexes with WHERE clauses for filtered queries (e.g. active records only).
+9. Generate CHECK CONSTRAINTS for columns with bounded values: status enums (IN list), positive amounts (> 0), percentage ranges (BETWEEN 0 AND 100), rating ranges, priority levels. Use the column name in the constraint name.
+10. For junction/mapping tables (many-to-many), add a COMPOSITE UNIQUE index on the two FK columns to prevent duplicate associations.
+11. For tables involving financial records, legal data, or user-generated content, add a "deleted_at" TIMESTAMP column (nullable, default null) for soft deletes.
+12. For columns storing secrets, tokens, or API keys, add companion columns: "expires_at" (timestamp), "last_rotated_at" (timestamp), and "description" (varchar).
+13. For self-referential FK columns (e.g. parent_id referencing same table), add a CHECK constraint: parent_id != id.
 
 Generate as many tables as the idea genuinely requires — don't artificially limit. A simple blog might need 3 tables, but a full e-commerce platform or crypto exchange might need 15-25+. Be thorough and include all tables needed for a production-ready schema.
-Use double quotes for all JSON strings.`;
+Use double quotes for all JSON strings. Emit compact JSON (no pretty-printing, no unnecessary whitespace).`;
     } else if (type === "generate-sql") {
       systemPrompt = `You are a SQL expert. Given a database schema context, generate valid PostgreSQL DDL statements.
 Rules:
@@ -83,11 +220,24 @@ SCORING RUBRIC — calculate precisely:
   - Missing NOT NULL on clearly required fields (e.g. name, email): -2 each
   - Table with zero indexes at all: -5 each
   - Missing CHECK constraint where values are clearly bounded: -2 each
+  - Junction/mapping table without composite unique on FK pair: -8 each
+  - Self-referential FK column without guard CHECK (parent_id != id): -5 each
+  - Column storing secrets/tokens without expires_at or rotation tracking: -8 each
+  - Financial/legal table missing soft delete (deleted_at): -5 each
+  - JSONB column without description or documentation comment: -2 each
+  - Missing composite index on multi-column query patterns: -3 each
 - Minimum score: 0
 - A well-designed schema with PKs, timestamps, indexes, clean naming, and constraints → 90-100
 - A typical new schema with tables but no indexes → 50-65
 - A schema with major issues (missing PKs, broken FKs, no timestamps) → below 40
 - Apply deductions precisely based on what you find. Do NOT default to a middle value.
+
+ADDITIONAL CHECKS:
+- For each junction/mapping table: verify a composite unique index exists on the two FK columns. If missing, suggest add_index.
+- For self-referential FK columns (e.g. parent_id on same table): verify a CHECK constraint exists (parent_id != id). If missing, suggest add_constraint.
+- For columns with names like "token", "secret", "api_key", "password_hash": verify companion columns (expires_at, last_rotated_at) exist.
+- For tables storing financial records, orders, transactions, invoices: verify deleted_at column exists for soft delete.
+- For JSONB columns: note if they lack documentation — suggest a description column or comment.
 
 Suggestion format — each must have "type", "target_table", "payload", "reason":
 - add_index: {"type":"add_index","target_table":"users","payload":{"columns":["email"],"unique":false,"name":"idx_users_email"},"reason":"..."}
@@ -198,60 +348,27 @@ Use double quotes for all JSON strings.`;
       systemPrompt = "You are a helpful AI assistant.";
     }
 
-    // Use Haiku for fast mechanical tasks, Sonnet for intelligent tasks
+    // ─── Model selection + token limits ──────────────────
     const fastTypes = ["generate-mock-data", "generate-sql", "generate-query", "smart-add-column"];
-    const model = fastTypes.includes(type) ? "claude-haiku-4-5-20251001" : "claude-sonnet-4-5-20250929";
-    // Use higher token limit for types that produce long output
+    const model = fastTypes.includes(type) ? "claude-haiku-4-5-20251001" : "claude-sonnet-4-6-20250514";
     const longOutputTypes = ["generate-mock-data", "generate-sql", "generate-schema"];
     const maxTokens = longOutputTypes.includes(type) ? 64000 : 16384;
 
-    console.log(`Processing request type: ${type} with model: ${model}, max_tokens: ${maxTokens}`);
+    console.log(`[vibedb-ai] type=${type} model=${model} max_tokens=${maxTokens}`);
 
-    // ─── Claude API request ─────────────────────────────
-    const response = await fetch("https://api.anthropic.com/v1/messages", {
-      method: "POST",
-      headers: {
-        "x-api-key": ANTHROPIC_API_KEY,
-        "anthropic-version": "2023-06-01",
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        model,
-        max_tokens: maxTokens,
-        system: systemPrompt,
-        messages: [
-          { role: "user", content: userPrompt },
-        ],
-      }),
-    });
+    // ─── Call Claude with automatic retry ────────────────
+    const { content: rawContent, stopReason, modelUsed } = await callClaudeWithRetry(
+      ANTHROPIC_API_KEY, systemPrompt, userPrompt, model, maxTokens
+    );
 
-    if (!response.ok) {
-      const errorText = await response.text();
-      console.error("Claude API error:", response.status, errorText);
+    let content = rawContent;
 
-      if (response.status === 429) {
-        return new Response(JSON.stringify({ error: "Rate limit exceeded. Please try again in a moment." }), {
-          status: 429,
-          headers: { ...corsHeaders, "Content-Type": "application/json" },
-        });
-      }
+    console.log(`[vibedb-ai] Success: model=${modelUsed} stop=${stopReason} len=${content.length}`);
 
-      return new Response(JSON.stringify({ error: "AI service error" }), {
-        status: 500,
-        headers: { ...corsHeaders, "Content-Type": "application/json" },
-      });
-    }
+    // ─── Post-process truncated responses ────────────────
 
-    const data = await response.json();
-    let content = data.content?.[0]?.text || "";
-    const stopReason = data.stop_reason;
-
-    console.log(`Successfully processed ${type} request (stop_reason: ${stopReason}, length: ${content.length})`);
-
-    // If SQL output was truncated, trim to last complete statement
+    // SQL truncation: trim to last complete statement
     if (stopReason === "max_tokens" && (type === "generate-mock-data" || type === "generate-sql" || type === "generate-query")) {
-      console.log("SQL response was truncated, trimming to last complete statement...");
-      // Find the last complete SQL statement (ending with ;)
       const lastSemicolon = content.lastIndexOf(";");
       if (lastSemicolon > 0) {
         content = content.substring(0, lastSemicolon + 1);
@@ -259,13 +376,11 @@ Use double quotes for all JSON strings.`;
       }
     }
 
-    // If response was truncated (hit token limit), try to fix the JSON
+    // JSON truncation: close open brackets/braces
     if (stopReason === "max_tokens" && (type === "generate-schema" || type === "schema-chat" || type === "batch-command" || type === "inspect-schema" || type === "smart-add-column")) {
-      console.log("Response was truncated, attempting to close JSON...");
-      // Remove any trailing partial string/value
-      content = content.replace(/,\s*"[^"]*$/, "");  // trailing partial key
-      content = content.replace(/,\s*$/, "");          // trailing comma
-      // Count and close open brackets/braces
+      console.log("[vibedb-ai] JSON truncated, attempting auto-close...");
+      content = content.replace(/,\s*"[^"]*$/, "");
+      content = content.replace(/,\s*$/, "");
       let openBraces = 0, openBrackets = 0, inStr = false, esc = false;
       for (const ch of content) {
         if (esc) { esc = false; continue; }
@@ -277,15 +392,38 @@ Use double quotes for all JSON strings.`;
         if (ch === "[") openBrackets++;
         if (ch === "]") openBrackets--;
       }
-      // Close any open strings
       if (inStr) content += '"';
-      // Remove trailing partial values after the last complete entry
       content = content.replace(/,\s*$/, "");
       for (let i = 0; i < openBrackets; i++) content += "]";
       for (let i = 0; i < openBraces; i++) content += "}";
     }
 
-    return new Response(JSON.stringify({ result: content }), {
+    // ─── Deduct credits AFTER successful response ────────
+    let creditsRemaining: number | undefined;
+    if (userId) {
+      const supabaseAdmin = createClient(
+        Deno.env.get("SUPABASE_URL") ?? "",
+        Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ?? "",
+        { auth: { persistSession: false } }
+      );
+      const creditCost = CREDIT_COSTS[type] ?? 1;
+      // Re-read current credits (may have changed during retries)
+      const { data: freshProfile } = await supabaseAdmin
+        .from("profiles")
+        .select("ai_credits")
+        .eq("user_id", userId)
+        .maybeSingle();
+      const freshCredits = freshProfile?.ai_credits ?? 0;
+      const newCredits = Math.max(0, freshCredits - creditCost);
+      await supabaseAdmin.from("profiles").update({ ai_credits: newCredits }).eq("user_id", userId);
+      creditsRemaining = newCredits;
+    }
+
+    return new Response(JSON.stringify({
+      result: content,
+      credits_remaining: creditsRemaining,
+      model_used: modelUsed,
+    }), {
       headers: { ...corsHeaders, "Content-Type": "application/json" },
     });
   } catch (e) {
