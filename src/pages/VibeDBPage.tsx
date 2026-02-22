@@ -120,6 +120,20 @@ function lintSchema(tables: TableNode[], convention = "snake_case") {
 
 // ─── CSV Parser ──────────────────────────────────────────
 function parseCSVData(csvText: string, tableName = "imported_table"): { tables: Omit<TableNode, "x" | "y">[] } {
+  // Check if it has multiple table segments
+  const tableSegments = csvText.split(/---\s*TABLE:\s*([^-]+)---\r?\n/i);
+  if (tableSegments.length > 1) {
+    const allTables: Omit<TableNode, "x" | "y">[] = [];
+    for (let i = 1; i < tableSegments.length; i += 2) {
+      const segName = tableSegments[i].trim();
+      const content = tableSegments[i + 1].trim();
+      if (!content) continue;
+      const res = parseCSVData(content, segName);
+      allTables.push(...res.tables);
+    }
+    return { tables: allTables };
+  }
+
   const lines = csvText.trim().split(/\r?\n/);
   if (lines.length < 2) throw new Error("CSV must have at least a header row and one data row.");
 
@@ -2358,15 +2372,25 @@ const VibeDBPage = () => {
                 <div>
                   <input
                     type="file"
+                    multiple
                     accept=".csv,.tsv,.sql,.txt"
                     className="hidden"
                     id="import-file-upload"
-                    onChange={(e) => {
-                      const file = e.target.files?.[0];
-                      if (!file) return;
-                      const reader = new FileReader();
-                      reader.onload = (event) => setImportText(event.target?.result as string);
-                      reader.readAsText(file);
+                    onChange={async (e) => {
+                      const files = e.target.files;
+                      if (!files || files.length === 0) return;
+                      let combinedText = "";
+                      for (let i = 0; i < files.length; i++) {
+                        const file = files[i];
+                        const text = await file.text();
+                        const tableName = file.name.replace(/\.[^/.]+$/, "");
+                        if (files.length > 0 || /---\s*TABLE/i.test(text)) {
+                          combinedText += `--- TABLE: ${tableName} ---\n${text}\n\n`;
+                        } else {
+                          combinedText += text;
+                        }
+                      }
+                      setImportText(combinedText);
                     }}
                   />
                   <label
