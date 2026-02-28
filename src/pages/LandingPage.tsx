@@ -1,8 +1,7 @@
 import { motion } from "framer-motion";
 import { Link } from "react-router-dom";
-import { Database, Sparkles, Rocket, FileCode2, ArrowRight, Layers, Wand2, Upload } from "lucide-react";
+import { Database, Sparkles, FileCode2, ArrowRight, Layers, Wand2, Upload } from "lucide-react";
 import { Button } from "@/components/ui/button";
-import { useAuth } from "@/hooks/use-auth";
 
 const fadeUp = {
   hidden: { opacity: 0, y: 30 },
@@ -43,10 +42,6 @@ const steps = [
 ];
 
 const LandingPage = () => {
-  const { user, subscription } = useAuth();
-  const ctaLink = user ? "/app" : "/auth";
-  const ctaLabel = user ? "Go to App" : "Get Started";
-
   return (
     <div className="min-h-screen bg-background">
       {/* Nav */}
@@ -58,22 +53,9 @@ const LandingPage = () => {
             </div>
             <span className="text-lg font-bold">VibeDB</span>
           </Link>
-          <div className="flex items-center gap-3">
-            {user ? (
-              <Button size="sm" asChild>
-                <Link to="/app">Go to App</Link>
-              </Button>
-            ) : (
-              <>
-                <Button variant="ghost" size="sm" asChild>
-                  <Link to="/auth">Sign in</Link>
-                </Button>
-                <Button size="sm" asChild>
-                  <Link to="/auth">Get Started</Link>
-                </Button>
-              </>
-            )}
-          </div>
+          <Button size="sm" asChild>
+            <Link to="/app">Go to App</Link>
+          </Button>
         </div>
       </nav>
 
@@ -118,15 +100,12 @@ const LandingPage = () => {
             initial="hidden"
             animate="visible"
             variants={fadeUp}
-            className="mt-8 flex flex-col items-center justify-center gap-3 sm:flex-row"
+            className="mt-8"
           >
             <Button size="lg" className="gap-2 shadow-glow" asChild>
-              <Link to={ctaLink}>
-                {ctaLabel} <ArrowRight size={16} />
+              <Link to="/app">
+                Get Started <ArrowRight size={16} />
               </Link>
-            </Button>
-            <Button size="lg" variant="outline" asChild>
-              <Link to="/auth">Sign In</Link>
             </Button>
           </motion.div>
         </div>
@@ -212,8 +191,8 @@ const LandingPage = () => {
           <h2 className="text-2xl font-bold md:text-3xl">Ready to build your database?</h2>
           <p className="mt-3 text-muted-foreground">Start designing your schema for free — powered by AI.</p>
           <Button size="lg" className="mt-6 gap-2 shadow-glow" asChild>
-            <Link to={ctaLink}>
-              {ctaLabel} <ArrowRight size={16} />
+            <Link to="/app">
+              Get Started <ArrowRight size={16} />
             </Link>
           </Button>
         </motion.div>
@@ -226,7 +205,7 @@ const LandingPage = () => {
             <Database size={14} className="text-primary" />
             <span>VibeDB</span>
           </div>
-          <span>© {new Date().getFullYear()} VibeDB. All rights reserved.</span>
+          <span>&copy; {new Date().getFullYear()} VibeDB. All rights reserved.</span>
         </div>
       </footer>
     </div>

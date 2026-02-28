@@ -18,6 +18,7 @@ interface SchemaAuditModalProps {
   open: boolean;
   onClose: () => void;
   isAuditing: boolean;
+  auditPhase?: string;
   report: AuditReport | null;
   onApplySuggestion: (suggestion: any) => void;
   onApplyAll: () => void;
@@ -110,7 +111,7 @@ function CollapsibleSection({ title, icon: Icon, count, children, defaultOpen = 
   );
 }
 
-function AuditingAnimation() {
+function AuditingAnimation({ phase }: { phase?: string }) {
   const steps = ["Analyzing table structure…", "Checking naming conventions…", "Validating foreign keys…", "Running AI inspection…"];
   const [step, setStep] = useState(0);
 
@@ -138,18 +139,18 @@ function AuditingAnimation() {
         </motion.div>
       </div>
       <motion.p
-        key={step}
+        key={phase || step}
         initial={{ opacity: 0, y: 10 }}
         animate={{ opacity: 1, y: 0 }}
         className="text-sm text-muted-foreground font-medium"
       >
-        {steps[step]}
+        {phase || steps[step]}
       </motion.p>
     </div>
   );
 }
 
-export default function SchemaAuditModal({ open, onClose, isAuditing, report, onApplySuggestion, onApplyAll, onRerunAudit }: SchemaAuditModalProps) {
+export default function SchemaAuditModal({ open, onClose, isAuditing, auditPhase, report, onApplySuggestion, onApplyAll, onRerunAudit }: SchemaAuditModalProps) {
   if (!open) return null;
 
   const score = report?.score || report?.confidence_score || 0;
@@ -194,7 +195,7 @@ export default function SchemaAuditModal({ open, onClose, isAuditing, report, on
             {/* Content */}
             <div className="flex-1 overflow-y-auto p-6">
               {isAuditing ? (
-                <AuditingAnimation />
+                <AuditingAnimation phase={auditPhase} />
               ) : report ? (
                 <div className="space-y-5">
                   {/* Clean state — everything looks good */}

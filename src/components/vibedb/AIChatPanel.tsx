@@ -6,29 +6,7 @@ import { findDuplicateIndex } from "@/components/vibedb/ExportGenerators";
 
 // ─── Types ───────────────────────────────────────────────
 
-interface Column {
-  id: string;
-  name: string;
-  type: string;
-  isForeignKey?: boolean;
-  linkedTable?: string;
-  linkedTableId?: string;
-  linkedColumn?: string;
-  fkStatus?: string;
-  constraints?: { type: string; value?: string }[];
-  description?: string;
-}
-
-interface TableNode {
-  id: string;
-  name: string;
-  columns: Column[];
-  x: number;
-  y: number;
-  indexes?: { name: string; columns: string[]; type: string; unique: boolean }[];
-  checkConstraints?: { name: string; expression: string }[];
-  description?: string;
-}
+import type { Column, TableNode } from "@/lib/types";
 
 interface ChatSuggestion {
   id: string;

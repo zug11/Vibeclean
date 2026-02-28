@@ -6,13 +6,23 @@ import {
   Table as TableIcon, Code, Upload, ShieldCheck, Edit3, ChevronDown,
   Settings, GitCompare, Key, Hash, LinkIcon, GripVertical, DatabaseZap,
   Box, Columns, Webhook, FileText, Rocket, Plug, CheckCircle2, AlertCircle,
-  FolderOpen, Save, FilePlus, PanelLeftOpen, PanelLeftClose, MessageCircle
+  FolderOpen, Save, FilePlus, PanelLeftOpen, PanelLeftClose, MessageCircle, Clock, Activity
 } from "lucide-react";
 import { Link } from "react-router-dom";
-import { useAuth } from "@/hooks/use-auth";
 import { v4 as uuidv4 } from "uuid";
 import { motion, AnimatePresence } from "framer-motion";
-import { supabase } from "@/integrations/supabase/client";
+import { ProjectStorage } from "@/lib/project-storage";
+import { createGenerationTracker, type GenerationProgress } from "@/lib/generation-tracker";
+import { STRATEGIES, getDefaultStrategy, setDefaultStrategy } from "@/lib/generation-strategies";
+import { GenerationHistoryStore, type GenerationRecord } from "@/lib/generation-history";
+import { runCompilerPass } from "@/lib/compiler-pass";
+import GenerationHistoryPanel from "@/components/vibedb/GenerationHistoryPanel";
+import SchemaCompareModal from "@/components/vibedb/SchemaCompareModal";
+import DatabaseManagerPanel from "@/components/vibedb/DatabaseManagerPanel";
+import QueryBuilderPanel from "@/components/vibedb/QueryBuilderPanel";
+import SupabasePanel from "@/components/vibedb/SupabasePanel";
+import SREModePanel from "@/components/vibedb/SREModePanel";
+import AskDataPanel from "@/components/vibedb/AskDataPanel";
 import VibeDBSidebar from "@/components/vibedb/VibeDBSidebar";
 import SchemaAuditModal from "@/components/vibedb/SchemaAuditModal";
 import AIChatPanel from "@/components/vibedb/AIChatPanel";
@@ -22,76 +32,16 @@ import {
   generateSQL, generateSQLDeferred, generatePrismaSchema, generateDrizzleSchema,
   generateGraphQLTypes, generateCSV, detectMissingFKTargets,
   diagnoseAndFixSchema, preDeployValidateSchema, type FixResult,
-  findDuplicateIndex, deduplicateSchema,
+  findDuplicateIndex, deduplicateSchema, buildSchemaFromIntent,
 } from "@/components/vibedb/ExportGenerators";
 
 // ─── Types ──────────────────────────────────────────────
-interface Column {
-  id: string;
-  name: string;
-  type: string;
-  isForeignKey?: boolean;
-  linkedTable?: string;
-  linkedTableId?: string;
-  linkedColumn?: string;
-  fkStatus?: string;
-  constraints?: { type: string; value?: string }[];
-  description?: string;
-}
-
-interface TableNode {
-  id: string;
-  name: string;
-  columns: Column[];
-  x: number;
-  y: number;
-  indexes?: { name: string; columns: string[]; type: string; unique: boolean; where?: string }[];
-  checkConstraints?: { name: string; expression: string }[];
-  description?: string;
-  isReordering?: boolean;
-  dataRows?: Record<string, string>[];
-  importedData?: {
-    headers: string[];
-    rows: string[][];
-  };
-}
-
-// Schema-level objects (enums, functions/triggers) stored alongside canvas items
-interface SchemaEnum {
-  name: string;
-  values: string[];
-}
-
-interface SchemaFunction {
-  name: string;
-  body: string; // Full CREATE OR REPLACE FUNCTION body
-}
-
-interface Toast {
-  id: number; message: string; type: "info" | "success" | "error" | "warning";
-}
-
-interface Project {
-  id: string;
-  name: string;
-  definition: TableNode[];
-  updated_at: string;
-}
-
-interface AuditReport {
-  score?: number;
-  issues?: { severity: string; message: string }[];
-  suggestions?: { type: string; target_table?: string; payload?: any; reason: string; description?: string }[];
-  lintIssues?: { type: string; severity: string; message: string }[];
-  fkIssues?: { type: string; severity: string; message: string }[];
-  strengths?: string[];
-  missing_elements?: string[];
-  risks?: string[];
-  confidence_score?: number;
-}
+import type { Column, TableNode, SchemaEnum, SchemaFunction, Toast, Project, AuditReport, CompilerReport } from "@/lib/types";
 
 // ─── Constants ──────────────────────────────────────────
 const COLUMN_TYPES = ["uuid", "varchar", "int", "timestamp", "boolean", "numeric", "text", "jsonb", "decimal", "float"];
+const MAX_CONTINUATION_CALLS = 4; // max 5 total calls (1 initial + 4 continuations)
+const MAX_AUDIT_CONTINUATIONS = 2; // max 3 total audit calls (1 initial + 2 continuations)
 const TABLE_WIDTH = 260;
 const HEADER_HEIGHT = 40;
 const ROW_HEIGHT = 32;
@@ -118,8 +68,118 @@ function lintSchema(tables: TableNode[], convention = "snake_case") {
   return issues;
 }
 
+// ─── Smart FK Inference Engine ──────────────────────────
+const ROLE_BASED_IDS: Record<string, string> = {
+  "buyer_id": "users", "seller_id": "users", "reviewer_id": "users",
+  "actor_id": "users", "sender_id": "users", "receiver_id": "users",
+  "owner_id": "users", "creator_id": "users"
+};
+
+const EXTERNAL_ID_PREFIXES = ["stripe_", "payment_provider_", "exchange_", "provider_"];
+const POLYMORPHIC_IDS = ["resource_id", "entity_id", "reference_id", "target_id", "object_id", "item_id"];
+
+function smartPluralize(word: string): string {
+  if (word.endsWith("y") && !/[aeiou]y$/i.test(word)) return word.slice(0, -1) + "ies";
+  if (word.endsWith("s")) return word;
+  return word + "s";
+}
+
+function applySmartFKResolution(tables: Omit<TableNode, "x" | "y">[]) {
+  const availableTables = new Set(tables.map(t => t.name.toLowerCase()));
+
+  tables.forEach(table => {
+    table.columns.forEach(col => {
+      // Skip if explicitly resolved already
+      if (col.isForeignKey && col.linkedTable) return;
+
+      const lowerName = col.name.toLowerCase();
+      if (lowerName.endsWith("_id")) {
+        // Skip explicitly external IDs
+        if (EXTERNAL_ID_PREFIXES.some(prefix => lowerName.startsWith(prefix))) {
+          col.isForeignKey = false;
+          col.linkedTable = undefined;
+          col.fkStatus = "resolved";
+          return;
+        }
+
+        // Skip naturally polymorphic or highly ambiguous IDs that break deterministic mapping
+        if (POLYMORPHIC_IDS.includes(lowerName)) {
+          col.isForeignKey = false;
+          col.linkedTable = undefined;
+          col.fkStatus = "resolved";
+          return;
+        }
+
+        if (ROLE_BASED_IDS[lowerName]) {
+          col.isForeignKey = true;
+          col.linkedTable = ROLE_BASED_IDS[lowerName];
+          col.linkedColumn = "id";
+          col.fkStatus = "unresolved";
+          return;
+        }
+
+        const baseName = lowerName.replace("_id", "");
+        const pluralName = smartPluralize(baseName);
+
+        let finalTable = pluralName;
+        if (availableTables.has(baseName)) {
+          finalTable = baseName;
+        }
+
+        col.isForeignKey = true;
+        col.linkedTable = finalTable;
+        col.linkedColumn = "id";
+        col.fkStatus = "unresolved";
+      }
+    });
+  });
+}
+
+// ─── Shared CSV Utilities ────────────────────────────────
+function splitCSVRow(line: string): string[] {
+  const values: string[] = [];
+  let cur = "";
+  let inQuote = false;
+  const isTSV = line.includes('\t') && !line.includes('","');
+  const separator = isTSV ? '\t' : ',';
+  for (let i = 0; i < line.length; i++) {
+    if (line[i] === '"') {
+      inQuote = !inQuote;
+    } else if (line[i] === separator && !inQuote) {
+      values.push(cur);
+      cur = "";
+    } else {
+      cur += line[i];
+    }
+  }
+  values.push(cur);
+  return values.map(v => v.trim());
+}
+
+function inferColumnType(values: string[]): string {
+  let isUuid = true, isBoolean = true, isInteger = true, isNumeric = true, isTimestamp = true, isJsonb = true;
+  for (const val of values) {
+    if (!val) continue;
+    const ln = val.toLowerCase();
+    if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(val)) isUuid = false;
+    if (ln !== "true" && ln !== "false" && ln !== "1" && ln !== "0") isBoolean = false;
+    if (!/^-?\d+$/.test(val)) isInteger = false;
+    if (!/^-?\d+(\.\d+)?$/.test(val)) isNumeric = false;
+    if (isNaN(Date.parse(val)) || /^\d+$/.test(val)) isTimestamp = false;
+    if (typeof val === 'string' && (!val.startsWith('{') && !val.startsWith('['))) isJsonb = false;
+    try { if (isJsonb) JSON.parse(val); } catch { isJsonb = false; }
+  }
+  if (isUuid) return "uuid";
+  if (isBoolean) return "boolean";
+  if (isInteger) return "int";
+  if (isNumeric) return "numeric";
+  if (isTimestamp) return "timestamp";
+  if (isJsonb) return "jsonb";
+  return "varchar";
+}
+
 // ─── CSV Parser ──────────────────────────────────────────
-function parseCSVData(csvText: string, tableName = "imported_table"): { tables: Omit<TableNode, "x" | "y">[] } {
+function parseCSVData(csvText: string, tableName = "imported_table", skipSmartFK = false): { tables: Omit<TableNode, "x" | "y">[] } {
   // Check if it has multiple table segments
   const tableSegments = csvText.split(/---\s*TABLE:\s*([^-]+)---\r?\n/i);
   if (tableSegments.length > 1) {
@@ -128,36 +188,15 @@ function parseCSVData(csvText: string, tableName = "imported_table"): { tables: 
       const segName = tableSegments[i].trim();
       const content = tableSegments[i + 1].trim();
       if (!content) continue;
-      const res = parseCSVData(content, segName);
+      const res = parseCSVData(content, segName, true);
       allTables.push(...res.tables);
     }
+    if (!skipSmartFK) applySmartFKResolution(allTables);
     return { tables: allTables };
   }
 
   const lines = csvText.trim().split(/\r?\n/);
   if (lines.length < 2) throw new Error("CSV must have at least a header row and one data row.");
-
-  function splitCSVRow(line: string) {
-    const values: string[] = [];
-    let cur = "";
-    let inQuote = false;
-    // Check if it's tab separated
-    const isTSV = line.includes('\t') && !line.includes('","');
-    const separator = isTSV ? '\t' : ',';
-
-    for (let i = 0; i < line.length; i++) {
-      if (line[i] === '"') {
-        inQuote = !inQuote;
-      } else if (line[i] === separator && !inQuote) {
-        values.push(cur);
-        cur = "";
-      } else {
-        cur += line[i];
-      }
-    }
-    values.push(cur);
-    return values.map(v => v.trim());
-  }
 
   const headers = splitCSVRow(lines[0]).map(h => h.toLowerCase().trim());
   const dataRows = lines.slice(1).map(splitCSVRow).filter(r => r.length === headers.length || r.some(c => c !== ""));
@@ -220,13 +259,6 @@ function parseCSVData(csvText: string, tableName = "imported_table"): { tables: 
             linkedColumn = "id";
           }
         }
-      } else if (cName.toLowerCase().endsWith("_id")) {
-        // Fallback heuristic if not explicitly defined in a non FK explicit schema
-        isForeignKey = true;
-        linkedTable = cName.toLowerCase().replace("_id", "");
-        if (linkedTable.endsWith("s")) linkedTable = linkedTable.slice(0, -1);
-        linkedTable = linkedTable + "s";
-        linkedColumn = "id";
       }
 
       table.columns.push({
@@ -246,51 +278,10 @@ function parseCSVData(csvText: string, tableName = "imported_table"): { tables: 
 
   // Otherwise, fallback to generic Data row inference for a single flat table
   const columns = headers.map((header, colIndex) => {
-    let type = "varchar";
+    const colValues = dataRows.map(row => row[colIndex] || "");
+    const type = inferColumnType(colValues);
     let isForeignKey = false;
     let linkedTable: string | undefined = undefined;
-
-    const lowerHeader = header.toLowerCase();
-    if (lowerHeader.endsWith("_id")) {
-      isForeignKey = true;
-      linkedTable = lowerHeader.replace("_id", "");
-      if (linkedTable.endsWith("s")) linkedTable = linkedTable.slice(0, -1);
-      linkedTable = linkedTable + "s";
-    }
-
-    let isUuid = true;
-    let isBoolean = true;
-    let isInteger = true;
-    let isNumeric = true;
-    let isTimestamp = true;
-    let isJsonb = true;
-
-    for (const row of dataRows) {
-      if (!row[colIndex]) {
-        continue;
-      }
-      const val = row[colIndex];
-      const ln = val.toLowerCase();
-
-      if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(val)) isUuid = false;
-      if (ln !== "true" && ln !== "false" && ln !== "1" && ln !== "0") isBoolean = false;
-      if (!/^-?\d+$/.test(val)) isInteger = false;
-      if (!/^-?\d+(\.\d+)?$/.test(val)) isNumeric = false;
-      if (isNaN(Date.parse(val)) || /^\d+$/.test(val)) isTimestamp = false;
-      if (typeof val === 'string' && (!val.startsWith('{') && !val.startsWith('['))) isJsonb = false;
-      try {
-        if (isJsonb) JSON.parse(val);
-      } catch (e) {
-        isJsonb = false;
-      }
-    }
-
-    if (isUuid) type = "uuid";
-    else if (isBoolean) type = "boolean";
-    else if (isInteger) type = "int";
-    else if (isNumeric) type = "numeric";
-    else if (isTimestamp) type = "timestamp";
-    else if (isJsonb) type = "jsonb";
 
     const cleanName = header.toLowerCase().replace(/[^a-z0-9_]/g, "_");
 
@@ -344,7 +335,62 @@ function parseCSVData(csvText: string, tableName = "imported_table"): { tables: 
     }
   };
 
-  return { tables: [table] };
+  const finalTables = [table];
+  if (!skipSmartFK) applySmartFKResolution(finalTables);
+
+  return { tables: finalTables };
+}
+
+// ─── CSV-to-3NF Normalization Engine ─────────────────────
+async function normalizeCSVData(csvText: string): Promise<{ tables: Omit<TableNode, "x" | "y">[]; normalizedSQL: string }> {
+  const lines = csvText.trim().split(/\r?\n/);
+  if (lines.length < 2) throw new Error("CSV must have at least a header row and one data row.");
+
+  // Send ALL data (up to 200 rows) to AI for full SQL generation
+  const maxRows = 200;
+  const csvToSend = lines.slice(0, maxRows + 1).join("\n");
+  const totalRows = lines.length - 1;
+  const prompt = `Normalize this CSV data (${totalRows} rows, showing ${Math.min(totalRows, maxRows)}):\n\n${csvToSend}${totalRows > maxRows ? `\n\n-- (${totalRows - maxRows} more rows not shown, but include ALL ${Math.min(totalRows, maxRows)} shown rows in INSERT statements)` : ""}`;
+
+  console.log("[Normalize] Sending full CSV to AI for SQL generation, rows:", totalRows);
+  const aiSQL = await callAI("normalize-csv", prompt);
+  console.log("[Normalize] Got SQL back, length:", aiSQL.length);
+  console.log("[Normalize] SQL preview:", aiSQL.substring(0, 500));
+
+  // Clean up any markdown fences the AI might have added
+  const cleanSQL = aiSQL.replace(/```sql\n?/g, "").replace(/```\n?/g, "").trim();
+
+  // Parse CREATE TABLE statements into canvas tables
+  const { tables } = parseSQLDDL(cleanSQL);
+  if (tables.length === 0) throw new Error("AI returned no valid CREATE TABLE statements");
+  console.log("[Normalize] Parsed tables:", tables.map(t => t.name));
+
+  // Parse INSERT statements to populate dataRows on each table
+  const insertData = parseInsertStatements(cleanSQL);
+  console.log("[Normalize] Parsed INSERT data:", Array.from(insertData.entries()).map(([k, v]) => `${k}: ${v.length} rows`));
+
+  for (const table of tables) {
+    const rows = insertData.get(table.name.toLowerCase());
+    if (rows && rows.length > 0) {
+      table.dataRows = rows.map(row => ({ id: uuidv4(), ...row }));
+    }
+  }
+
+  // Ensure every table has an "id" column for canvas compatibility
+  for (const table of tables) {
+    if (!table.columns.some(c => c.name === "id")) {
+      table.columns.unshift({
+        id: uuidv4(),
+        name: "id",
+        type: "uuid",
+        constraints: [{ type: "primary" }, { type: "notNull" }],
+        isForeignKey: false,
+        fkStatus: "resolved",
+      });
+    }
+  }
+
+  return { tables, normalizedSQL: cleanSQL };
 }
 
 // ─── SQL DDL Parser ─────────────────────────────────────
@@ -399,6 +445,73 @@ function parseSQLDDL(sql: string): { tables: Omit<TableNode, "x" | "y">[] } {
   return { tables };
 }
 
+// ─── INSERT Statement Parser ─────────────────────────────
+function splitSQLValues(valStr: string): string[] {
+  const values: string[] = [];
+  let cur = "", inQuote = false;
+  for (let i = 0; i < valStr.length; i++) {
+    const ch = valStr[i];
+    if (ch === "'" && (i === 0 || valStr[i - 1] !== "\\")) {
+      inQuote = !inQuote;
+      cur += ch;
+    } else if (ch === "," && !inQuote) {
+      values.push(cur.trim());
+      cur = "";
+    } else {
+      cur += ch;
+    }
+  }
+  values.push(cur.trim());
+  return values;
+}
+
+function parseInsertStatements(sql: string): Map<string, Record<string, string>[]> {
+  const result = new Map<string, Record<string, string>[]>();
+  // Match INSERT INTO table (col1, col2, ...) VALUES ...;
+  const insertRegex = /INSERT\s+INTO\s+["'`]?(\w+)["'`]?\s*\(([^)]+)\)\s*VALUES\s*([\s\S]*?);/gi;
+  let match;
+  while ((match = insertRegex.exec(sql)) !== null) {
+    const tableName = match[1].toLowerCase();
+    const columns = match[2].split(",").map(c => c.trim().replace(/["'`]/g, "").toLowerCase());
+    const valuesBlock = match[3];
+    const rows: Record<string, string>[] = [];
+    // Parse each (...) value tuple, handling quoted strings with commas/parens
+    let i = 0;
+    while (i < valuesBlock.length) {
+      if (valuesBlock[i] === "(") {
+        let depth = 1, inQ = false, tupleContent = "";
+        i++;
+        while (i < valuesBlock.length && depth > 0) {
+          const c = valuesBlock[i];
+          if (c === "'" && (i === 0 || valuesBlock[i - 1] !== "\\")) inQ = !inQ;
+          if (!inQ) {
+            if (c === "(") depth++;
+            if (c === ")") { depth--; if (depth === 0) break; }
+          }
+          tupleContent += c;
+          i++;
+        }
+        // Parse the tuple content into values
+        const vals = splitSQLValues(tupleContent);
+        const row: Record<string, string> = {};
+        columns.forEach((col, idx) => {
+          let v = (vals[idx] || "").trim();
+          // Strip surrounding quotes
+          if (v.startsWith("'") && v.endsWith("'")) v = v.slice(1, -1);
+          // Handle NULL
+          if (v.toUpperCase() === "NULL") v = "";
+          row[col] = v;
+        });
+        rows.push(row);
+      }
+      i++;
+    }
+    const existing = result.get(tableName) || [];
+    result.set(tableName, [...existing, ...rows]);
+  }
+  return result;
+}
+
 // ─── AI Helper ──────────────────────────────────────────
 function robustJsonParse(str: string): any {
   // Step 1: Remove markdown fences
@@ -448,11 +561,314 @@ function robustJsonParse(str: string): any {
   for (let i = 0; i < openBraces; i++) fixed += "}";
   try { return JSON.parse(fixed); } catch { }
 
+  // Step 6: Extract complete table objects from truncated {"tables":[...]} JSON
+  const tablesIdx = fixed.indexOf('"tables"');
+  if (tablesIdx !== -1) {
+    const arrStart = fixed.indexOf("[", tablesIdx);
+    if (arrStart !== -1) {
+      const tableObjects: string[] = [];
+      let pos = arrStart + 1;
+      while (pos < fixed.length) {
+        // Skip whitespace and commas
+        while (pos < fixed.length && /[\s,]/.test(fixed[pos])) pos++;
+        if (pos >= fixed.length || fixed[pos] !== "{") break;
+        // Find matching close brace for this table object
+        let depth = 0;
+        const start = pos;
+        let inStr2 = false;
+        let esc2 = false;
+        for (; pos < fixed.length; pos++) {
+          if (esc2) { esc2 = false; continue; }
+          if (fixed[pos] === "\\") { esc2 = true; continue; }
+          if (fixed[pos] === '"') { inStr2 = !inStr2; continue; }
+          if (inStr2) continue;
+          if (fixed[pos] === "{") depth++;
+          if (fixed[pos] === "}") { depth--; if (depth === 0) { pos++; break; } }
+        }
+        if (depth === 0) {
+          const obj = fixed.substring(start, pos);
+          try { JSON.parse(obj); tableObjects.push(obj); } catch { /* skip malformed table */ }
+        } else break; // Incomplete object — stop
+      }
+      if (tableObjects.length > 0) {
+        console.log(`[VibeDB] Recovered ${tableObjects.length} complete tables from truncated JSON`);
+        return JSON.parse(`{"tables":[${tableObjects.join(",")}]}`);
+      }
+    }
+  }
+
   // Give up
   throw new Error("Failed to parse AI response as JSON");
 }
 
-// Sanitize AI-generated tables: fix missing PKs, duplicate columns, multiple PKs
+// ─── Graceful fallback for truncated audit JSON ───
+function extractPartialAuditResult(raw: string): any {
+  const result: any = {};
+
+  // Extract score (always near the start)
+  const scoreMatch = raw.match(/"score"\s*:\s*(\d+)/);
+  if (scoreMatch) result.score = parseInt(scoreMatch[1], 10);
+
+  // Helper: extract complete JSON objects from an array in the raw string
+  function extractObjects(fieldName: string): any[] | null {
+    const fieldIdx = raw.indexOf(`"${fieldName}"`);
+    if (fieldIdx === -1) return null;
+    const arrStart = raw.indexOf("[", fieldIdx);
+    if (arrStart === -1 || arrStart - fieldIdx > 20) return null; // sanity: [ must be close to field name
+
+    const objects: any[] = [];
+    let pos = arrStart + 1;
+    while (pos < raw.length) {
+      while (pos < raw.length && /[\s,]/.test(raw[pos])) pos++;
+      if (pos >= raw.length || raw[pos] !== "{") break;
+      let depth = 0, inStr = false, esc = false;
+      const start = pos;
+      for (; pos < raw.length; pos++) {
+        if (esc) { esc = false; continue; }
+        if (raw[pos] === "\\") { esc = true; continue; }
+        if (raw[pos] === '"') { inStr = !inStr; continue; }
+        if (inStr) continue;
+        if (raw[pos] === "{") depth++;
+        if (raw[pos] === "}") { depth--; if (depth === 0) { pos++; break; } }
+      }
+      if (depth === 0) {
+        try { objects.push(JSON.parse(raw.substring(start, pos))); } catch { /* skip */ }
+      } else break;
+    }
+    return objects.length > 0 ? objects : null;
+  }
+
+  // Helper: extract string items from a string array field
+  function extractStrings(fieldName: string): string[] | null {
+    const fieldIdx = raw.indexOf(`"${fieldName}"`);
+    if (fieldIdx === -1) return null;
+    const arrStart = raw.indexOf("[", fieldIdx);
+    if (arrStart === -1 || arrStart - fieldIdx > 30) return null;
+
+    // Find array boundary (may be incomplete)
+    let depth = 0, arrEnd = raw.length;
+    let inStr = false, esc = false;
+    for (let i = arrStart; i < raw.length; i++) {
+      if (esc) { esc = false; continue; }
+      if (raw[i] === "\\") { esc = true; continue; }
+      if (raw[i] === '"') { inStr = !inStr; continue; }
+      if (inStr) continue;
+      if (raw[i] === "[") depth++;
+      if (raw[i] === "]") { depth--; if (depth === 0) { arrEnd = i; break; } }
+    }
+    const arrContent = raw.substring(arrStart + 1, arrEnd);
+    const strings: string[] = [];
+    const re = /"((?:[^"\\]|\\.)*)"/g;
+    let m;
+    while ((m = re.exec(arrContent)) !== null) strings.push(m[1]);
+    return strings.length > 0 ? strings : null;
+  }
+
+  // Extract each field
+  const issues = extractObjects("issues");
+  if (issues) result.issues = issues;
+  const suggestions = extractObjects("suggestions");
+  if (suggestions) result.suggestions = suggestions;
+  const strengths = extractStrings("strengths");
+  if (strengths) result.strengths = strengths;
+  const missing = extractStrings("missing_elements");
+  if (missing) result.missing_elements = missing;
+  const risks = extractStrings("risks");
+  if (risks) result.risks = risks;
+
+  // Add truncation note
+  if (!result.score && !result.issues && !result.suggestions) {
+    result.issues = [{ severity: "warning", message: "AI audit response was truncated and could not be parsed. Try re-running the audit." }];
+  } else {
+    result.issues = [...(result.issues || []), { severity: "info", message: "AI audit response was truncated. Some suggestions or details may be missing." }];
+  }
+
+  return result;
+}
+
+// ─── Audit chaining helpers ───
+
+function buildAuditContinuationPrompt(
+  schemaContext: string,
+  partialResult: any,
+): string {
+  const parts: string[] = [];
+  if (partialResult.score !== undefined) parts.push(`Score: ${partialResult.score}`);
+  if (partialResult.issues?.length) parts.push(`Issues already identified: ${partialResult.issues.length}`);
+  if (partialResult.suggestions?.length) {
+    const summaries = partialResult.suggestions.map(
+      (s: any) => `- ${s.type} on ${s.target_table || "schema"}: ${(s.reason || s.description || "").substring(0, 80)}`
+    );
+    parts.push(`Suggestions already generated:\n${summaries.join("\n")}`);
+  }
+  if (partialResult.strengths?.length) parts.push(`Strengths already identified: ${partialResult.strengths.length}`);
+  if (partialResult.missing_elements?.length) parts.push(`Missing elements already identified: ${partialResult.missing_elements.length}`);
+  if (partialResult.risks?.length) parts.push(`Risks already identified: ${partialResult.risks.length}`);
+
+  return `You are continuing a database schema audit that was truncated due to length.
+
+Schema being audited:
+${schemaContext}
+
+Previous audit progress:
+${parts.join("\n")}
+
+Your task: generate ONLY the remaining analysis. Do NOT regenerate the score or already-identified issues/suggestions.
+
+CRITICAL: Return a single valid JSON object with ONLY new/additional items:
+{"suggestions":[...],"strengths":[...],"missing_elements":[...],"risks":[...]}
+
+- suggestions: any NEW suggestions not already listed above. Each must have "type", "target_table", "payload", and "reason".
+- strengths/missing_elements/risks: generate fresh if not in previous response, or add new items.
+- Do NOT include "score" or "issues" — those are already captured.
+- Keep the response compact. No markdown. No text outside JSON.`;
+}
+
+function mergeAuditResults(base: any, continuation: any): any {
+  // Dedup suggestions by type+target_table+payload key
+  const allSuggestions = [...(base.suggestions || []), ...(continuation.suggestions || [])];
+  const seenSuggestions = new Set<string>();
+  const dedupedSuggestions = allSuggestions.filter((s: any) => {
+    const payloadKey = s.payload
+      ? (s.payload.name || s.payload.column || s.payload.columns?.join(",") || s.payload.newName || "")
+      : "";
+    const key = `${s.type}|${s.target_table || ""}|${payloadKey}`;
+    if (seenSuggestions.has(key)) return false;
+    seenSuggestions.add(key);
+    return true;
+  });
+
+  return {
+    ...base,
+    score: base.score,
+    issues: base.issues,
+    suggestions: dedupedSuggestions,
+    strengths: [...new Set([...(base.strengths || []), ...(continuation.strengths || [])])],
+    missing_elements: [...new Set([...(base.missing_elements || []), ...(continuation.missing_elements || [])])],
+    risks: [...new Set([...(base.risks || []), ...(continuation.risks || [])])],
+  };
+}
+
+async function runAuditChain(
+  schemaContext: string,
+  initialResult: any,
+  setPhase: (phase: string) => void,
+): Promise<any> {
+  let merged = { ...initialResult };
+  let continuationCount = 0;
+  let wasTruncated = true;
+
+  while (wasTruncated && continuationCount < MAX_AUDIT_CONTINUATIONS) {
+    continuationCount++;
+    setPhase(`Gathering remaining analysis (${continuationCount + 1}/${MAX_AUDIT_CONTINUATIONS + 1})...`);
+
+    const contPrompt = buildAuditContinuationPrompt(schemaContext, merged);
+    let contResponse: AIRawResponse;
+    try {
+      contResponse = await callAIRaw("inspect-schema", contPrompt, schemaContext);
+    } catch (err) {
+      console.warn(`[VibeDB] Audit continuation ${continuationCount} fetch failed, returning partial results:`, err);
+      break;
+    }
+
+    try {
+      let contResult: any;
+      try {
+        contResult = robustJsonParse(contResponse.result);
+      } catch {
+        contResult = extractPartialAuditResult(contResponse.result);
+      }
+
+      if (contResult && typeof contResult === "object") {
+        // Remove truncation info messages before merging
+        if (contResult.issues) {
+          contResult.issues = contResult.issues.filter((i: any) => !i.message?.includes("truncated"));
+        }
+        merged = mergeAuditResults(merged, contResult);
+        console.log(
+          `[VibeDB] Audit continuation ${continuationCount}: ` +
+          `+${contResult.suggestions?.length || 0} suggestions, ` +
+          `+${contResult.strengths?.length || 0} strengths` +
+          `${contResponse.truncated ? " — still truncated" : ""}`
+        );
+      } else {
+        console.log(`[VibeDB] Audit continuation ${continuationCount}: empty result, stopping`);
+        break;
+      }
+    } catch (err) {
+      console.warn(`[VibeDB] Audit continuation ${continuationCount} parse error, stopping:`, err);
+      break;
+    }
+
+    wasTruncated = contResponse.truncated;
+  }
+
+  return merged;
+}
+
+// ─── Continuation prompt for reactive chaining ───
+function buildContinuationPrompt(
+  originalPrompt: string,
+  existingTables: Omit<TableNode, "x" | "y">[]
+): string {
+  const tableSummaries = existingTables.map(t => {
+    const colNames = t.columns.map(c => c.name).join(", ");
+    return `- ${t.name}: ${colNames}`;
+  }).join("\n");
+
+  return `You are continuing to generate a PostgreSQL schema. The previous response was truncated due to length.
+
+Original requirement: "${originalPrompt}"
+
+These ${existingTables.length} tables have already been generated:
+${tableSummaries}
+
+Generate ONLY the remaining tables needed to fulfill the original requirement. Do NOT regenerate any table listed above.
+Foreign keys referencing existing tables should use their exact names and reference the "id" column.
+Return JSON: {"tables": [...]} containing ONLY the new tables.`;
+}
+
+// ─── Type inference: correct AI type mistakes based on column name semantics ───
+function inferCorrectType(colName: string, aiType: string, isForeignKey: boolean): string {
+  const name = colName.toLowerCase();
+
+  // FK columns and ID columns → uuid is correct
+  if (isForeignKey || name === "id") return aiType;
+  if (name.endsWith("_id") && aiType === "uuid") return "uuid"; // FK pattern
+
+  // If AI used uuid for a non-ID/non-FK column, correct it
+  if (aiType === "uuid" && !name.endsWith("_id") && name !== "id") {
+    // Determine correct type from name semantics
+    if (name.includes("url") || name.includes("link") || name.includes("href")) return "text";
+    if (name.includes("email")) return "varchar";
+    if (name.includes("name") || name.includes("title") || name.includes("slug") || name.includes("label")) return "varchar";
+    if (name.includes("description") || name.includes("bio") || name.includes("content") || name.includes("body") || name.includes("notes") || name.includes("readme")) return "text";
+    if (name.includes("status") || name.includes("role") || name.includes("type") || name.includes("category") || name.includes("tier") || name.includes("level")) return "varchar";
+    if (name.includes("version") || name.includes("code") || name.includes("sku") || name.includes("license") || name.includes("coupon")) return "varchar";
+    if (name.includes("phone") || name.includes("address") || name.includes("city") || name.includes("country") || name.includes("zip") || name.includes("state")) return "varchar";
+    if (name.includes("currency") || name.includes("locale") || name.includes("language") || name.includes("timezone")) return "varchar";
+    if (name.includes("path") || name.includes("filename") || name.includes("extension") || name.includes("mime")) return "varchar";
+    if (name.includes("token") || name.includes("secret") || name.includes("key") || name.includes("hash") || name.includes("password")) return "varchar";
+    if (name.includes("ip") || name.includes("user_agent") || name.includes("origin") || name.includes("referer")) return "varchar";
+    if (name.includes("count") || name.includes("quantity") || name.includes("total") || name.includes("number") || name.includes("max") || name.includes("min") || name.includes("size")) return "int";
+    if (name.includes("price") || name.includes("amount") || name.includes("rate") || name.includes("fee") || name.includes("cost") || name.includes("balance") || name.includes("salary")) return "numeric";
+    if (name.includes("rating") || name.includes("score") || name.includes("percent")) return "numeric";
+    if (name.includes("is_") || name.includes("has_") || name.includes("enabled") || name.includes("active") || name.includes("verified") || name.includes("public") || name.includes("featured")) return "boolean";
+    if (name.includes("_at") || name.includes("date") || name.includes("time") || name.includes("expires") || name.includes("started") || name.includes("ended")) return "timestamp";
+    if (name.includes("meta") || name.includes("config") || name.includes("settings") || name.includes("data") || name.includes("payload") || name.includes("options")) return "jsonb";
+    // Default correction: uuid → varchar for unknown non-ID columns
+    return "varchar";
+  }
+
+  // Fix timestamp used for non-date columns
+  if (aiType === "timestamp" && !name.includes("_at") && !name.includes("date") && !name.includes("time") && !name.includes("expires") && !name.includes("started") && !name.includes("ended") && !name.includes("created") && !name.includes("updated") && !name.includes("deleted") && !name.includes("published") && !name.includes("scheduled") && !name.includes("last_") && !name.includes("next_")) {
+    if (name.includes("code") || name.includes("coupon") || name.includes("token") || name.includes("name") || name.includes("key") || name.includes("status") || name.includes("version")) return "varchar";
+  }
+
+  return aiType;
+}
+
+// Sanitize AI-generated tables: fix missing PKs, duplicate columns, multiple PKs, bad types
 function sanitizeGeneratedTables(tables: any[]): any[] {
   return tables.map(t => {
     const seen = new Set<string>();
@@ -474,16 +890,35 @@ function sanitizeGeneratedTables(tables: any[]): any[] {
         hasId = true;
         // Ensure id has PK constraint
         if (!isPK) {
-          return { ...c, type: c.type || "uuid", constraints: [{ type: "primary" }, { type: "notNull" }, ...(c.constraints || []).filter((x: any) => x.type !== "primary")] };
+          return { ...c, type: "uuid", constraints: [{ type: "primary" }, { type: "notNull" }, ...(c.constraints || []).filter((x: any) => x.type !== "primary")] };
         }
         pkCount++;
         return c;
       }
       // Remove PK from non-id columns (should only be on id)
       if (isPK) {
-        return { ...c, constraints: (c.constraints || []).filter((x: any) => x.type !== "primary") };
+        c = { ...c, constraints: (c.constraints || []).filter((x: any) => x.type !== "primary") };
       }
-      return c;
+
+      // ─── Type correction: fix AI type mistakes ───
+      const correctedType = inferCorrectType(c.name, c.type || "varchar", !!c.isForeignKey);
+
+      // ─── NOT NULL enforcement: add notNull for columns that should logically be required ───
+      const constraints = [...(c.constraints || [])];
+      const hasNotNull = constraints.some((x: any) => x.type === "notNull");
+      if (!hasNotNull) {
+        const name = c.name.toLowerCase();
+        // Most columns should be NOT NULL except explicitly optional ones
+        const isOptional = name === "deleted_at" || name.includes("optional") || name.includes("bio") ||
+          name.includes("notes") || name.includes("description") || name === "avatar_url" ||
+          name === "last_login_at" || name === "phone" || name === "middle_name" ||
+          name.includes("metadata") || name.includes("config");
+        if (!isOptional && name !== "created_at" && name !== "updated_at") {
+          constraints.push({ type: "notNull" });
+        }
+      }
+
+      return { ...c, type: correctedType, constraints };
     });
 
     // If no id column, prepend one
@@ -503,7 +938,86 @@ function sanitizeGeneratedTables(tables: any[]): any[] {
   });
 }
 
-async function callAI(type: string, prompt: string, context?: string) {
+// Convert edge function's {"tables":[...]} JSON format to TableNode[]
+// This handles the AI response when the edge function overrides the system prompt
+// to return full table definitions (with indexes, CHECK constraints, etc.)
+function convertAITablesToNodes(tables: any[]): Omit<TableNode, "x" | "y">[] {
+  const sanitized = sanitizeGeneratedTables(tables);
+  return sanitized.map(t => {
+    const columns: Column[] = (t.columns || []).map((c: any) => ({
+      id: uuidv4(),
+      name: c.name,
+      type: c.type || "varchar",
+      isForeignKey: !!c.isForeignKey,
+      linkedTable: c.linkedTable || undefined,
+      linkedColumn: c.linkedColumn || "id",
+      constraints: c.constraints || [],
+      description: c.description,
+      fkStatus: c.isForeignKey ? "unresolved" : "resolved",
+    }));
+    return {
+      id: uuidv4(),
+      name: t.name,
+      columns,
+      indexes: t.indexes,
+      checkConstraints: t.checkConstraints,
+    };
+  });
+}
+
+// ─── Reactive Chaining: continuation loop for truncated schema generation ───
+async function runContinuationChain(
+  originalPrompt: string,
+  initialTables: Omit<TableNode, "x" | "y">[],
+  strategy: string,
+  tracker: ReturnType<typeof createGenerationTracker>,
+): Promise<{ tables: Omit<TableNode, "x" | "y">[]; continuationCount: number }> {
+  let allTables = [...initialTables];
+  let continuationCount = 0;
+  let wasTruncated = true;
+
+  while (wasTruncated && continuationCount < MAX_CONTINUATION_CALLS) {
+    continuationCount++;
+    const batchLabel = `Generating remaining tables (batch ${continuationCount + 1})`;
+    tracker.insertStep(batchLabel);
+    tracker.advanceStep();
+
+    const contPrompt = buildContinuationPrompt(originalPrompt, allTables);
+    const contResponse = await callAIRaw("generate-schema", contPrompt, undefined, strategy);
+
+    try {
+      const contResult = robustJsonParse(contResponse.result);
+      if (contResult?.tables && Array.isArray(contResult.tables) && contResult.tables.length > 0) {
+        const newTables = convertAITablesToNodes(contResult.tables);
+        // Dedup: filter out tables whose names already exist (case-insensitive)
+        const existingNames = new Set(allTables.map(t => t.name.toLowerCase()));
+        const uniqueNew = newTables.filter(t => !existingNames.has(t.name.toLowerCase()));
+        allTables = [...allTables, ...uniqueNew];
+        console.log(`[VibeDB] Continuation batch ${continuationCount}: +${uniqueNew.length} tables (${allTables.length} total)${contResponse.truncated ? " — still truncated" : ""}`);
+      } else {
+        // AI returned no more tables — schema is complete
+        console.log(`[VibeDB] Continuation batch ${continuationCount}: no new tables returned, stopping`);
+        break;
+      }
+    } catch (err) {
+      // Continuation parse failed — stop chaining, keep what we have
+      console.warn(`[VibeDB] Continuation batch ${continuationCount} parse error, stopping:`, err);
+      break;
+    }
+
+    wasTruncated = contResponse.truncated;
+  }
+
+  return { tables: allTables, continuationCount };
+}
+
+interface AIRawResponse {
+  result: string;
+  truncated: boolean;
+  modelUsed: string;
+}
+
+async function callAIRaw(type: string, prompt: string, context?: string, strategy?: string): Promise<AIRawResponse> {
   const supabaseUrl = import.meta.env.VITE_SUPABASE_URL;
   const supabaseKey = import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY;
   const controller = new AbortController();
@@ -516,20 +1030,29 @@ async function callAI(type: string, prompt: string, context?: string) {
         "Content-Type": "application/json",
         "Authorization": `Bearer ${supabaseKey}`,
       },
-      body: JSON.stringify({ type, prompt, context }),
+      body: JSON.stringify({ type, prompt, context, strategy }),
       signal: controller.signal,
     });
     const data = await res.json();
     if (!res.ok) throw new Error(data?.error || `AI service error (${res.status})`);
     if (data?.error) throw new Error(data.error);
-    const result = data?.result || "";
-    return result.replace(/```json\n?/g, "").replace(/```sql\n?/g, "").replace(/```\n?/g, "").trim();
+    const result = (data?.result || "").replace(/```json\n?/g, "").replace(/```sql\n?/g, "").replace(/```\n?/g, "").trim();
+    return {
+      result,
+      truncated: !!data?.truncated,
+      modelUsed: data?.model_used || "",
+    };
   } catch (err: any) {
     if (err.name === "AbortError") throw new Error("Request timed out — try a simpler prompt or generate in parts");
     throw err;
   } finally {
     clearTimeout(timeout);
   }
+}
+
+async function callAI(type: string, prompt: string, context?: string, strategy?: string) {
+  const { result } = await callAIRaw(type, prompt, context, strategy);
+  return result;
 }
 
 // ─── Force Layout ───────────────────────────────────────
@@ -593,60 +1116,97 @@ function useHistory<T>(initial: T): [T, (action: T | ((prev: T) => T)) => void, 
   return [state, setState, undo, redo, idx > 0, idx < history.length - 1];
 }
 
-// ─── User Menu ──────────────────────────────────────────
-const UserMenu = () => {
-  const { profile, subscription, signOut } = useAuth();
-  const [open, setOpen] = useState(false);
+// ─── Generation Progress UI ─────────────────────────────
+function GenerationProgressUI({ progress }: { progress: GenerationProgress }) {
   return (
-    <div className="relative">
-      <button onClick={() => setOpen(!open)} className="flex h-8 items-center gap-2 rounded-lg bg-secondary px-2.5 text-sm hover:bg-secondary/80 transition">
-        {profile?.avatar_url ? (
-          <img src={profile.avatar_url} alt="" className="h-5 w-5 rounded-full" />
-        ) : (
-          <div className="flex h-5 w-5 items-center justify-center rounded-full bg-primary/20 text-primary text-[10px] font-bold">
-            {(profile?.display_name || "U")[0].toUpperCase()}
-          </div>
-        )}
-        <span className="max-w-[100px] truncate text-xs font-medium">{profile?.display_name || "Account"}</span>
-      </button>
-      {open && (
-        <div className="absolute right-0 top-full mt-1 w-48 rounded-xl bg-card border border-border shadow-xl overflow-hidden z-50">
-          <div className="px-3 py-2 border-b border-border">
-            <div className="text-xs font-semibold truncate">{profile?.display_name}</div>
-          </div>
-          <button onClick={() => { signOut(); setOpen(false); }} className="w-full text-left px-3 py-2 text-sm hover:bg-secondary transition">Sign out</button>
+    <div className="space-y-1.5">
+      {progress.steps.map((step, i) => (
+        <div key={step.id} className="flex items-center gap-2 text-xs">
+          {step.status === "completed" ? (
+            <CheckCircle2 size={12} className="text-emerald-500 shrink-0" />
+          ) : step.status === "error" ? (
+            <AlertCircle size={12} className="text-red-500 shrink-0" />
+          ) : step.status === "active" ? (
+            <Loader2 size={12} className="animate-spin text-accent shrink-0" />
+          ) : (
+            <div className="h-3 w-3 shrink-0 rounded-full border border-muted-foreground/30" />
+          )}
+          <span className={step.status === "active" ? "text-foreground font-medium" : "text-muted-foreground"}>
+            {step.label}
+          </span>
+          {step.startedAt && step.completedAt && (
+            <span className="ml-auto text-[10px] text-muted-foreground/60">
+              {((step.completedAt - step.startedAt) / 1000).toFixed(1)}s
+            </span>
+          )}
+        </div>
+      ))}
+      {progress.totalDurationMs != null && progress.overallStatus !== "running" && (
+        <div className="mt-1 text-[10px] text-muted-foreground/60">
+          Total: {(progress.totalDurationMs / 1000).toFixed(1)}s
         </div>
       )}
     </div>
   );
-};
+}
 
-// ─── Thinking Animation (cycling steps during generation) ─
-const THINKING_STEPS = [
-  "Analyzing your requirements...",
-  "Identifying core entities and relationships...",
-  "Designing table structure and columns...",
-  "Planning foreign key relationships...",
-  "Adding constraints and indexes...",
-  "Optimizing schema for production...",
-];
+// ─── Compiler Report UI ──────────────────────────────────
+function CompilerReportUI({ report }: { report: CompilerReport }) {
+  const [expanded, setExpanded] = React.useState(false);
 
-function ThinkingAnimation() {
-  const [step, setStep] = useState(0);
-  useEffect(() => {
-    const interval = setInterval(() => setStep(s => (s + 1) % THINKING_STEPS.length), 2000);
-    return () => clearInterval(interval);
-  }, []);
+  // Group actions by pass type
+  const grouped = React.useMemo(() => {
+    const map = new Map<string, typeof report.actions>();
+    for (const a of report.actions) {
+      const group = map.get(a.pass) || [];
+      group.push(a);
+      map.set(a.pass, group);
+    }
+    return map;
+  }, [report.actions]);
+
+  const passLabels: Record<string, string> = {
+    "naming": "Naming fixes",
+    "check-constraint": "CHECK constraints added",
+    "fk-index": "FK indexes added",
+    "dedup": "Duplicates removed",
+    "timestamp-default": "Timestamp defaults added",
+  };
+
   return (
-    <motion.span key={step} initial={{ opacity: 0, y: 6 }} animate={{ opacity: 1, y: 0 }} className="block">
-      {THINKING_STEPS[step]}
-    </motion.span>
+    <div className="mt-2 border-t border-border/50 pt-2">
+      <button
+        onClick={() => setExpanded(!expanded)}
+        className="flex items-center gap-1.5 text-xs text-muted-foreground hover:text-foreground transition w-full"
+      >
+        <ChevronDown size={10} className={`transition-transform ${expanded ? "" : "-rotate-90"}`} />
+        <Zap size={11} className="text-amber-500" />
+        <span className="font-medium">Compiler: {report.actions.length} fix{report.actions.length !== 1 ? "es" : ""} applied</span>
+        <span className="ml-auto text-[10px] text-muted-foreground/50">{report.durationMs}ms</span>
+      </button>
+      {expanded && (
+        <div className="mt-1.5 space-y-1 pl-5">
+          {Array.from(grouped.entries()).map(([pass, actions]) => (
+            <div key={pass} className="text-[11px]">
+              <span className="text-muted-foreground">→ {actions.length} {passLabels[pass] || pass}</span>
+              <div className="pl-3 space-y-0.5">
+                {actions.slice(0, 5).map((a, i) => (
+                  <div key={i} className="text-[10px] text-muted-foreground/70 truncate max-w-[400px]">{a.description}</div>
+                ))}
+                {actions.length > 5 && (
+                  <div className="text-[10px] text-muted-foreground/50">...and {actions.length - 5} more</div>
+                )}
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
   );
 }
 
 // ─── Main Component ─────────────────────────────────────
 const VibeDBPage = () => {
-  const { user } = useAuth();
   const [prompt, setPrompt] = useState("");
   const [isGenerating, setIsGenerating] = useState(false);
   const [sidebarItems, setSidebarItems] = useState<Omit<TableNode, "x" | "y">[]>([]);
@@ -659,7 +1219,7 @@ const VibeDBPage = () => {
   const [draggingTable, setDraggingTable] = useState<string | null>(null);
   const [dragOffset, setDragOffset] = useState({ x: 0, y: 0 });
 
-  // ─── Projects ────────────────────────────────────────
+  // ─── Projects (localStorage) ─────────────────────────
   const [projects, setProjects] = useState<Project[]>([]);
   const [currentProjectId, setCurrentProjectId] = useState<string | null>(null);
   const [projectName, setProjectName] = useState("Untitled Schema");
@@ -670,34 +1230,39 @@ const VibeDBPage = () => {
 
   // Load projects list on mount
   useEffect(() => {
-    if (!user) return;
-    const loadProjects = async () => {
-      const { data } = await supabase
-        .from("schemas")
-        .select("id, name, definition, updated_at")
-        .eq("user_id", user.id)
-        .order("updated_at", { ascending: false });
-      if (data) {
-        setProjects(data.map((s: any) => ({
-          id: s.id,
-          name: s.name || "Untitled Schema",
-          definition: Array.isArray(s.definition) ? s.definition : [],
-          updated_at: s.updated_at,
-        })));
+    const metas = ProjectStorage.listProjects();
+    setProjects(metas.map(s => ({
+      id: s.id,
+      name: s.name || "Untitled Schema",
+      definition: [], // lightweight list — full data loaded on demand from IndexedDB
+      updated_at: s.updated_at,
+    })));
+    const lastProjectId = ProjectStorage.getCurrentProjectId();
+    if (lastProjectId) {
+      const meta = metas.find(p => p.id === lastProjectId);
+      if (meta) {
+        setCurrentProjectId(meta.id);
+        setProjectName(meta.name);
+        // Load full project data (with definition + dataRows) from IndexedDB
+        ProjectStorage.getProject(meta.id).then(full => {
+          if (full) setCanvasItems(full.definition);
+        });
       }
-    };
-    loadProjects();
-  }, [user]);
+    }
+  }, []);
 
   // Auto-save current project when canvas changes (debounced)
   useEffect(() => {
-    if (!user || !currentProjectId || canvasItems.length === 0) return;
+    if (!currentProjectId || canvasItems.length === 0) return;
     if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
     saveTimerRef.current = setTimeout(async () => {
-      await supabase
-        .from("schemas")
-        .update({ definition: canvasItems as any, name: projectName })
-        .eq("id", currentProjectId);
+      await ProjectStorage.saveProject({
+        id: currentProjectId,
+        name: projectName,
+        definition: canvasItems,
+        updated_at: new Date().toISOString(),
+        created_at: new Date().toISOString(),
+      });
       setProjects(prev => prev.map(p =>
         p.id === currentProjectId
           ? { ...p, definition: canvasItems, name: projectName, updated_at: new Date().toISOString() }
@@ -705,17 +1270,19 @@ const VibeDBPage = () => {
       ));
     }, 2000);
     return () => { if (saveTimerRef.current) clearTimeout(saveTimerRef.current); };
-  }, [canvasItems, currentProjectId, user, projectName]);
+  }, [canvasItems, currentProjectId, projectName]);
 
   const saveProject = useCallback(async () => {
-    if (!user) return;
     setIsSaving(true);
     try {
       if (currentProjectId) {
-        await supabase
-          .from("schemas")
-          .update({ definition: canvasItems as any, name: projectName })
-          .eq("id", currentProjectId);
+        await ProjectStorage.saveProject({
+          id: currentProjectId,
+          name: projectName,
+          definition: canvasItems,
+          updated_at: new Date().toISOString(),
+          created_at: new Date().toISOString(),
+        });
         setProjects(prev => prev.map(p =>
           p.id === currentProjectId
             ? { ...p, definition: canvasItems, name: projectName, updated_at: new Date().toISOString() }
@@ -724,18 +1291,21 @@ const VibeDBPage = () => {
         addToast("Project saved", "success");
       } else {
         const newId = uuidv4();
-        await supabase.from("schemas").insert({
+        const now = new Date().toISOString();
+        await ProjectStorage.saveProject({
           id: newId,
-          user_id: user.id,
           name: projectName,
-          definition: canvasItems as any,
+          definition: canvasItems,
+          updated_at: now,
+          created_at: now,
         });
         setCurrentProjectId(newId);
+        ProjectStorage.setCurrentProjectId(newId);
         setProjects(prev => [{
           id: newId,
           name: projectName,
           definition: canvasItems,
-          updated_at: new Date().toISOString(),
+          updated_at: now,
         }, ...prev]);
         addToast("Project created", "success");
       }
@@ -744,12 +1314,15 @@ const VibeDBPage = () => {
     } finally {
       setIsSaving(false);
     }
-  }, [user, currentProjectId, canvasItems, projectName]);
+  }, [currentProjectId, canvasItems, projectName]);
 
-  const loadProject = useCallback((project: Project) => {
+  const loadProject = useCallback(async (project: Project) => {
     setCurrentProjectId(project.id);
+    ProjectStorage.setCurrentProjectId(project.id);
     setProjectName(project.name);
-    setCanvasItems(project.definition);
+    // Load full project data (with dataRows) from IndexedDB
+    const full = await ProjectStorage.getProject(project.id);
+    setCanvasItems(full ? full.definition : project.definition);
     setSidebarItems([]);
     setShowProjectsPanel(false);
     addToast(`Opened "${project.name}"`, "info");
@@ -757,6 +1330,7 @@ const VibeDBPage = () => {
 
   const newProject = useCallback(() => {
     setCurrentProjectId(null);
+    ProjectStorage.setCurrentProjectId(null);
     setProjectName("Untitled Schema");
     setCanvasItems([]);
     setSidebarItems([]);
@@ -765,10 +1339,11 @@ const VibeDBPage = () => {
   }, []);
 
   const deleteProject = useCallback(async (projectId: string) => {
-    await supabase.from("schemas").delete().eq("id", projectId);
+    await ProjectStorage.deleteProject(projectId);
     setProjects(prev => prev.filter(p => p.id !== projectId));
     if (currentProjectId === projectId) {
       setCurrentProjectId(null);
+      ProjectStorage.setCurrentProjectId(null);
       setProjectName("Untitled Schema");
       setCanvasItems([]);
     }
@@ -788,12 +1363,16 @@ const VibeDBPage = () => {
   const [copied, setCopied] = useState(false);
   const [showPlayground, setShowPlayground] = useState(false);
   const [queryPrompt, setQueryPrompt] = useState("");
+  const [isCallingAI, setIsCallingAI] = useState(false);
   const [generatedQuery, setGeneratedQuery] = useState("");
   const [isQuerying, setIsQuerying] = useState(false);
   const [showImportModal, setShowImportModal] = useState(false);
   const [importText, setImportText] = useState("");
+  const [normalizeOnImport, setNormalizeOnImport] = useState(false);
+  const [normalizedSQL, setNormalizedSQL] = useState<string | null>(null);
   const [showAuditModal, setShowAuditModal] = useState(false);
   const [isAuditing, setIsAuditing] = useState(false);
+  const [auditPhase, setAuditPhase] = useState("");
   const [auditReport, setAuditReport] = useState<AuditReport | null>(null);
   const [showBatchModal, setShowBatchModal] = useState(false);
   const [batchPrompt, setBatchPrompt] = useState("");
@@ -809,9 +1388,19 @@ const VibeDBPage = () => {
   const [isGeneratingSidebar, setIsGeneratingSidebar] = useState(false);
   const [showChatPanel, setShowChatPanel] = useState(false);
 
-  // AI Thinking
+  // AI Thinking & Generation Tracking
   const [generationThinking, setGenerationThinking] = useState<string>("");
   const [thinkingExpanded, setThinkingExpanded] = useState(false);
+  const [generationProgress, setGenerationProgress] = useState<GenerationProgress | null>(null);
+  const [selectedStrategy, setSelectedStrategy] = useState(getDefaultStrategy);
+  const [showHistoryPanel, setShowHistoryPanel] = useState(false);
+
+  // Feature Panels
+  const [showDBManager, setShowDBManager] = useState(false);
+  const [showQueryBuilder, setShowQueryBuilder] = useState(false);
+  const [showSupabasePanel, setShowSupabasePanel] = useState(false);
+  const [showSREMode, setShowSREMode] = useState(false);
+  const [showAskData, setShowAskData] = useState(false);
 
   // Deploy
   const [showDeployModal, setShowDeployModal] = useState(false);
@@ -821,10 +1410,13 @@ const VibeDBPage = () => {
   const [isTesting, setIsTesting] = useState(false);
   const [isDeploying, setIsDeploying] = useState(false);
   const [deployResults, setDeployResults] = useState<{ statement: string; success: boolean; error?: string }[] | null>(null);
+  const [isImportingRows, setIsImportingRows] = useState(false);
   const [deployFixResult, setDeployFixResult] = useState<FixResult | null>(null);
+  const [compilerReport, setCompilerReport] = useState<CompilerReport | null>(null);
 
   // Schema Diff
   const [diffBase, setDiffBase] = useState<TableNode[] | null>(null);
+  const [showSchemaCompare, setShowSchemaCompare] = useState(false);
   const [showDiff, setShowDiff] = useState(false);
 
   // Connection mode
@@ -843,7 +1435,16 @@ const VibeDBPage = () => {
     setTimeout(() => setToasts(prev => prev.filter(t => t.id !== id)), 2500);
   }, []);
 
-  useEffect(() => setGeneratedSql(""), [canvasItems]);
+  // Track whether we're in the middle of a normalization import
+  const skipNormalizedClearRef = useRef(false);
+  useEffect(() => {
+    setGeneratedSql("");
+    if (skipNormalizedClearRef.current) {
+      skipNormalizedClearRef.current = false; // Reset flag, don't clear normalizedSQL
+    } else {
+      setNormalizedSQL(null);
+    }
+  }, [canvasItems]);
 
   // Keyboard shortcuts
   useEffect(() => {
@@ -854,6 +1455,10 @@ const VibeDBPage = () => {
         setShowAddTableMenu(false); setShowExportMenu(false); setShowMockDataModal(false);
         setConnectionMode(null); setEditingColumn(null); setShowDiff(false);
         setShowDeployModal(false); setShowChatPanel(false);
+        setShowDBManager(false); setShowQueryBuilder(false);
+        setShowSupabasePanel(false); setShowSREMode(false);
+        setShowHistoryPanel(false); setShowSchemaCompare(false);
+        setShowAskData(false);
       }
       if ((e.metaKey || e.ctrlKey) && e.key === "z") { e.preventDefault(); undo(); }
       if ((e.metaKey || e.ctrlKey) && e.key === "y") { e.preventDefault(); redo(); }
@@ -869,36 +1474,174 @@ const VibeDBPage = () => {
     setSidebarItems([]);
     setAuditReport(null);
     setThinkingExpanded(true);
+
+    const tracker = createGenerationTracker(setGenerationProgress);
+    const strategy = selectedStrategy;
+    let generatedTables: Omit<TableNode, "x" | "y">[] = [];
+    let errorMsg = "";
+    let continuationCount = 0;
+
+    if (strategy === "v2-pipeline") {
+      tracker.start([
+        "Extracting entities from prompt",
+        "Designing full schema with constraints",
+        "Compiling schema (deterministic passes)",
+        "Resolving foreign keys",
+        "Finalizing schema",
+      ]);
+    } else {
+      tracker.start([
+        "Sending prompt to AI",
+        "Parsing schema response",
+        "Compiling schema (deterministic passes)",
+        "Resolving foreign keys",
+        "Finalizing schema",
+      ]);
+    }
+
     try {
-      const resultStr = await callAI("generate-schema", prompt);
-      let result = robustJsonParse(resultStr);
-      // Handle AI returning an array instead of { tables: [...] }
-      if (Array.isArray(result)) {
-        result = { tables: result };
-      }
-      if (result?.tables && result.tables.length > 0) {
-        const sanitized = sanitizeGeneratedTables(result.tables);
-        const tables = sanitized.map((t: any, i: number) => ({
-          ...t,
-          id: t.id || uuidv4(),
-          x: 100 + (i % 4) * 350,
-          y: 100 + Math.floor(i / 4) * 400,
-          columns: (t.columns || []).map((c: any) => ({
-            ...c, id: c.id || uuidv4(), fkStatus: c.isForeignKey ? "resolved" : "resolved", constraints: c.constraints || [],
-          })),
-        }));
-        setCanvasItems(prev => [...prev, ...tables]);
-        addToast(`Generated ${tables.length} tables on canvas`, "success");
+      if (strategy === "v2-pipeline") {
+        // Pipeline: Step 1 — entity extraction
+        const entityPrompt = `Extract the core entities (tables) and their relationships from this requirement. Return JSON: { "entities": [...], "relationships": [...] }.\n\nRequirement: "${prompt}"`;
+        const entityStr = await callAI("generate-schema", entityPrompt, undefined, strategy);
+        const entityResult = robustJsonParse(entityStr);
+        tracker.advanceStep();
+
+        // Pipeline: Step 2 — full schema design from entities (always use tables format)
+        if (entityResult?.entities) {
+          const entityNames = entityResult.entities.map((e: any) => e.name || e).join(", ");
+          const schemaPrompt = `Design a full production-quality PostgreSQL schema for these entities: [${entityNames}].\nOriginal requirement: "${prompt}"\n\nIMPORTANT: Return JSON with {"tables":[...]} format. Do NOT return entities format.`;
+          const schemaResponse = await callAIRaw("generate-schema", schemaPrompt, undefined, strategy);
+          const schemaResult = robustJsonParse(schemaResponse.result);
+          tracker.advanceStep();
+
+          if (schemaResult?.tables && Array.isArray(schemaResult.tables)) {
+            generatedTables = convertAITablesToNodes(schemaResult.tables);
+          } else {
+            // Fallback: if AI still returned entities, convert them to minimal tables
+            const fallbackTables = (schemaResult?.entities || entityResult.entities).map((e: any) => ({
+              name: typeof e === "string" ? e : e.name,
+              columns: [
+                { name: "id", type: "uuid", constraints: [{ type: "primary" }, { type: "notNull" }] },
+                ...(e.attributes || []).map((a: any) => ({ name: a.name, type: a.type || "varchar", constraints: [{ type: "notNull" }] })),
+                { name: "created_at", type: "timestamp", constraints: [{ type: "default", value: "now()" }] },
+                { name: "updated_at", type: "timestamp", constraints: [{ type: "default", value: "now()" }] },
+              ],
+              indexes: [],
+              checkConstraints: [],
+            }));
+            generatedTables = convertAITablesToNodes(fallbackTables);
+          }
+
+          // Reactive chaining: if truncated, generate remaining tables
+          if (schemaResponse.truncated && generatedTables.length > 0) {
+            const chainResult = await runContinuationChain(prompt, generatedTables, strategy, tracker);
+            generatedTables = chainResult.tables;
+            continuationCount = chainResult.continuationCount;
+          }
+        } else {
+          tracker.advanceStep();
+        }
       } else {
-        addToast("No tables generated — try a more specific prompt", "warning");
+        // Direct or Fast: single AI call — always uses tables format via edge function system prompt
+        const initialResponse = await callAIRaw("generate-schema", prompt, undefined, strategy);
+        tracker.advanceStep();
+        const result = robustJsonParse(initialResponse.result);
+
+        if (result?.tables && Array.isArray(result.tables)) {
+          generatedTables = convertAITablesToNodes(result.tables);
+        } else if (result?.entities && Array.isArray(result.entities)) {
+          // AI returned entities instead of tables — convert to tables format and process
+          const fallbackTables = result.entities.map((e: any) => ({
+            name: typeof e === "string" ? e : e.name,
+            columns: [
+              { name: "id", type: "uuid", constraints: [{ type: "primary" }, { type: "notNull" }] },
+              ...(e.attributes || []).map((a: any) => ({ name: a.name, type: a.type || "varchar", constraints: [{ type: "notNull" }] })),
+              { name: "created_at", type: "timestamp", constraints: [{ type: "default", value: "now()" }] },
+              { name: "updated_at", type: "timestamp", constraints: [{ type: "default", value: "now()" }] },
+            ],
+            indexes: [],
+            checkConstraints: [],
+          }));
+          generatedTables = convertAITablesToNodes(fallbackTables);
+        }
+        tracker.advanceStep();
+
+        // Reactive chaining: if truncated, generate remaining tables
+        if (initialResponse.truncated && generatedTables.length > 0) {
+          const chainResult = await runContinuationChain(prompt, generatedTables, strategy, tracker);
+          generatedTables = chainResult.tables;
+          continuationCount = chainResult.continuationCount;
+        }
+      }
+
+      if (generatedTables.length > 0) {
+        // Position tables on canvas in a grid layout
+        const positioned = generatedTables.map((t, i) => ({
+          ...t,
+          x: (-view.x / view.zoom) + 100 + (i % 4) * 300,
+          y: (-view.y / view.zoom) + 100 + Math.floor(i / 4) * 300,
+        })) as TableNode[];
+
+        // Run deterministic compiler pipeline
+        tracker.advanceStep();
+        const { tables: compiled, report: cReport } = runCompilerPass(positioned);
+        setCompilerReport(cReport);
+
+        // Resolve FK linkedTableId references
+        tracker.advanceStep();
+        setCanvasItems(prev => {
+          const allTables = [...prev, ...compiled];
+          const tableMap = new Map<string, string>();
+          allTables.forEach(t => tableMap.set(t.name.toLowerCase(), t.id));
+          const resolved = compiled.map(t => ({
+            ...t,
+            columns: t.columns.map(col => {
+              if (col.isForeignKey && col.linkedTable) {
+                const targetId = tableMap.get(col.linkedTable.toLowerCase());
+                return { ...col, linkedTableId: targetId, fkStatus: targetId ? "resolved" as const : "unresolved" as const };
+              }
+              return col;
+            }),
+          }));
+          return [...prev, ...resolved];
+        });
+        tracker.complete();
+        const fixCount = cReport.actions.length;
+        const batchNote = continuationCount > 0 ? ` across ${continuationCount + 1} batches` : "";
+        addToast(`Generated ${generatedTables.length} tables${batchNote}${fixCount > 0 ? ` · Compiler: ${fixCount} fix${fixCount !== 1 ? "es" : ""} applied` : ""}`, "success");
+      } else {
+        tracker.complete();
+        addToast("No tables extracted from prompt", "warning");
       }
     } catch (err: any) {
-      const msg = err.message?.includes("Failed to fetch") || err.message?.includes("timed out")
+      errorMsg = err.message?.includes("Failed to fetch") || err.message?.includes("timed out")
         ? "Generation timed out — the AI is still working. Try again or use a simpler prompt."
+        : err.message?.includes("parse") || err.message?.includes("JSON")
+        ? "AI response was too large to process completely. Try again or use a simpler prompt."
         : err.message || "Failed to generate schema";
-      addToast(msg, "error");
+      tracker.fail(errorMsg);
+      addToast(errorMsg, "error");
     } finally {
       setIsGenerating(false);
+
+      // Record to generation history
+      const progress = tracker.getProgress();
+      const record: GenerationRecord = {
+        id: uuidv4(),
+        prompt: prompt.trim(),
+        strategy,
+        steps: progress.steps,
+        resultTableCount: generatedTables.length,
+        resultTableNames: generatedTables.map(t => t.name),
+        startedAt: progress.startedAt || Date.now(),
+        completedAt: progress.completedAt || Date.now(),
+        durationMs: progress.totalDurationMs || 0,
+        success: !errorMsg,
+        error: errorMsg || undefined,
+        continuationCount,
+      };
+      GenerationHistoryStore.addRecord(record);
     }
   };
 
@@ -907,22 +1650,43 @@ const VibeDBPage = () => {
     setIsGeneratingSidebar(true);
     try {
       const existingTables = [...canvasItems, ...sidebarItems.map(t => ({ ...t, x: 0, y: 0 }))].map(t => t.name).join(", ");
-      const resultStr = await callAI(
-        "generate-schema",
-        `Existing tables: [${existingTables}]. Generate 1-3 new tables for: "${sidebarPrompt}". Return JSON with "tables" key.`
-      );
+
+      // Send context about existing tables so the edge function knows what already exists
+      const fullPrompt = `Generate 1-3 new tables for an existing system.\nExisting tables: [${existingTables}].\n\nRequirement: "${sidebarPrompt}"`;
+
+      const resultStr = await callAI("generate-schema", fullPrompt, undefined, selectedStrategy);
       const result = robustJsonParse(resultStr);
-      if (result?.tables) {
-        const sanitized = sanitizeGeneratedTables(result.tables);
-        const tables = sanitized.map((t: any) => ({
-          ...t,
-          id: t.id || uuidv4(),
-          columns: (t.columns || []).map((c: any) => ({
-            ...c, id: c.id || uuidv4(), fkStatus: "resolved", constraints: c.constraints || [],
-          })),
+
+      let generatedTables: Omit<TableNode, "x" | "y">[] = [];
+
+      if (result?.tables && Array.isArray(result.tables)) {
+        generatedTables = convertAITablesToNodes(result.tables);
+      } else if (result?.entities && Array.isArray(result.entities)) {
+        // Convert entities to minimal tables format instead of using lossy buildSchemaFromIntent
+        const fallbackTables = result.entities.map((e: any) => ({
+          name: typeof e === "string" ? e : e.name,
+          columns: [
+            { name: "id", type: "uuid", constraints: [{ type: "primary" }, { type: "notNull" }] },
+            ...(e.attributes || []).map((a: any) => ({ name: a.name, type: a.type || "varchar", constraints: [{ type: "notNull" }] })),
+            { name: "created_at", type: "timestamp", constraints: [{ type: "default", value: "now()" }] },
+            { name: "updated_at", type: "timestamp", constraints: [{ type: "default", value: "now()" }] },
+          ],
+          indexes: [],
+          checkConstraints: [],
         }));
-        setSidebarItems(prev => [...prev, ...tables]);
-        addToast(`Generated ${tables.length} new tables`, "success");
+        generatedTables = convertAITablesToNodes(fallbackTables);
+      }
+
+      if (generatedTables.length > 0) {
+        // Run compiler pipeline on sidebar tables too
+        const withPos = generatedTables.map(t => ({ ...t, x: 0, y: 0 })) as TableNode[];
+        const { tables: compiled, report: cReport } = runCompilerPass(withPos);
+        const withoutPos = compiled.map(({ x, y, ...rest }) => rest);
+        setSidebarItems(prev => [...prev, ...withoutPos]);
+        const fixCount = cReport.actions.length;
+        addToast(`Compiled ${generatedTables.length} new tables${fixCount > 0 ? ` · ${fixCount} fix${fixCount !== 1 ? "es" : ""}` : ""}`, "success");
+      } else {
+        addToast("No valid entities extracted", "warning");
       }
     } catch {
       addToast("Failed to generate tables", "error");
@@ -976,8 +1740,36 @@ const VibeDBPage = () => {
   // ─── Compile SQL ──────────────────────────────────────
   const handleCompileSQL = () => {
     if (canvasItems.length === 0) { addToast("Add tables first", "error"); return; }
-    setGeneratedSql(generateSQL(canvasItems));
+    // If we have AI-generated normalized SQL, show that; otherwise generate from canvas
+    if (normalizedSQL) {
+      setGeneratedSql(normalizedSQL);
+    } else {
+      setGeneratedSql(generateSQL(canvasItems));
+    }
     setShowSqlModal(true);
+  };
+
+  // ─── Fix FK Issues from SQL Viewer ─────────────────
+  const handleFixSqlIssues = () => {
+    const canvasIssues = preDeployValidateSchema(canvasItems);
+    if (canvasIssues.length === 0) {
+      addToast("No issues found", "info");
+      return;
+    }
+
+    const result = diagnoseAndFixSchema(canvasItems, canvasIssues, view);
+
+    // Update canvas + SQL — new tables are already positioned at viewport-relative
+    // coordinates by diagnoseAndFixSchema, so no force layout needed.
+    setCanvasItems(result.fixedItems);
+    setGeneratedSql(generateSQL(result.fixedItems));
+
+    const fixableCount = result.actions.filter(a => a.type !== "unfixable" && a.type !== "skip_existing").length;
+    addToast(
+      `Fixed ${fixableCount} issue${fixableCount !== 1 ? "s" : ""}` +
+      (result.hasUnfixable ? ` (${result.actions.filter(a => a.type === "unfixable").length} unfixable)` : ""),
+      result.hasUnfixable ? "warning" : "success"
+    );
   };
 
   // ─── Export ───────────────────────────────────────────
@@ -1038,9 +1830,8 @@ const VibeDBPage = () => {
 
     // Clear previous fix results
     setDeployFixResult(null);
-    setDeployResults(null);
 
-    // Pre-deploy validation: check for schema issues before hitting Supabase
+    // Pre-Deploy Schema Validation
     const preDeployIssues = preDeployValidateSchema(canvasItems);
     if (preDeployIssues.length > 0) {
       setDeployResults(preDeployIssues);
@@ -1048,60 +1839,111 @@ const VibeDBPage = () => {
       return;
     }
 
-    // ALWAYS use deferred FK mode: create all tables first, then add FK constraints via ALTER TABLE.
-    // This prevents ordering errors (42P01) when tables reference each other.
-    const sql = generateSQLDeferred(canvasItems, schemaEnums, schemaFunctions);
-    console.log("[VibeDB Deploy] Using DEFERRED FK SQL generation (always-on)");
+    // Auto-heal deploy loop: deploy → if errors → classify → fix → retry (max 3 attempts)
+    const MAX_ATTEMPTS = 3;
+    let currentItems = canvasItems;
+    let attempts = 0;
+    let lastResult: { success: boolean; results: { statement: string; success: boolean; error?: string }[]; setupNeeded?: boolean } | null = null;
+
     setIsDeploying(true);
+    setDeployResults(null);
     setDeploySetupNeeded(false);
+
     try {
-      const res = await fetch(`${import.meta.env.VITE_SUPABASE_URL}/functions/v1/vibedb-deploy`, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "Authorization": `Bearer ${import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY}`,
-        },
-        body: JSON.stringify({ sql, supabaseUrl: deployUrl, serviceRoleKey: deployKey, action: "deploy" }),
-      });
-      const data = await res.json();
-      if (data.setup_needed) {
-        setDeploySetupNeeded(true);
-        addToast("Setup required — see instructions in the deploy modal", "warning");
-        return;
-      }
-      if (!res.ok && data.error) throw new Error(data.error);
-      setDeployResults(data.results || []);
-      if (data.success) {
-        addToast("Schema deployed successfully!", "success");
+      while (attempts < MAX_ATTEMPTS) {
+        attempts++;
+        console.log(`[VibeDB Deploy] Attempt ${attempts}/${MAX_ATTEMPTS}`);
 
-        // Self-Healing Telemetry: If this successful deploy immediately followed an auto-fix, log it.
-        if (deployFixResult && deployFixResult.initialErrors && deployFixResult.initialErrors.length > 0) {
-          // Fire and forget telemetry
-          fetch(`${import.meta.env.VITE_SUPABASE_URL}/functions/v1/vibedb-telemetry`, {
-            method: "POST",
-            headers: {
-              "Content-Type": "application/json",
-              "Authorization": `Bearer ${import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY}`,
-            },
-            body: JSON.stringify({
-              event: "schema_auto_fix_success",
-              initialErrors: deployFixResult.initialErrors,
-              appliedFixes: deployFixResult.actions,
-              finalSql: sql
-            }),
-          }).catch(err => console.error("[VibeDB Telemetry] Failed to log telemetry:", err));
+        lastResult = await executeDeployCall(currentItems);
 
-          // Clear the fix result so we don't double log on next deploy
-          setDeployFixResult(null);
+        // Setup needed — abort, show instructions
+        if (lastResult.setupNeeded) {
+          setDeploySetupNeeded(true);
+          addToast("Setup required — see instructions in the deploy modal", "warning");
+          return;
         }
-      } else {
-        addToast(data.message || "Deploy had errors", "warning");
+
+        setDeployResults(lastResult.results);
+
+        if (lastResult.success) {
+          const healMsg = attempts > 1 ? ` (auto-healed after ${attempts - 1} fix${attempts > 2 ? "es" : ""})` : "";
+          addToast(`Schema deployed successfully${healMsg}!`, "success");
+
+          // Self-Healing Telemetry
+          if (deployFixResult && deployFixResult.initialErrors && deployFixResult.initialErrors.length > 0) {
+            fetch(`${import.meta.env.VITE_SUPABASE_URL}/functions/v1/vibedb-telemetry`, {
+              method: "POST",
+              headers: { "Content-Type": "application/json", "Authorization": `Bearer ${import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY}` },
+              body: JSON.stringify({ event: "schema_auto_fix_success", initialErrors: deployFixResult.initialErrors, appliedFixes: deployFixResult.actions }),
+            }).catch(err => console.error("[VibeDB Telemetry]", err));
+            setDeployFixResult(null);
+          }
+          return;
+        }
+
+        // Deploy failed — try auto-heal if not last attempt
+        if (attempts >= MAX_ATTEMPTS) break;
+
+        const failedResults = lastResult.results.filter(r => !r.success);
+        if (failedResults.length === 0) break; // No errors to fix
+
+        console.log(`[VibeDB Deploy] Auto-healing ${failedResults.length} errors...`);
+        const fixResult = diagnoseAndFixSchema(currentItems, failedResults, view);
+
+        if (fixResult.hasUnfixable || fixResult.actions.length === 0) {
+          console.log("[VibeDB Deploy] Unfixable errors or no fixes available, stopping auto-heal");
+          break;
+        }
+
+        // Apply fixes and retry
+        currentItems = fixResult.fixedItems;
+        setCanvasItems(currentItems);
+        setDeployFixResult(fixResult);
+        addToast(`Auto-healing: ${fixResult.actions.length} fix${fixResult.actions.length !== 1 ? "es" : ""} applied, retrying deploy...`, "info");
       }
+
+      // If we get here, deploy failed after all attempts
+      addToast(lastResult?.success === false ? "Deploy had errors — see details" : "Deploy failed", "warning");
     } catch (e: any) {
       addToast("Deploy failed: " + e.message, "error");
     } finally {
       setIsDeploying(false);
     }
+  };
+
+
+  const executeDeployCall = async (itemsToDeploy: TableNode[]): Promise<{ success: boolean; results: { statement: string; success: boolean; error?: string }[]; setupNeeded?: boolean }> => {
+    // Generate SQL from canvas items (always deferred FK mode unless we have normalized SQL)
+    let sqlToRun: string;
+    if (normalizedSQL) {
+      sqlToRun = normalizedSQL;
+      console.log("[VibeDB Deploy] Using AI-generated normalized SQL (length:", sqlToRun.length, ")");
+    } else {
+      sqlToRun = generateSQLDeferred(itemsToDeploy, schemaEnums, schemaFunctions);
+      console.log("[VibeDB Deploy] Using DEFERRED FK SQL generation (always-on)");
+    }
+    const insertCount = (sqlToRun.match(/INSERT INTO/gi) || []).length;
+    console.log("[VibeDB Deploy] INSERT count:", insertCount, "| Tables with dataRows:", itemsToDeploy.filter(t => t.dataRows && t.dataRows.length > 0).map(t => `${t.name}(${t.dataRows!.length} rows)`).join(", ") || "none");
+
+    const res = await fetch(`${import.meta.env.VITE_SUPABASE_URL}/functions/v1/vibedb-deploy`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY}`,
+      },
+      body: JSON.stringify({ sql: sqlToRun, supabaseUrl: deployUrl, serviceRoleKey: deployKey, action: "deploy" }),
+    });
+    const data = await res.json();
+
+    if (data.setup_needed) {
+      return { success: false, results: [], setupNeeded: true };
+    }
+    if (!res.ok && data.error) throw new Error(data.error);
+
+    return {
+      success: !!data.success,
+      results: data.results || [],
+    };
   };
 
   // ─── Fix Deploy Errors ─────────────────────────────────
@@ -1168,6 +2010,59 @@ const VibeDBPage = () => {
     addToast("Disconnected", "info");
   };
 
+  // ─── Import Rows from Supabase ─────────────────────────
+  const handleImportRows = async () => {
+    if (canvasItems.length === 0 || !deployConnected) return;
+    setIsImportingRows(true);
+
+    const supabaseUrl = import.meta.env.VITE_SUPABASE_URL;
+    const supabaseKey = import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY;
+    let totalRows = 0;
+    let tablesUpdated = 0;
+
+    try {
+      const updatedItems = [...canvasItems];
+
+      for (let i = 0; i < updatedItems.length; i++) {
+        const table = updatedItems[i];
+        try {
+          const res = await fetch(`${supabaseUrl}/functions/v1/vibedb-deploy`, {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              "Authorization": `Bearer ${supabaseKey}`,
+            },
+            body: JSON.stringify({
+              action: "query",
+              sql: `SELECT * FROM ${table.name} LIMIT 10000`,
+              supabaseUrl: deployUrl,
+              serviceRoleKey: deployKey,
+            }),
+          });
+          const data = await res.json();
+          if (data.success && data.rows && data.rows.length > 0) {
+            updatedItems[i] = { ...table, dataRows: data.rows };
+            totalRows += data.rows.length;
+            tablesUpdated++;
+          }
+        } catch {
+          // Table might not exist in DB yet — skip silently
+        }
+      }
+
+      setCanvasItems(updatedItems);
+      if (totalRows > 0) {
+        addToast(`Imported ${totalRows} rows from ${tablesUpdated} table${tablesUpdated !== 1 ? "s" : ""}`, "success");
+      } else {
+        addToast("No data found in Supabase tables", "info");
+      }
+    } catch (e: any) {
+      addToast("Import failed: " + (e.message || "Unknown error"), "error");
+    } finally {
+      setIsImportingRows(false);
+    }
+  };
+
   // ─── Auto Layout ──────────────────────────────────────
   const handleAutoLayout = () => {
     if (canvasItems.length === 0) return;
@@ -1200,21 +2095,63 @@ const VibeDBPage = () => {
     addToast(`Inferred ${count} relationships`, "success");
   };
 
-  // ─── SQL Import ───────────────────────────────────────
-  const handleImport = () => {
+  // ─── SQL / CSV Import ─────────────────────────────────
+  const handleImport = async () => {
     try {
       let result;
+
+      // If normalize toggle is on and it's not SQL, use AI-powered 3NF normalization
+      if (normalizeOnImport && !(/CREATE\s+TABLE/i.test(importText))) {
+        addToast("Analyzing CSV for 3NF normalization...", "info");
+        setIsCallingAI(true);
+        try {
+          const normResult = await normalizeCSVData(importText);
+          result = normResult;
+          if (!result || result.tables.length === 0) throw new Error("Normalization produced no tables");
+          setNormalizedSQL(normResult.normalizedSQL);
+          skipNormalizedClearRef.current = true; // Prevent useEffect from clearing normalizedSQL
+          const totalRows = result.tables.reduce((sum, t) => sum + (t.dataRows?.length || 0), 0);
+          addToast(`Normalized into ${result.tables.length} tables (${totalRows} total rows)`, "success");
+        } catch (normErr: any) {
+          console.error("[Normalize] Failed:", normErr);
+          addToast("Normalization failed: " + normErr.message + ". Falling back to flat import.", "warning");
+          result = parseCSVData(importText);
+        } finally {
+          setIsCallingAI(false);
+        }
+      }
       // Simple heuristic: if it has CREATE TABLE, treat as SQL, else try CSV first
-      if (/CREATE\s+TABLE/i.test(importText)) {
+      else if (/CREATE\s+TABLE/i.test(importText)) {
         result = parseSQLDDL(importText);
-        if (result.tables.length === 0) { addToast("No tables found in SQL", "error"); return; }
+        // If SQL parsing fails natively, fallback is handled below
       } else {
         try {
           result = parseCSVData(importText);
+          if (result.tables.length === 0) throw new Error("No tables found in CSV");
         } catch (csvErr) {
-          // fallback to SQL parse if CSV failed
-          result = parseSQLDDL(importText);
-          if (result.tables.length === 0) { addToast("No tables found in input", "error"); return; }
+          // CSV failed, maybe it's unstructured
+          result = { tables: [] };
+        }
+      }
+
+      // If both deterministic engines failed to extract a schema, fall back to LLM
+      if (!result || !result.tables || result.tables.length === 0) {
+        addToast("Format not strictly recognized, attempting AI inference...", "info");
+        setIsCallingAI(true);
+        try {
+          const aiPrompt = `The following text is an unstructured data dump or schema representation. Please generate valid standard PostgreSQL CREATE TABLE statements that best represent this data, inferring column types, primary keys (UUID if missing), and foreign key references based on the context. Only output the SQL DDL.\n\nInput Data:\n${importText.substring(0, 3000)}`;
+          const aiSQL = await callAI("schema", aiPrompt);
+          if (!aiSQL) {
+            addToast("AI inference failed to generate schema.", "error");
+            return;
+          }
+          result = parseSQLDDL(aiSQL);
+          if (result.tables.length === 0) {
+            addToast("No tables found after AI inference.", "error");
+            return;
+          }
+        } finally {
+          setIsCallingAI(false);
         }
       }
 
@@ -1235,15 +2172,15 @@ const VibeDBPage = () => {
         }),
       }));
       setCanvasItems(prev => [...prev, ...resolved]);
-      setShowImportModal(false); setImportText("");
-      addToast(`Imported ${result.tables.length} tables`, "success");
+      setShowImportModal(false); setImportText(""); setNormalizeOnImport(false);
+      addToast(`Imported ${result.tables.length} table${result.tables.length > 1 ? "s" : ""}`, "success");
     } catch (err: any) { addToast("Import failed: " + err.message, "error"); }
   };
 
   // ─── Schema Audit ─────────────────────────────────────
   const handleAudit = async () => {
     if (canvasItems.length === 0) { addToast("Add tables first", "error"); return; }
-    setShowAuditModal(true); setIsAuditing(true); setAuditReport(null);
+    setShowAuditModal(true); setIsAuditing(true); setAuditReport(null); setAuditPhase("Analyzing schema...");
     try {
       const lintIssues = lintSchema(canvasItems);
       const fkIssues: { type: string; severity: string; message: string }[] = [];
@@ -1269,11 +2206,30 @@ const VibeDBPage = () => {
         return `${t.name}(${cols})${idxStr}`;
       }).join("\n");
       const contextStr = `Tables:\n${compactSchema}${lintIssues.length > 0 ? `\n\nLint issues:\n${lintIssues.map(i => i.message).join("\n")}` : ""}${fkIssues.length > 0 ? `\n\nFK issues:\n${fkIssues.map(i => i.message).join("\n")}` : ""}`;
-      const resultStr = await callAI("inspect-schema", "Inspect this schema thoroughly", contextStr);
-      const result = robustJsonParse(resultStr);
+
+      // Initial AI call (using callAIRaw for truncation detection)
+      const response = await callAIRaw("inspect-schema", "Inspect this schema thoroughly", contextStr);
+      let result: any;
+      try {
+        result = robustJsonParse(response.result);
+      } catch {
+        result = extractPartialAuditResult(response.result);
+      }
+
+      // Reactive chaining if truncated
+      if (response.truncated) {
+        console.log("[VibeDB] Audit response truncated, starting continuation chain...");
+        // Strip the "truncated" info messages — chaining will fill the gaps
+        if (result.issues) {
+          result.issues = result.issues.filter((i: any) => !i.message?.includes("truncated"));
+        }
+        result = await runAuditChain(contextStr, result, setAuditPhase);
+      }
+
+      setAuditPhase("Finalizing results...");
       setAuditReport({ ...result, lintIssues, fkIssues });
     } catch (err: any) { addToast(err?.message || "Audit failed", "error"); setAuditReport({ lintIssues: [], fkIssues: [], issues: [{ severity: "error", message: err?.message || "Failed to run AI audit" }] }); }
-    finally { setIsAuditing(false); }
+    finally { setIsAuditing(false); setAuditPhase(""); }
   };
 
   const handleDeduplicate = () => {
@@ -1350,7 +2306,15 @@ const VibeDBPage = () => {
           if (!targetCol || !newColName) { if (!silent) addToast("Missing column info", "warning"); break; }
           setCanvasItems(prev => prev.map(t => {
             if (t.name.toLowerCase() !== targetTable.toLowerCase()) return t;
-            return { ...t, columns: t.columns.map(c => c.name.toLowerCase() === targetCol.toLowerCase() ? { ...c, name: newColName } : c) };
+            return {
+              ...t,
+              columns: t.columns.map(c => c.name.toLowerCase() === targetCol.toLowerCase() ? { ...c, name: newColName } : c),
+              dataRows: t.dataRows?.map(row => {
+                if (!(targetCol in row)) return row;
+                const { [targetCol]: val, ...rest } = row;
+                return { ...rest, [newColName]: val };
+              }),
+            };
           }));
           if (!silent) addToast(`Renamed ${targetCol} → ${newColName}`, "success");
           break;
@@ -1935,7 +2899,27 @@ const VibeDBPage = () => {
             {isGenerating ? <Loader2 size={16} className="animate-spin" /> : <Sparkles size={16} />}
             Generate
           </button>
+          {/* Strategy Selector */}
+          <select
+            value={selectedStrategy}
+            onChange={e => { setSelectedStrategy(e.target.value); setDefaultStrategy(e.target.value); }}
+            className="rounded-lg border border-border bg-card px-2 py-2 text-xs outline-none focus:border-primary"
+            title="Generation strategy"
+          >
+            {STRATEGIES.map(s => (
+              <option key={s.id} value={s.id}>{s.name}</option>
+            ))}
+          </select>
         </div>
+
+        {/* History Toggle */}
+        <button
+          onClick={() => setShowHistoryPanel(!showHistoryPanel)}
+          className={`flex items-center gap-1.5 px-2.5 py-2 rounded-lg text-xs font-medium transition-colors ${showHistoryPanel ? "bg-primary/10 text-primary" : "text-muted-foreground hover:bg-secondary"}`}
+          title="Generation history"
+        >
+          <Clock size={14} />
+        </button>
 
         {/* Expert Toggle */}
         <button onClick={() => setExpertMode(!expertMode)} className={`flex items-center gap-2 px-3 py-2 rounded-lg font-medium text-sm transition-colors ${expertMode ? "bg-primary/10 text-primary" : "text-muted-foreground hover:bg-secondary"}`}>
@@ -1948,13 +2932,16 @@ const VibeDBPage = () => {
           <button onClick={redo} disabled={!canRedo} className="flex h-8 w-8 items-center justify-center rounded-lg text-muted-foreground hover:bg-secondary disabled:opacity-30" title="Redo"><Redo2 size={16} /></button>
         </div>
 
-        {/* User Menu */}
-        <UserMenu />
+        {/* Branding */}
+        <div className="flex items-center gap-2 text-sm font-semibold text-muted-foreground">
+          <Database size={16} className="text-primary" />
+          VibeDB
+        </div>
       </div>
 
-      {/* AI Thinking Dropdown */}
+      {/* AI Generation Progress */}
       <AnimatePresence>
-        {(isGenerating || generationThinking) && (
+        {(isGenerating || generationProgress) && (
           <motion.div
             initial={{ height: 0, opacity: 0 }}
             animate={{ height: "auto", opacity: 1 }}
@@ -1970,13 +2957,17 @@ const VibeDBPage = () => {
                 <ChevronDown size={12} className={`transition-transform ${thinkingExpanded ? "" : "-rotate-90"}`} />
                 {isGenerating && <Loader2 size={12} className="animate-spin text-accent" />}
                 {isGenerating ? (
-                  <span className="font-medium text-accent">AI is thinking...</span>
+                  <span className="font-medium text-accent">Generating schema...</span>
+                ) : generationProgress?.overallStatus === "completed" ? (
+                  <span className="font-medium text-emerald-500">Generation complete</span>
+                ) : generationProgress?.overallStatus === "error" ? (
+                  <span className="font-medium text-red-500">Generation failed</span>
                 ) : (
-                  <span className="font-medium">View AI reasoning</span>
+                  <span className="font-medium">View generation steps</span>
                 )}
-                {!isGenerating && generationThinking && (
+                {!isGenerating && generationProgress && (
                   <button
-                    onClick={(e) => { e.stopPropagation(); setGenerationThinking(""); setThinkingExpanded(false); }}
+                    onClick={(e) => { e.stopPropagation(); setGenerationProgress(null); setThinkingExpanded(false); }}
                     className="ml-2 text-muted-foreground/50 hover:text-muted-foreground"
                   >
                     <X size={10} />
@@ -1984,7 +2975,7 @@ const VibeDBPage = () => {
                 )}
               </button>
               <AnimatePresence>
-                {thinkingExpanded && (
+                {thinkingExpanded && generationProgress && (
                   <motion.div
                     initial={{ height: 0, opacity: 0 }}
                     animate={{ height: "auto", opacity: 1 }}
@@ -1992,8 +2983,12 @@ const VibeDBPage = () => {
                     transition={{ duration: 0.15 }}
                     className="overflow-hidden"
                   >
-                    <div className="mt-2 max-h-48 overflow-y-auto rounded-lg bg-background/60 border border-border/50 p-3 text-xs text-muted-foreground whitespace-pre-wrap font-mono leading-relaxed">
-                      {isGenerating ? <ThinkingAnimation /> : generationThinking}
+                    <div className="mt-2 rounded-lg bg-background/60 border border-border/50 p-3">
+                      <GenerationProgressUI progress={generationProgress} />
+                      {/* Compiler Report */}
+                      {compilerReport && compilerReport.actions.length > 0 && !isGenerating && (
+                        <CompilerReportUI report={compilerReport} />
+                      )}
                     </div>
                   </motion.div>
                 )}
@@ -2038,8 +3033,18 @@ const VibeDBPage = () => {
         {/* Diff */}
         <button onClick={saveSnapshot} className="flex items-center gap-1.5 rounded-lg bg-secondary px-3 py-1.5 text-xs font-semibold text-secondary-foreground hover:bg-secondary/80 transition"><GitCompare size={14} /> Snapshot</button>
         {diffBase && <button onClick={() => setShowDiff(!showDiff)} className="flex items-center gap-1.5 rounded-lg bg-primary/10 px-3 py-1.5 text-xs font-semibold text-primary hover:bg-primary/20 transition"><Eye size={14} /> Diff</button>}
+        {diffBase && <button onClick={() => setShowSchemaCompare(true)} className="flex items-center gap-1.5 rounded-lg bg-primary/10 px-3 py-1.5 text-xs font-semibold text-primary hover:bg-primary/20 transition"><GitCompare size={14} /> Compare</button>}
 
         <div className="flex-1" />
+
+        {/* Feature Panel Toggles */}
+        <button onClick={() => setShowDBManager(!showDBManager)} className={`flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-xs font-semibold transition ${showDBManager ? "bg-accent text-accent-foreground" : "bg-secondary text-secondary-foreground hover:bg-secondary/80"}`}><Plug size={14} /> DB</button>
+        <button onClick={() => setShowQueryBuilder(!showQueryBuilder)} className={`flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-xs font-semibold transition ${showQueryBuilder ? "bg-accent text-accent-foreground" : "bg-secondary text-secondary-foreground hover:bg-secondary/80"}`}><Terminal size={14} /> Query</button>
+        <button onClick={() => setShowSupabasePanel(!showSupabasePanel)} className={`flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-xs font-semibold transition ${showSupabasePanel ? "bg-accent text-accent-foreground" : "bg-secondary text-secondary-foreground hover:bg-secondary/80"}`}><DatabaseZap size={14} /> Supa</button>
+        <button onClick={() => setShowSREMode(!showSREMode)} className={`flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-xs font-semibold transition ${showSREMode ? "bg-primary/10 text-primary" : "bg-secondary text-secondary-foreground hover:bg-secondary/80"}`}><Activity size={14} /> SRE</button>
+
+        <button onClick={() => setShowAskData(!showAskData)} className={`flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-xs font-semibold transition ${showAskData ? "bg-violet-600 text-white" : "bg-violet-500/10 text-violet-600 dark:text-violet-400 hover:bg-violet-500/20"}`}><MessageCircle size={14} /> Ask Data</button>
+
         <button onClick={() => setShowPlayground(!showPlayground)} className="flex items-center gap-1.5 rounded-lg bg-secondary px-3 py-1.5 text-xs font-semibold text-secondary-foreground hover:bg-secondary/80 transition"><Terminal size={14} /> Query Lab</button>
 
         {/* Export Menu */}
@@ -2192,6 +3197,9 @@ const VibeDBPage = () => {
                   ) : (
                     <span className="text-sm font-bold flex items-center gap-1.5">
                       <TableIcon size={12} className="text-muted-foreground" /> {table.name}
+                      {table.dataRows && table.dataRows.length > 0 && (
+                        <span className="rounded-full bg-accent/15 px-1.5 py-0.5 text-[9px] font-semibold text-accent leading-none">{table.dataRows.length} rows</span>
+                      )}
                     </span>
                   )}
                   <div className="flex items-center gap-0.5">
@@ -2284,6 +3292,108 @@ const VibeDBPage = () => {
               </div>
             </div>
           )}
+
+          {/* Minimap */}
+          {canvasItems.length > 0 && (() => {
+            const MINIMAP_W = 200;
+            const MINIMAP_H = 140;
+            const PADDING = 20;
+
+            // Calculate bounding box of all tables
+            let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+            canvasItems.forEach(t => {
+              const tableH = HEADER_HEIGHT + t.columns.length * ROW_HEIGHT + (!expertMode ? 28 : 0);
+              minX = Math.min(minX, t.x);
+              minY = Math.min(minY, t.y);
+              maxX = Math.max(maxX, t.x + TABLE_WIDTH);
+              maxY = Math.max(maxY, t.y + tableH);
+            });
+            minX -= PADDING; minY -= PADDING; maxX += PADDING; maxY += PADDING;
+            const contentW = maxX - minX || 1;
+            const contentH = maxY - minY || 1;
+            const scale = Math.min(MINIMAP_W / contentW, MINIMAP_H / contentH);
+
+            // Viewport rectangle in canvas coordinates
+            const canvasEl = canvasRef.current;
+            const vpW = canvasEl ? canvasEl.clientWidth / view.zoom : 0;
+            const vpH = canvasEl ? canvasEl.clientHeight / view.zoom : 0;
+            const vpX = -view.x / view.zoom;
+            const vpY = -view.y / view.zoom;
+
+            const handleMinimapMouseDown = (e: React.MouseEvent) => {
+              e.stopPropagation();
+              e.preventDefault();
+              const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
+              const navigate = (clientX: number, clientY: number) => {
+                const mx = (clientX - rect.left) / scale + minX;
+                const my = (clientY - rect.top) / scale + minY;
+                setView(v => ({
+                  ...v,
+                  x: -(mx - vpW / 2) * v.zoom,
+                  y: -(my - vpH / 2) * v.zoom,
+                }));
+              };
+              navigate(e.clientX, e.clientY);
+              const handleMove = (ev: MouseEvent) => navigate(ev.clientX, ev.clientY);
+              const handleUp = () => { window.removeEventListener("mousemove", handleMove); window.removeEventListener("mouseup", handleUp); };
+              window.addEventListener("mousemove", handleMove);
+              window.addEventListener("mouseup", handleUp);
+            };
+
+            return (
+              <div
+                className="absolute bottom-3 right-3 z-40 rounded-lg border border-border bg-card/90 backdrop-blur-sm shadow-lg overflow-hidden cursor-crosshair"
+                style={{ width: MINIMAP_W, height: MINIMAP_H }}
+                onMouseDown={handleMinimapMouseDown}
+              >
+                <svg width={MINIMAP_W} height={MINIMAP_H}>
+                  {/* FK connection lines */}
+                  {canvasItems.flatMap(sourceTable =>
+                    sourceTable.columns.map((col, idx) => {
+                      if (!col.isForeignKey || (!col.linkedTableId && !col.linkedTable)) return null;
+                      const targetTable = canvasItems.find(t => t.id === col.linkedTableId || t.name === col.linkedTable || t.name?.toLowerCase() === col.linkedTable?.toLowerCase());
+                      if (!targetTable) return null;
+                      const sy = sourceTable.y + HEADER_HEIGHT + idx * ROW_HEIGHT + ROW_HEIGHT / 2;
+                      let ti = targetTable.columns.findIndex(c => c.name === col.linkedColumn);
+                      if (ti === -1) ti = 0;
+                      const ty = targetTable.y + HEADER_HEIGHT + ti * ROW_HEIGHT + ROW_HEIGHT / 2;
+                      const sx = sourceTable.x + TABLE_WIDTH / 2 < targetTable.x + TABLE_WIDTH / 2 ? sourceTable.x + TABLE_WIDTH : sourceTable.x;
+                      const ex = sourceTable.x + TABLE_WIDTH / 2 < targetTable.x + TABLE_WIDTH / 2 ? targetTable.x : targetTable.x + TABLE_WIDTH;
+                      return (
+                        <line key={`mm-${sourceTable.id}-${col.id}-${idx}`}
+                          x1={(sx - minX) * scale} y1={(sy - minY) * scale}
+                          x2={(ex - minX) * scale} y2={(ty - minY) * scale}
+                          stroke="hsl(var(--accent))" strokeWidth={1} opacity={0.4}
+                        />
+                      );
+                    })
+                  ).filter(Boolean)}
+
+                  {/* Table rectangles */}
+                  {canvasItems.map(t => {
+                    const tableH = HEADER_HEIGHT + t.columns.length * ROW_HEIGHT + (!expertMode ? 28 : 0);
+                    return (
+                      <rect key={`mm-${t.id}`}
+                        x={(t.x - minX) * scale} y={(t.y - minY) * scale}
+                        width={TABLE_WIDTH * scale} height={tableH * scale}
+                        rx={2} fill="hsl(var(--primary))" fillOpacity={0.35}
+                        stroke="hsl(var(--primary))" strokeWidth={0.75} strokeOpacity={0.6}
+                      />
+                    );
+                  })}
+
+                  {/* Viewport rectangle */}
+                  <rect
+                    x={(vpX - minX) * scale} y={(vpY - minY) * scale}
+                    width={vpW * scale} height={vpH * scale}
+                    fill="hsl(var(--accent))" fillOpacity={0.08}
+                    stroke="hsl(var(--accent))" strokeWidth={1.5} strokeOpacity={0.7}
+                    rx={2}
+                  />
+                </svg>
+              </div>
+            );
+          })()}
         </div>
       </div>
 
@@ -2353,6 +3463,7 @@ const VibeDBPage = () => {
         tables={canvasItems}
         onCopy={handleCopy}
         copied={copied}
+        onFixIssues={handleFixSqlIssues}
       />
 
       {/* Import Modal */}
@@ -2368,7 +3479,12 @@ const VibeDBPage = () => {
               <textarea value={importText} onChange={e => setImportText(e.target.value)}
                 placeholder={`CREATE TABLE users (\n  id UUID PRIMARY KEY,\n  name VARCHAR NOT NULL\n);\n\n-- OR --\n\nid,name,email\n1,Alice,alice@example.com`}
                 className="w-full rounded-xl border border-border bg-background p-4 font-mono text-xs leading-relaxed outline-none focus:border-primary resize-none" rows={12} />
-              <div className="mt-4 flex items-center justify-between">
+              <label className="mt-3 flex items-center gap-2 cursor-pointer select-none">
+                <input type="checkbox" checked={normalizeOnImport} onChange={e => setNormalizeOnImport(e.target.checked)} className="rounded border-border accent-accent" />
+                <span className="text-xs font-medium text-muted-foreground">Normalize to 3NF</span>
+                <span className="text-[10px] text-muted-foreground/60">(split flat CSV into related tables using AI)</span>
+              </label>
+              <div className="mt-3 flex items-center justify-between">
                 <div>
                   <input
                     type="file"
@@ -2402,7 +3518,10 @@ const VibeDBPage = () => {
                 </div>
                 <div className="flex gap-2">
                   <button onClick={() => setShowImportModal(false)} className="rounded-lg bg-secondary px-4 py-2 text-sm font-semibold hover:bg-secondary/80">Cancel</button>
-                  <button onClick={handleImport} disabled={!importText.trim()} className="flex items-center gap-2 rounded-lg bg-accent px-4 py-2 text-sm font-semibold text-accent-foreground disabled:opacity-50"><Upload size={14} /> Import</button>
+                  <button onClick={handleImport} disabled={!importText.trim() || isCallingAI} className="flex items-center gap-2 rounded-lg bg-accent px-4 py-2 text-sm font-semibold text-accent-foreground disabled:opacity-50">
+                    {isCallingAI ? <Loader2 size={14} className="animate-spin" /> : <Upload size={14} />}
+                    Import
+                  </button>
                 </div>
               </div>
             </motion.div>
@@ -2475,7 +3594,13 @@ const VibeDBPage = () => {
                     <p className="text-xs text-muted-foreground">Find these in your Supabase dashboard → Settings → API. Your key is stored locally in this browser only.</p>
                   </div>
                   <div className="mt-5 flex justify-end gap-2">
-                    <button onClick={() => setShowDeployModal(false)} className="rounded-lg bg-secondary px-4 py-2 text-sm font-semibold hover:bg-secondary/80">Cancel</button>
+                    <button onClick={() => setDeployResults(null)} className="rounded-lg bg-secondary px-4 py-2 text-sm font-semibold hover:bg-secondary/80">Cancel</button>
+                    <button
+                      onClick={handleFixDeployErrors}
+                      className="flex items-center gap-2 rounded-lg bg-yellow-500/20 px-4 py-2 text-sm font-semibold text-yellow-500 hover:bg-yellow-500/30"
+                    >
+                      <Sparkles size={14} /> Auto-Fix Schema
+                    </button>
                     <button onClick={handleTestConnection} disabled={isTesting || !deployUrl.trim() || !deployKey.trim()} className="flex items-center gap-2 rounded-lg bg-primary px-4 py-2 text-sm font-semibold text-primary-foreground disabled:opacity-50">
                       {isTesting ? <Loader2 size={14} className="animate-spin" /> : <Plug size={14} />}
                       {isTesting ? "Connecting..." : "Test Connection"}
@@ -2498,7 +3623,7 @@ const VibeDBPage = () => {
                         <div className="text-xs font-semibold text-muted-foreground mb-2">Schema to deploy</div>
                         <div className="flex flex-wrap gap-1.5">
                           {canvasItems.map(t => (
-                            <span key={t.id} className="rounded-md bg-secondary px-2 py-0.5 text-xs font-medium">{t.name} ({t.columns.length} cols)</span>
+                            <span key={t.id} className="rounded-md bg-secondary px-2 py-0.5 text-xs font-medium">{t.name} ({t.columns.length} cols{t.dataRows && t.dataRows.length > 0 ? `, ${t.dataRows.length} rows` : ""})</span>
                           ))}
                         </div>
                       </div>
@@ -2512,10 +3637,21 @@ const VibeDBPage = () => {
                         <AlertCircle size={14} /> One-time setup required
                       </div>
                       <p className="text-xs text-muted-foreground">Run this SQL in your target Supabase project's <strong>SQL Editor</strong> first:</p>
-                      <pre className="bg-background rounded-lg p-3 text-xs font-mono overflow-x-auto select-all">{`CREATE OR REPLACE FUNCTION exec_sql(query text)
+                      <pre className="bg-background rounded-lg p-3 text-xs font-mono overflow-x-auto select-all">{`-- Required for deploying schemas
+CREATE OR REPLACE FUNCTION exec_sql(query text)
 RETURNS void AS $$
 BEGIN
   EXECUTE query;
+END;
+$$ LANGUAGE plpgsql SECURITY DEFINER;
+
+-- Required for live querying
+CREATE OR REPLACE FUNCTION exec_sql_read(query text)
+RETURNS json AS $$
+DECLARE result json;
+BEGIN
+  EXECUTE 'SELECT json_agg(row_to_json(t)) FROM (' || query || ') t' INTO result;
+  RETURN COALESCE(result, '[]'::json);
 END;
 $$ LANGUAGE plpgsql SECURITY DEFINER;`}</pre>
                       <p className="text-xs text-muted-foreground">Then click <strong>Deploy Schema</strong> again.</p>
@@ -2532,14 +3668,24 @@ $$ LANGUAGE plpgsql SECURITY DEFINER;`}</pre>
                       <p className="text-xs text-muted-foreground">
                         {deployResults.filter(r => r.success).length} statement{deployResults.filter(r => r.success).length !== 1 ? "s" : ""} executed
                       </p>
-                      <button
-                        onClick={() => { setDeployFixResult(null); handleDeploy(); }}
-                        disabled={isDeploying}
-                        className="flex items-center gap-2 mx-auto rounded-lg bg-secondary px-3 py-1.5 text-xs font-semibold hover:bg-secondary/80 transition"
-                      >
-                        {isDeploying ? <Loader2 size={12} className="animate-spin" /> : <RefreshCw size={12} />}
-                        Re-run Deploy
-                      </button>
+                      <div className="flex items-center justify-center gap-2">
+                        <button
+                          onClick={() => { setDeployFixResult(null); handleDeploy(); }}
+                          disabled={isDeploying}
+                          className="flex items-center gap-2 rounded-lg bg-secondary px-3 py-1.5 text-xs font-semibold hover:bg-secondary/80 transition"
+                        >
+                          {isDeploying ? <Loader2 size={12} className="animate-spin" /> : <RefreshCw size={12} />}
+                          Re-deploy
+                        </button>
+                        <button
+                          onClick={handleImportRows}
+                          disabled={isImportingRows}
+                          className="flex items-center gap-2 rounded-lg bg-violet-600 text-white px-3 py-1.5 text-xs font-semibold hover:bg-violet-700 transition disabled:opacity-50"
+                        >
+                          {isImportingRows ? <Loader2 size={12} className="animate-spin" /> : <Download size={12} />}
+                          Import Rows from DB
+                        </button>
+                      </div>
                     </div>
                   )}
 
@@ -2605,6 +3751,14 @@ $$ LANGUAGE plpgsql SECURITY DEFINER;`}</pre>
                   <div className="mt-5 flex justify-end gap-2">
                     <button onClick={() => { setShowDeployModal(false); setDeployFixResult(null); }} className="rounded-lg bg-secondary px-4 py-2 text-sm font-semibold hover:bg-secondary/80">Close</button>
                     <button
+                      onClick={handleImportRows}
+                      disabled={isImportingRows || canvasItems.length === 0}
+                      className="flex items-center gap-2 rounded-lg bg-violet-600 text-white px-4 py-2 text-sm font-semibold hover:bg-violet-700 disabled:opacity-50 transition"
+                    >
+                      {isImportingRows ? <Loader2 size={14} className="animate-spin" /> : <Download size={14} />}
+                      {isImportingRows ? "Importing..." : "Import Rows"}
+                    </button>
+                    <button
                       onClick={() => { setDeployFixResult(null); handleDeploy(); }}
                       disabled={isDeploying || canvasItems.length === 0}
                       className="flex items-center gap-2 rounded-lg bg-accent px-4 py-2 text-sm font-semibold text-accent-foreground disabled:opacity-50"
@@ -2625,10 +3779,67 @@ $$ LANGUAGE plpgsql SECURITY DEFINER;`}</pre>
         open={showAuditModal}
         onClose={() => setShowAuditModal(false)}
         isAuditing={isAuditing}
+        auditPhase={auditPhase}
         report={auditReport}
         onApplySuggestion={handleApplySuggestion}
         onApplyAll={handleApplyAllSuggestions}
         onRerunAudit={handleAudit}
+      />
+
+      {/* Schema Compare Modal */}
+      <SchemaCompareModal
+        open={showSchemaCompare}
+        onClose={() => setShowSchemaCompare(false)}
+        currentSchema={canvasItems}
+        previousSchema={diffBase || []}
+      />
+
+      {/* Generation History Panel */}
+      <GenerationHistoryPanel open={showHistoryPanel} onClose={() => setShowHistoryPanel(false)} />
+
+      {/* Database Manager Panel */}
+      <DatabaseManagerPanel
+        open={showDBManager}
+        onClose={() => setShowDBManager(false)}
+        onImportSchema={(tables) => {
+          setCanvasItems(prev => [...prev, ...tables]);
+          addToast(`Imported ${tables.length} tables from database`, "success");
+        }}
+      />
+
+      {/* Query Builder Panel */}
+      <QueryBuilderPanel
+        open={showQueryBuilder}
+        onClose={() => setShowQueryBuilder(false)}
+        canvasItems={canvasItems}
+        callAI={callAI}
+        deployConnected={deployConnected}
+      />
+
+      {/* Supabase Panel */}
+      <SupabasePanel
+        open={showSupabasePanel}
+        onClose={() => setShowSupabasePanel(false)}
+        canvasItems={canvasItems}
+        onImportSchema={(tables) => {
+          setCanvasItems(prev => [...prev, ...tables]);
+          addToast(`Imported ${tables.length} tables from Supabase`, "success");
+        }}
+      />
+
+      {/* SRE Mode Panel */}
+      <SREModePanel
+        open={showSREMode}
+        onClose={() => setShowSREMode(false)}
+        callAI={callAI}
+      />
+
+      {/* Ask Data Panel */}
+      <AskDataPanel
+        open={showAskData}
+        onClose={() => setShowAskData(false)}
+        canvasItems={canvasItems}
+        callAI={callAI}
       />
 
       {/* AI Chat Panel */}

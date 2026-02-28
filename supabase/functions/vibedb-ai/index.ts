@@ -1,5 +1,4 @@
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
-import { createClient } from "npm:@supabase/supabase-js@2.57.2";
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
@@ -11,11 +10,13 @@ const CREDIT_COSTS: Record<string, number> = {
   "generate-schema": 3,
   "batch-command": 3,
   "inspect-schema": 2,
+  "normalize-csv": 2,
   "generate-sql": 1,
   "generate-mock-data": 1,
   "generate-query": 1,
   "smart-add-column": 1,
   "schema-chat": 1,
+  "analyze-data": 2,
 };
 
 // Retryable HTTP status codes
@@ -90,92 +91,56 @@ serve(async (req) => {
   if (req.method === "OPTIONS") return new Response(null, { headers: corsHeaders });
 
   try {
-    const { prompt, type, context } = await req.json();
+    const { prompt, type, context, strategy } = await req.json();
     const ANTHROPIC_API_KEY = Deno.env.get("ANTHROPIC_API_KEY");
     if (!ANTHROPIC_API_KEY) throw new Error("ANTHROPIC_API_KEY is not configured");
-
-    // ─── Credit gate (check BEFORE, deduct AFTER success) ─
-    const authHeader = req.headers.get("Authorization");
-    let userId: string | null = null;
-    let currentCredits = 0;
-
-    if (authHeader) {
-      const supabaseAdmin = createClient(
-        Deno.env.get("SUPABASE_URL") ?? "",
-        Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ?? "",
-        { auth: { persistSession: false } }
-      );
-
-      const token = authHeader.replace("Bearer ", "");
-      const { data: userData } = await supabaseAdmin.auth.getUser(token);
-      userId = userData.user?.id ?? null;
-
-      if (userId) {
-        const creditCost = CREDIT_COSTS[type] ?? 1;
-
-        const { data: profile } = await supabaseAdmin
-          .from("profiles")
-          .select("ai_credits, subscription_tier")
-          .eq("user_id", userId)
-          .maybeSingle();
-
-        if (!profile || profile.subscription_tier === "none") {
-          return new Response(JSON.stringify({
-            error: "Active subscription required. Please subscribe to use AI features.",
-            code: "NO_SUBSCRIPTION",
-          }), {
-            status: 403,
-            headers: { ...corsHeaders, "Content-Type": "application/json" },
-          });
-        }
-
-        currentCredits = profile.ai_credits ?? 0;
-        if (currentCredits < creditCost) {
-          return new Response(JSON.stringify({
-            error: `Not enough credits. This action costs ${creditCost} credit${creditCost > 1 ? "s" : ""}. You have ${currentCredits}.`,
-            code: "NO_CREDITS",
-            credits_remaining: currentCredits,
-            credits_required: creditCost,
-          }), {
-            status: 402,
-            headers: { ...corsHeaders, "Content-Type": "application/json" },
-          });
-        }
-      }
-    }
 
     // ─── Build prompts ──────────────────────────────────
     let systemPrompt = "";
     let userPrompt = prompt;
 
     if (type === "generate-schema") {
-      systemPrompt = `You are an expert database architect. Given a user's description, generate a complete database schema.
+      systemPrompt = `You are an expert database architect. Given a user's description, generate a complete production-quality PostgreSQL database schema.
 
 CRITICAL: Your entire response must be a single valid JSON object. No text before or after. No markdown. No comments. No explanation.
 
 The JSON must have this exact structure:
 {"tables":[{"name":"string","columns":[{"name":"string","type":"string","isForeignKey":false,"linkedTable":"","linkedColumn":"","constraints":[]}],"indexes":[{"name":"string","columns":["string"],"type":"btree","unique":false,"where":"optional filter"}],"checkConstraints":[{"name":"string","expression":"column_name > 0"}]}]}
 
-Column types: uuid, varchar, int, timestamp, boolean, numeric, text, jsonb, decimal, float.
-Constraints: [{"type":"primary"},{"type":"notNull"},{"type":"unique"},{"type":"default","value":"now()"}]
+COLUMN TYPE RULES — use the CORRECT type for each column's semantic meaning:
+- uuid: ONLY for primary key "id" columns and foreign key "_id" columns. NEVER for any other column.
+- varchar: names, titles, slugs, short strings (email, username, phone, status, role, country_code, currency, version, license_key, coupon_code)
+- text: long text (description, bio, content, notes, body, readme, changelog, url, github_url, website_url, avatar_url, image_url)
+- int: counts, quantities, whole numbers (stock_count, download_count, max_retries, sort_order, port)
+- boolean: true/false flags (is_active, is_verified, is_public, is_featured, has_free_tier, enabled)
+- numeric OR decimal: money, prices, percentages, ratings (price, amount, total, discount, commission_rate, rating, latitude, longitude)
+- timestamp: dates and times (created_at, updated_at, published_at, expires_at, last_login_at, deleted_at)
+- jsonb: structured data, metadata, settings, configuration blobs
+
+NEVER use uuid for: names, emails, URLs, descriptions, statuses, versions, codes, slugs, titles, or any non-ID column.
+NEVER use timestamp for: codes, names, identifiers, or any non-date column.
+
+Constraint types: [{"type":"primary"},{"type":"notNull"},{"type":"unique"},{"type":"default","value":"now()"}]
 
 MANDATORY RULES — violating these makes the schema invalid:
 1. EVERY table MUST have exactly ONE "id" column as its FIRST column: {"name":"id","type":"uuid","constraints":[{"type":"primary"},{"type":"notNull"}]}
-2. EVERY table MUST have created_at and updated_at timestamp columns.
+2. EVERY table MUST have created_at and updated_at timestamp columns with default now().
 3. NEVER duplicate column names within a table. Each column name must be unique.
 4. NEVER have more than one primary key per table (only the id column).
 5. Foreign key columns must reference a column that EXISTS. Always reference "id" on the target table.
-6. Use snake_case for all table and column names.
-7. Foreign key columns should be named like: user_id, project_id, etc.
-8. Generate INDEXES for: every FK column, columns commonly used in WHERE/ORDER BY, composite indexes for multi-column queries, partial indexes with WHERE clauses for filtered queries (e.g. active records only).
-9. Generate CHECK CONSTRAINTS for columns with bounded values: status enums (IN list), positive amounts (> 0), percentage ranges (BETWEEN 0 AND 100), rating ranges, priority levels. Use the column name in the constraint name.
-10. For junction/mapping tables (many-to-many), add a COMPOSITE UNIQUE index on the two FK columns to prevent duplicate associations.
-11. For tables involving financial records, legal data, or user-generated content, add a "deleted_at" TIMESTAMP column (nullable, default null) for soft deletes.
-12. For columns storing secrets, tokens, or API keys, add companion columns: "expires_at" (timestamp), "last_rotated_at" (timestamp), and "description" (varchar).
-13. For self-referential FK columns (e.g. parent_id referencing same table), add a CHECK constraint: parent_id != id.
+6. Use snake_case for all table and column names. Pluralize table names (users, orders, products).
+7. Foreign key columns MUST be named: <singular_target_table>_id (e.g. user_id, project_id, category_id).
+8. NOT NULL CONSTRAINT: Add {"type":"notNull"} to EVERY column that is logically required. In a well-designed schema, 80%+ of columns should be NOT NULL. Only nullable: optional descriptions, deleted_at, secondary contact info, metadata fields.
+9. Generate INDEXES for: every FK column, columns commonly used in WHERE/ORDER BY, email/username (unique), composite indexes for multi-column queries, partial indexes with WHERE clauses for filtered queries (e.g. active records only).
+10. Generate CHECK CONSTRAINTS for ALL bounded columns: status/role/type enums (IN list), positive amounts (> 0), percentage/rating ranges (BETWEEN 0 AND 100 or BETWEEN 1 AND 5), non-negative counts (>= 0), priority levels. Name format: chk_<table>_<column>.
+11. For junction/mapping tables (many-to-many), add a COMPOSITE UNIQUE index on the two FK columns to prevent duplicate associations.
+12. For tables involving financial records, legal data, or user-generated content, add a "deleted_at" TIMESTAMP column (nullable, default null) for soft deletes.
+13. For columns storing secrets, tokens, or API keys, add companion columns: "expires_at" (timestamp), "last_rotated_at" (timestamp).
+14. For self-referential FK columns (e.g. parent_id referencing same table), add a CHECK constraint: parent_id != id.
 
-Generate as many tables as the idea genuinely requires — don't artificially limit. A simple blog might need 3 tables, but a full e-commerce platform or crypto exchange might need 15-25+. Be thorough and include all tables needed for a production-ready schema.
+Generate as many tables as the idea genuinely requires — don't artificially limit. A simple blog might need 3-5 tables, but a full e-commerce platform or marketplace might need 15-25+. Be thorough and include all tables needed for a production-ready schema.
 Use double quotes for all JSON strings. Emit compact JSON (no pretty-printing, no unnecessary whitespace).`;
+      userPrompt = `Requirement: ${prompt}`;
     } else if (type === "generate-sql") {
       systemPrompt = `You are a SQL expert. Given a database schema context, generate valid PostgreSQL DDL statements.
 Rules:
@@ -203,6 +168,23 @@ Rules:
       systemPrompt = `You are a SQL query expert. Given the schema context and a user request, generate a valid PostgreSQL query.
 Return ONLY valid SQL, no markdown formatting.`;
       userPrompt = `Schema:\n${context}\n\nRequest: ${prompt}`;
+    } else if (type === "analyze-data") {
+      systemPrompt = `You are a data analyst. You are given actual row data from database tables. Analyze the provided data and answer the user's question.
+
+Rules:
+- Answer the user's question directly first, then provide supporting details.
+- Summarize key findings, patterns, outliers, and distributions you find in the actual data.
+- Use specific numbers and values from the data provided. Reference actual row values.
+- If a table has no data rows, say so clearly.
+- If the data is insufficient to answer the question, explain what additional data would help.
+- Keep the response conversational but precise — 2-5 paragraphs.
+- Use bullet points for lists of findings. Use **bold** for key metrics.
+- Do NOT output SQL or suggest queries. You are analyzing data that is already provided to you.
+- Do NOT reference "query results" or "SQL execution". The data comes directly from the user's canvas tables.
+- Output plain English only — no JSON, no code blocks.`;
+      userPrompt = context
+        ? `${context}\n\nUser Question: ${prompt}`
+        : `User Question: ${prompt}`;
     } else if (type === "inspect-schema") {
       systemPrompt = `You are a database architecture reviewer. CRITICAL: Your entire response must be a single valid JSON object. No text before or after. No markdown.
 
@@ -344,15 +326,83 @@ Constraint types: primary, notNull, unique, default (with value).
 For add_table, always include id (uuid, primary), created_at, updated_at columns.
 Use double quotes for all JSON strings.`;
       userPrompt = context ? `Current Schema:\n${context}\n\nConversation:\n${prompt}` : prompt;
+    } else if (type === "normalize-csv") {
+      systemPrompt = `You are an expert database normalizer. Given a flat denormalized CSV, generate a complete normalized PostgreSQL database schema in Third Normal Form (3NF).
+
+Output ONLY valid PostgreSQL SQL. No markdown. No \`\`\` fences.
+
+REQUIRED OUTPUT SECTIONS (in this order):
+1. DROP TABLE IF EXISTS ... CASCADE for each table (child/fact tables first, then parent/entity tables)
+2. CREATE TABLE for each entity/dimension table (parent tables first):
+   - Use SERIAL PRIMARY KEY for IDs
+   - Add proper column types (VARCHAR, INTEGER, DECIMAL, DATE, BOOLEAN, TEXT as appropriate)
+   - Add NOT NULL, UNIQUE, CHECK constraints where appropriate
+   - Add created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP and updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+3. CREATE TABLE for the fact/transaction table with proper FOREIGN KEY REFERENCES to entity tables
+4. CREATE INDEX for all FK columns and commonly queried columns
+5. INSERT INTO statements for EVERY entity/dimension table with deduplicated data extracted from the CSV
+6. INSERT INTO for the fact/transaction table with every original CSV row, using integer FK IDs that match the SERIAL order from entity INSERTs
+
+NORMALIZATION RULES:
+- Identify repeated column groups by shared prefix (customer_, product_, salesperson_, etc.) and extract into separate entity tables
+- The leaf/fact table (sales, orders, transactions) keeps only per-row columns (quantity, total, date, discount) plus FK references
+- Deduplicate entity data: if customer_name+customer_email repeat across rows, insert each unique customer only once
+- Every CSV column must end up in exactly one table — no data lost
+- Use snake_case for all table and column names
+- Strip redundant prefixes in entity tables (customer_name → name in customers table, product_category → category in products table)
+- Keep it practical: 2-6 tables is typical for most spreadsheets
+
+FOR INSERT STATEMENTS (CRITICAL):
+- Include ALL rows from the provided CSV data — do not skip or truncate
+- For entity tables: each unique entity appears exactly once, in insertion order matching SERIAL IDs (first inserted = ID 1)
+- For the fact table: include every original CSV row with proper integer FK references matching the entity insertion order
+- Values must be properly SQL-escaped (single quotes for strings, no quotes for numbers/NULL)
+- Use multi-row INSERT syntax: INSERT INTO table (cols) VALUES (row1), (row2), ...;`;
+      userPrompt = prompt;
+    } else if (type === "sre-analyze-incident") {
+      systemPrompt = `You are an expert Site Reliability Engineer. Analyze the incident described below and provide root cause analysis.
+
+Your response should include:
+1. Likely root cause (be specific about the failure mode)
+2. Contributing factors
+3. Immediate mitigation steps
+4. Long-term preventive measures
+5. Suggested monitoring improvements
+
+Be concise and actionable. Reference specific services when relevant.`;
+      userPrompt = context ? `Service topology:\n${context}\n\nIncident:\n${prompt}` : prompt;
+    } else if (type === "sre-generate-runbook") {
+      systemPrompt = `You are an expert Site Reliability Engineer. Generate an operational runbook for the specified service.
+
+CRITICAL: Your entire response must be a single valid JSON object. No text before or after. No markdown.
+
+Return format:
+{"title":"Runbook: <service name> - <scenario>","steps":[{"order":1,"action":"Description of what to do","command":"optional shell command","expected":"what you should see if successful"}]}
+
+Generate 5-10 practical steps covering:
+- Health check verification
+- Common failure diagnosis
+- Service restart procedures
+- Log analysis commands
+- Rollback procedures
+- Escalation criteria
+
+Use realistic commands (systemctl, kubectl, docker, curl, psql, etc.) appropriate for the service type.`;
+      userPrompt = context ? `Service context:\n${context}\n\nGenerate runbook for: ${prompt}` : prompt;
     } else {
       systemPrompt = "You are a helpful AI assistant.";
     }
 
     // ─── Model selection + token limits ──────────────────
     const fastTypes = ["generate-mock-data", "generate-sql", "generate-query", "smart-add-column"];
-    const model = fastTypes.includes(type) ? "claude-haiku-4-5-20251001" : "claude-sonnet-4-6-20250514";
-    const longOutputTypes = ["generate-mock-data", "generate-sql", "generate-schema"];
-    const maxTokens = longOutputTypes.includes(type) ? 64000 : 16384;
+    // Use Haiku for explicitly fast types OR when "v3-fast" strategy is requested
+    const useFastModel = fastTypes.includes(type) || (strategy === "v3-fast" && type === "generate-schema");
+    const model = useFastModel ? "claude-haiku-4-5-20251001" : "claude-sonnet-4-6";
+    const longOutputTypes = ["generate-mock-data", "generate-sql", "generate-schema", "normalize-csv"];
+    // Supabase edge functions have a 150s wall-clock timeout.
+    // Sonnet 4.6 at ~130 tok/s: 16384 tokens ≈ 126s → fits within timeout.
+    // Reactive chaining handles overflow for complex schemas (20+ tables).
+    const maxTokens = longOutputTypes.includes(type) ? 16384 : 8192;
 
     console.log(`[vibedb-ai] type=${type} model=${model} max_tokens=${maxTokens}`);
 
@@ -362,13 +412,14 @@ Use double quotes for all JSON strings.`;
     );
 
     let content = rawContent;
+    let truncated = false;
 
     console.log(`[vibedb-ai] Success: model=${modelUsed} stop=${stopReason} len=${content.length}`);
 
     // ─── Post-process truncated responses ────────────────
 
     // SQL truncation: trim to last complete statement
-    if (stopReason === "max_tokens" && (type === "generate-mock-data" || type === "generate-sql" || type === "generate-query")) {
+    if (stopReason === "max_tokens" && (type === "generate-mock-data" || type === "generate-sql" || type === "generate-query" || type === "normalize-csv")) {
       const lastSemicolon = content.lastIndexOf(";");
       if (lastSemicolon > 0) {
         content = content.substring(0, lastSemicolon + 1);
@@ -376,8 +427,44 @@ Use double quotes for all JSON strings.`;
       }
     }
 
-    // JSON truncation: close open brackets/braces
-    if (stopReason === "max_tokens" && (type === "generate-schema" || type === "schema-chat" || type === "batch-command" || type === "inspect-schema" || type === "smart-add-column")) {
+    // JSON truncation: smart recovery for generate-schema
+    if (stopReason === "max_tokens" && type === "generate-schema") {
+      console.log("[vibedb-ai] Schema JSON truncated, using smart table-level recovery...");
+      const tablesStart = content.indexOf('"tables"');
+      if (tablesStart !== -1) {
+        const arrayStart = content.indexOf("[", tablesStart);
+        if (arrayStart !== -1) {
+          // Walk through the tables array, tracking depth to find complete table objects
+          let lastGoodPos = -1;
+          let depth = 0;
+          let inStr = false;
+          let esc = false;
+          for (let i = arrayStart + 1; i < content.length; i++) {
+            const ch = content[i];
+            if (esc) { esc = false; continue; }
+            if (ch === "\\") { esc = true; continue; }
+            if (ch === '"') { inStr = !inStr; continue; }
+            if (inStr) continue;
+            if (ch === "{" || ch === "[") depth++;
+            if (ch === "}" || ch === "]") {
+              depth--;
+              if (depth === 0) {
+                // Back at the tables array level — this is a complete table object
+                lastGoodPos = i;
+              }
+            }
+          }
+          if (lastGoodPos > arrayStart) {
+            content = content.substring(0, lastGoodPos + 1) + "]}";
+            truncated = true;
+            console.log("[vibedb-ai] Recovered truncated schema, trimmed to last complete table");
+          }
+        }
+      }
+    }
+
+    // JSON truncation: generic close open brackets/braces (for non-schema types)
+    if (stopReason === "max_tokens" && type !== "generate-schema" && (type === "schema-chat" || type === "batch-command" || type === "inspect-schema" || type === "smart-add-column")) {
       console.log("[vibedb-ai] JSON truncated, attempting auto-close...");
       content = content.replace(/,\s*"[^"]*$/, "");
       content = content.replace(/,\s*$/, "");
@@ -396,33 +483,16 @@ Use double quotes for all JSON strings.`;
       content = content.replace(/,\s*$/, "");
       for (let i = 0; i < openBrackets; i++) content += "]";
       for (let i = 0; i < openBraces; i++) content += "}";
-    }
-
-    // ─── Deduct credits AFTER successful response ────────
-    let creditsRemaining: number | undefined;
-    if (userId) {
-      const supabaseAdmin = createClient(
-        Deno.env.get("SUPABASE_URL") ?? "",
-        Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ?? "",
-        { auth: { persistSession: false } }
-      );
-      const creditCost = CREDIT_COSTS[type] ?? 1;
-      // Re-read current credits (may have changed during retries)
-      const { data: freshProfile } = await supabaseAdmin
-        .from("profiles")
-        .select("ai_credits")
-        .eq("user_id", userId)
-        .maybeSingle();
-      const freshCredits = freshProfile?.ai_credits ?? 0;
-      const newCredits = Math.max(0, freshCredits - creditCost);
-      await supabaseAdmin.from("profiles").update({ ai_credits: newCredits }).eq("user_id", userId);
-      creditsRemaining = newCredits;
+      // Signal frontend to issue continuation calls for inspect-schema
+      if (type === "inspect-schema") {
+        truncated = true;
+      }
     }
 
     return new Response(JSON.stringify({
       result: content,
-      credits_remaining: creditsRemaining,
       model_used: modelUsed,
+      truncated,
     }), {
       headers: { ...corsHeaders, "Content-Type": "application/json" },
     });

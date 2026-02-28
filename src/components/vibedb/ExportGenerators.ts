@@ -1,37 +1,7 @@
 // ─── Export Generators for VibeDB ────────────────────────
 
-interface Column {
-  id: string;
-  name: string;
-  type: string;
-  isForeignKey?: boolean;
-  linkedTable?: string;
-  linkedTableId?: string;
-  linkedColumn?: string;
-  fkStatus?: string;
-  constraints?: { type: string; value?: string }[];
-}
-
-interface TableNode {
-  id: string;
-  name: string;
-  columns: Column[];
-  x: number;
-  y: number;
-  indexes?: { name: string; columns: string[]; type: string; unique: boolean; where?: string }[];
-  checkConstraints?: { name: string; expression: string }[];
-  dataRows?: Record<string, string>[];
-}
-
-export interface SchemaEnum {
-  name: string;
-  values: string[];
-}
-
-export interface SchemaFunction {
-  name: string;
-  body: string;
-}
+import type { Column, TableNode, SchemaEnum, SchemaFunction } from "@/lib/types";
+export type { SchemaEnum, SchemaFunction };
 
 // ─── Sanitize a single table's columns before SQL generation ─────────
 // Deduplicates columns, ensures exactly one PK on 'id', removes extra PKs,
@@ -465,7 +435,9 @@ export function diagnoseAndFixSchema(
 
   let createIndex = 0;
   for (const missingName of uniqueMissingTables) {
-    if (existingTableNames.has(missingName.toLowerCase()) || createdTableNames.has(missingName.toLowerCase())) {
+    const missingNameLower = missingName.toLowerCase();
+
+    if (existingTableNames.has(missingNameLower) || createdTableNames.has(missingNameLower)) {
       // Table EXISTS on canvas but Supabase says it doesn't exist — this is an ordering issue.
       // The FK references a table that hasn't been created YET in the deploy sequence.
       // Fix: mark for deferred FK generation (ALTER TABLE ADD CONSTRAINT after all tables created)
@@ -478,6 +450,44 @@ export function diagnoseAndFixSchema(
       continue;
     }
 
+    // Symmetric Matching: Check if it's a compound prefix pointing to an existing table
+    // E.g. "created_by_users" or "referred_by_users" -> "users"
+    // E.g. "parent_categories" -> "categories"
+    const words = missingNameLower.split("_");
+    let mappedExistingTable: string | null = null;
+
+    if (words.length > 1) {
+      // Check suffix iteratively: categories, then parent_categories
+      for (let i = 1; i < words.length; i++) {
+        const suffixCandidate = words.slice(i).join("_");
+        if (existingTableNames.has(suffixCandidate) || createdTableNames.has(suffixCandidate)) {
+          mappedExistingTable = suffixCandidate;
+          break;
+        }
+      }
+    }
+
+    if (mappedExistingTable) {
+      // We found a valid base table for this compound name. Redirect any FKs trying to hit the missing table
+      for (const t of fixedItems) {
+        for (const c of t.columns) {
+          if (c.isForeignKey && c.linkedTable?.toLowerCase() === missingNameLower) {
+            c.linkedTable = mappedExistingTable;
+            const targetTableDef = fixedItems.find(et => et.name.toLowerCase() === mappedExistingTable);
+            if (targetTableDef) c.linkedTableId = targetTableDef.id;
+            c.fkStatus = "resolved";
+          }
+        }
+      }
+      actions.push({
+        type: "fix_missing_pk_col",
+        tableName: missingName,
+        description: `Mapped compound reference '${missingName}' to existing table '${mappedExistingTable}'`,
+      });
+      continue;
+    }
+
+    // If no symmetric match was found, we actually need to create the missing table.
     // Determine the FK column type from the referencing columns to match the id type
     let idType = "uuid";
     for (const t of fixedItems) {
@@ -741,6 +751,63 @@ export function diagnoseAndFixSchema(
   };
 }
 
+// ─── Polymorphic Relationship Detection ─────────────────────────────
+
+export interface PolymorphicRelationship {
+  tableName: string;
+  idColumn: string;
+  typeColumn: string;
+  prefix: string;
+}
+
+/**
+ * Scan tables for polymorphic relationship patterns.
+ * Looks for column pairs where a `*_id` column is paired with a matching
+ * `*_type` column (e.g. `commentable_id` + `commentable_type`, or
+ * `entity_id` + `entity_type`).
+ */
+export function detectPolymorphicRelationships(tables: TableNode[]): PolymorphicRelationship[] {
+  const results: PolymorphicRelationship[] = [];
+
+  for (const table of tables) {
+    const colNames = table.columns.map(c => c.name);
+
+    // Build a set of column names for quick lookup
+    const colNameSet = new Set(colNames.map(n => n.toLowerCase()));
+
+    for (const col of table.columns) {
+      const lower = col.name.toLowerCase();
+
+      // Check if this column ends with "_id"
+      if (!lower.endsWith("_id")) continue;
+
+      const prefix = lower.slice(0, -3); // strip "_id"
+      if (!prefix) continue;
+
+      // Look for a matching "_type" column with the same prefix
+      const typeColName = `${prefix}_type`;
+      if (!colNameSet.has(typeColName)) continue;
+
+      // Find the actual column name (preserving original casing)
+      const actualTypeCol = colNames.find(n => n.toLowerCase() === typeColName);
+      if (!actualTypeCol) continue;
+
+      // Skip if the _id column is already an explicit foreign key —
+      // that means it's a regular FK, not a polymorphic reference.
+      if (col.isForeignKey && col.linkedTable) continue;
+
+      results.push({
+        tableName: table.name,
+        idColumn: col.name,
+        typeColumn: actualTypeCol,
+        prefix,
+      });
+    }
+  }
+
+  return results;
+}
+
 // ─── SQL Generation ─────────────────────────────────────────────────
 
 // Generate SQL with all FK constraints inline (original mode)
@@ -842,9 +909,11 @@ function generateSQLInternal(tables: TableNode[], deferFKs: boolean, enums?: Sch
         if (c.type === "unique") line += " UNIQUE";
         if (c.type === "default" && c.value) {
           const val = c.value;
-          if (val === "now()" || val === "gen_random_uuid()" || val === "true" || val === "false" || !isNaN(Number(val))) {
+          // SQL functions/keywords that should NOT be quoted as string literals
+          const sqlKeywords = ["now()", "gen_random_uuid()", "true", "false", "CURRENT_TIMESTAMP", "current_timestamp", "CURRENT_DATE", "current_date", "CURRENT_TIME", "current_time", "NULL", "null"];
+          if (sqlKeywords.includes(val) || !isNaN(Number(val))) {
             line += ` DEFAULT ${val}`;
-          } else if (val.startsWith("'") || val.startsWith("(")) {
+          } else if (val.startsWith("'") || val.startsWith("(") || val.endsWith("()")) {
             line += ` DEFAULT ${val}`;
           } else {
             line += ` DEFAULT '${val}'`;
@@ -913,6 +982,22 @@ function generateSQLInternal(tables: TableNode[], deferFKs: boolean, enums?: Sch
         const where = idx.where ? ` WHERE ${idx.where}` : "";
         sql += `CREATE ${unique}INDEX ${idx.name} ON ${t.name}(${idx.columns.join(", ")})${where};\n`;
       }
+    }
+    sql += "\n";
+  }
+
+  // Polymorphic Relationships — add composite indexes & documentation comments
+  const polyRels = detectPolymorphicRelationships(tables);
+  if (polyRels.length > 0) {
+    sql += "-- Polymorphic Relationships\n";
+    sql += "-- The following tables use polymorphic associations where a type column\n";
+    sql += "-- discriminates which parent table the ID column references.\n";
+    for (const rel of polyRels) {
+      sql += `-- ${rel.tableName}: ${rel.idColumn} + ${rel.typeColumn} (prefix: ${rel.prefix})\n`;
+    }
+    sql += "\n";
+    for (const rel of polyRels) {
+      sql += `CREATE INDEX idx_${rel.tableName}_${rel.prefix}_poly ON ${rel.tableName}(${rel.typeColumn}, ${rel.idColumn});\n`;
     }
     sql += "\n";
   }
@@ -1111,4 +1196,252 @@ export function generateCSV(tables: TableNode[]): string {
     header.join(","),
     ...rows.map(row => row.map(cell => `"${String(cell || "").replace(/"/g, '""')}"`).join(",")),
   ].join("\n");
+}
+
+// ─── NLP Engine / Deterministic Schema Builder ──────────────────────
+
+export interface SchemaIntent {
+  entities: {
+    name: string;
+    attributes?: { name: string; type: string }[];
+  }[];
+  relationships: {
+    source: string;
+    target: string;
+    type: "one_to_many" | "many_to_one" | "many_to_many" | "one_to_one";
+  }[];
+}
+
+export function buildSchemaFromIntent(intent: SchemaIntent): TableNode[] {
+  const tables: TableNode[] = [];
+  const tableMap = new Map<string, TableNode>();
+
+  const TYPE_NORMALIZATION: Record<string, string> = {
+    'string': 'text',
+    'varchar': 'text',
+    'number': 'numeric',
+    'int': 'integer',
+    'integer': 'integer',
+    'boolean': 'boolean',
+    'bool': 'boolean',
+    'date': 'timestamp',
+    'datetime': 'timestamp',
+    'json': 'jsonb',
+  };
+
+  const RESERVED_NAMES = [
+    'table', 'order', 'group', 'select', 'where', 'from', 'join',
+    'index', 'constraint', 'primary', 'foreign', 'references',
+    'default', 'unique', 'check', 'not', 'null', 'and', 'or',
+    'user', 'session', 'password', 'id', 'created_at', 'updated_at', 'deleted_at'
+  ];
+
+  const SENSITIVE_PATTERNS = ['password', 'secret', 'token', 'key', 'credential'];
+
+  // Helper to force snake_case
+  const enforceNamingConvention = (name: string): string => {
+    return name
+      .replace(/([A-Z])/g, '_$1')
+      .toLowerCase()
+      .replace(/^_/, '');
+  };
+
+  // Helper to pluralize safely
+  const pluralize = (word: string) => {
+    if (word.endsWith("y") && !/[aeiou]y$/i.test(word)) return word.slice(0, -1) + "ies";
+    if (word.endsWith("s")) return word;
+    return word + "s";
+  };
+
+  // 1. Create base tables
+  if (intent.entities && Array.isArray(intent.entities)) {
+    intent.entities.forEach((entityObj, i) => {
+      // In case AI gives just a string instead of an object
+      const entityName = typeof entityObj === "string" ? entityObj : entityObj.name;
+      const attributes = typeof entityObj === "object" ? entityObj.attributes : [];
+
+      const tableName = pluralize(entityName.toLowerCase().replace(/[^a-z0-9_]/g, "_"));
+
+      // Position in a nice grid
+      const x = 100 + (i % 4) * 350;
+      const y = 100 + Math.floor(i / 4) * 400;
+
+      const baseColumns: Column[] = [
+        { id: simpleId(), name: "id", type: "uuid", constraints: [{ type: "primary" }, { type: "notNull" }], fkStatus: "resolved" }
+      ];
+
+      // Add AI suggested attributes if they exist
+      if (attributes && Array.isArray(attributes)) {
+        const seenColumns = new Set<string>();
+
+        attributes.forEach(attr => {
+          if (!attr.name) return;
+
+          let safeName = enforceNamingConvention(attr.name);
+
+          // Skip system injected items completely
+          if (["id", "created_at", "updated_at"].includes(safeName)) return;
+
+          // Prevent duplication
+          if (seenColumns.has(safeName)) return;
+          seenColumns.add(safeName);
+
+          // Handle sensitive pattern renames
+          if (SENSITIVE_PATTERNS.some(p => safeName.includes(p)) && !safeName.endsWith("_hash")) {
+            safeName = `${safeName}_hash`;
+          }
+
+          // Handle reserved words escape
+          if (RESERVED_NAMES.includes(safeName)) {
+            safeName = `${safeName}_field`;
+          }
+
+          // Type Normalization
+          const rawType = (attr.type || "text").toLowerCase();
+          const normalizedType = TYPE_NORMALIZATION[rawType] || "text";
+
+          baseColumns.push({
+            id: simpleId(),
+            name: safeName,
+            type: normalizedType,
+            fkStatus: "resolved"
+          });
+        });
+      }
+
+      baseColumns.push({ id: simpleId(), name: "created_at", type: "timestamp", constraints: [{ type: "default", value: "now()" }], fkStatus: "resolved" });
+      baseColumns.push({ id: simpleId(), name: "updated_at", type: "timestamp", constraints: [{ type: "default", value: "now()" }], fkStatus: "resolved" });
+
+      const table: TableNode = {
+        id: simpleId(),
+        name: tableName,
+        x, y,
+        columns: baseColumns
+      };
+      tables.push(table);
+      tableMap.set(tableName, table);
+      tableMap.set(entityName.toLowerCase(), table); // Keep a reference to the singular entity name
+    });
+  }
+
+  // 2. Process Relationships
+  // Count how many junction tables we make to position them
+  let junctionCount = 0;
+
+  // Helper: singularize a table name for FK column naming (users → user, categories → category)
+  const singularize = (name: string): string => {
+    if (name.endsWith("ies")) return name.slice(0, -3) + "y";
+    if (name.endsWith("ses") || name.endsWith("xes") || name.endsWith("zes")) return name.slice(0, -2);
+    if (name.endsWith("s") && !name.endsWith("ss")) return name.slice(0, -1);
+    return name;
+  };
+
+  // Helper: add or upgrade an existing attribute column to an FK column
+  // Returns true if an existing column was upgraded, false if a new one needs to be added
+  const addOrUpgradeFKColumn = (table: TableNode, fkName: string, linkedTable: string, linkedTableId: string): boolean => {
+    // Check if a column with this FK name already exists (from entity attributes)
+    const existing = table.columns.find(c => c.name.toLowerCase() === fkName.toLowerCase());
+    if (existing) {
+      // Upgrade the attribute column to a proper FK
+      existing.type = "uuid";
+      existing.isForeignKey = true;
+      existing.linkedTable = linkedTable;
+      existing.linkedTableId = linkedTableId;
+      existing.linkedColumn = "id";
+      existing.fkStatus = "resolved";
+      return true;
+    }
+    return false;
+  };
+
+  if (intent.relationships && Array.isArray(intent.relationships)) {
+    intent.relationships.forEach(rel => {
+      if (!rel.source || !rel.target || !rel.type) return;
+
+      const sourceTable = tableMap.get(rel.source.toLowerCase());
+      const targetTable = tableMap.get(rel.target.toLowerCase());
+
+      if (!sourceTable || !targetTable) return;
+
+      if (rel.type === "one_to_many") {
+        // Source has many Targets -> Target needs source_id
+        const fkName = `${singularize(rel.source.toLowerCase().replace(/[^a-z0-9_]/g, "_"))}_id`;
+        if (!addOrUpgradeFKColumn(targetTable, fkName, sourceTable.name, sourceTable.id)) {
+          targetTable.columns.push({
+            id: simpleId(),
+            name: fkName,
+            type: "uuid",
+            isForeignKey: true,
+            linkedTable: sourceTable.name,
+            linkedTableId: sourceTable.id,
+            linkedColumn: "id",
+            fkStatus: "resolved"
+          });
+        }
+      } else if (rel.type === "many_to_one") {
+        // Source has one Target -> Source needs target_id
+        const fkName = `${singularize(rel.target.toLowerCase().replace(/[^a-z0-9_]/g, "_"))}_id`;
+        if (!addOrUpgradeFKColumn(sourceTable, fkName, targetTable.name, targetTable.id)) {
+          sourceTable.columns.push({
+            id: simpleId(),
+            name: fkName,
+            type: "uuid",
+            isForeignKey: true,
+            linkedTable: targetTable.name,
+            linkedTableId: targetTable.id,
+            linkedColumn: "id",
+            fkStatus: "resolved"
+          });
+        }
+      } else if (rel.type === "one_to_one") {
+        // Source gets target_id unique
+        const fkName = `${singularize(rel.target.toLowerCase().replace(/[^a-z0-9_]/g, "_"))}_id`;
+        if (!addOrUpgradeFKColumn(sourceTable, fkName, targetTable.name, targetTable.id)) {
+          sourceTable.columns.push({
+            id: simpleId(),
+            name: fkName,
+            type: "uuid",
+            isForeignKey: true,
+            linkedTable: targetTable.name,
+            linkedTableId: targetTable.id,
+            linkedColumn: "id",
+            fkStatus: "resolved",
+            constraints: [{ type: "unique" }]
+          });
+        }
+      } else if (rel.type === "many_to_many") {
+        // Junction table (strictly alphabetically sorted to prevent duplicates)
+        const sortedNames = [sourceTable.name, targetTable.name].sort();
+        const junctionName = `${sortedNames[0]}_${sortedNames[1]}`;
+
+        if (!tableMap.has(junctionName)) {
+          const x = 100 + (junctionCount % 4) * 350;
+          const y = 100 + Math.floor(junctionCount / 4) * 400 + 800; // offset Y below main tables
+          junctionCount++;
+
+          const junctionTable: TableNode = {
+            id: simpleId(),
+            name: junctionName,
+            x, y,
+            columns: [
+              { id: simpleId(), name: "id", type: "uuid", constraints: [{ type: "primary" }, { type: "notNull" }], fkStatus: "resolved" },
+              {
+                id: simpleId(), name: `${sourceTable.name.toLowerCase().replace(/s$/, "")}_id`, type: "uuid",
+                isForeignKey: true, linkedTable: sourceTable.name, linkedTableId: sourceTable.id, linkedColumn: "id", fkStatus: "resolved"
+              },
+              {
+                id: simpleId(), name: `${targetTable.name.toLowerCase().replace(/s$/, "")}_id`, type: "uuid",
+                isForeignKey: true, linkedTable: targetTable.name, linkedTableId: targetTable.id, linkedColumn: "id", fkStatus: "resolved"
+              },
+              { id: simpleId(), name: "created_at", type: "timestamp", constraints: [{ type: "default", value: "now()" }], fkStatus: "resolved" },
+            ]
+          };
+          tables.push(junctionTable);
+          tableMap.set(junctionName, junctionTable);
+        }
+      }
+    });
+  }
+
+  return tables;
 }

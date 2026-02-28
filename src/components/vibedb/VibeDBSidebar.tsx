@@ -3,29 +3,7 @@ import { Plus, Search, Sparkles, Loader2, Trash2, X, GripVertical, Settings } fr
 import { v4 as uuidv4 } from "uuid";
 import { AnimatePresence, motion } from "framer-motion";
 
-interface Column {
-  id: string;
-  name: string;
-  type: string;
-  isForeignKey?: boolean;
-  linkedTable?: string;
-  linkedTableId?: string;
-  linkedColumn?: string;
-  fkStatus?: string;
-  constraints?: { type: string; value?: string }[];
-  description?: string;
-}
-
-interface TableNode {
-  id: string;
-  name: string;
-  columns: Column[];
-  x: number;
-  y: number;
-  indexes?: { name: string; columns: string[]; type: string; unique: boolean }[];
-  checkConstraints?: { name: string; expression: string }[];
-  description?: string;
-}
+import type { Column, TableNode } from "@/lib/types";
 
 const COLUMN_TYPES = ["uuid", "varchar", "int", "timestamp", "boolean", "numeric", "text", "jsonb", "decimal", "float"];
 

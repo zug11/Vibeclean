@@ -74,6 +74,141 @@ serve(async (req) => {
       }
     }
 
+    // ─── Query Action: Execute read-only SQL and return rows ───
+    if (action === "query") {
+      if (!sql) {
+        return new Response(JSON.stringify({ error: "No SQL query provided" }), {
+          status: 400,
+          headers: { ...corsHeaders, "Content-Type": "application/json" },
+        });
+      }
+
+      // Safety: block mutating statements
+      const upperSql = sql.trim().toUpperCase();
+      const MUTATING = ["INSERT", "UPDATE", "DELETE", "DROP", "CREATE", "ALTER", "TRUNCATE"];
+      const isMutating = MUTATING.some((kw: string) => upperSql.startsWith(kw));
+      if (isMutating) {
+        return new Response(JSON.stringify({ error: "Only SELECT queries are allowed. Use deploy for DDL/DML." }), {
+          status: 400,
+          headers: { ...corsHeaders, "Content-Type": "application/json" },
+        });
+      }
+
+      const queryRes = await fetch(`${baseUrl}/rest/v1/rpc/exec_sql_read`, {
+        method: "POST",
+        headers: {
+          "apikey": serviceRoleKey,
+          "Authorization": `Bearer ${serviceRoleKey}`,
+          "Content-Type": "application/json",
+          "Prefer": "return=representation",
+        },
+        body: JSON.stringify({ query: sql }),
+      });
+
+      if (!queryRes.ok) {
+        const errText = await queryRes.text();
+        if (errText.includes("PGRST202") || errText.includes("could not find")) {
+          // Auto-create exec_sql_read function using exec_sql, then retry
+          console.log("[vibedb-deploy] exec_sql_read not found, auto-creating...");
+          const createFnSql = `CREATE OR REPLACE FUNCTION exec_sql_read(query text) RETURNS json AS $$ DECLARE result json; BEGIN EXECUTE 'SELECT json_agg(row_to_json(t)) FROM (' || query || ') t' INTO result; RETURN COALESCE(result, '[]'::json); END; $$ LANGUAGE plpgsql SECURITY DEFINER`;
+          const createRes = await fetch(`${baseUrl}/rest/v1/rpc/exec_sql`, {
+            method: "POST",
+            headers: {
+              "apikey": serviceRoleKey,
+              "Authorization": `Bearer ${serviceRoleKey}`,
+              "Content-Type": "application/json",
+              "Prefer": "return=minimal",
+            },
+            body: JSON.stringify({ query: createFnSql + ";" }),
+          });
+
+          if (!createRes.ok) {
+            const createErr = await createRes.text();
+            if (createErr.includes("PGRST202") || createErr.includes("could not find")) {
+              return new Response(JSON.stringify({
+                error: "Setup required",
+                setup_needed: true,
+                message: "Database functions not found. Deploy your schema first using the Deploy panel.",
+              }), {
+                status: 400,
+                headers: { ...corsHeaders, "Content-Type": "application/json" },
+              });
+            }
+            return new Response(JSON.stringify({ error: `Failed to auto-setup: ${createErr}` }), {
+              status: 400,
+              headers: { ...corsHeaders, "Content-Type": "application/json" },
+            });
+          }
+
+          // Notify PostgREST to reload its schema cache so it sees the new function
+          await fetch(`${baseUrl}/rest/v1/rpc/exec_sql`, {
+            method: "POST",
+            headers: {
+              "apikey": serviceRoleKey,
+              "Authorization": `Bearer ${serviceRoleKey}`,
+              "Content-Type": "application/json",
+              "Prefer": "return=minimal",
+            },
+            body: JSON.stringify({ query: "NOTIFY pgrst, 'reload schema';" }),
+          });
+
+          // Wait for PostgREST to pick up the schema reload
+          await new Promise(r => setTimeout(r, 2000));
+
+          // Retry the query via exec_sql_read
+          const retryRes = await fetch(`${baseUrl}/rest/v1/rpc/exec_sql_read`, {
+            method: "POST",
+            headers: {
+              "apikey": serviceRoleKey,
+              "Authorization": `Bearer ${serviceRoleKey}`,
+              "Content-Type": "application/json",
+              "Prefer": "return=representation",
+            },
+            body: JSON.stringify({ query: sql }),
+          });
+
+          if (!retryRes.ok) {
+            // Schema cache still stale — tell user to retry
+            return new Response(JSON.stringify({
+              error: "Query function was just installed. Please try your query again in a moment.",
+            }), {
+              status: 400,
+              headers: { ...corsHeaders, "Content-Type": "application/json" },
+            });
+          }
+
+          const retryRows = await retryRes.json();
+          const retryArray = Array.isArray(retryRows) ? retryRows : [];
+          const retryCols = retryArray.length > 0 ? Object.keys(retryArray[0]) : [];
+          return new Response(JSON.stringify({
+            success: true,
+            columns: retryCols,
+            rows: retryArray,
+            rowCount: retryArray.length,
+          }), {
+            headers: { ...corsHeaders, "Content-Type": "application/json" },
+          });
+        }
+        return new Response(JSON.stringify({ error: `Query failed: ${errText}` }), {
+          status: 400,
+          headers: { ...corsHeaders, "Content-Type": "application/json" },
+        });
+      }
+
+      const rows = await queryRes.json();
+      const rowArray = Array.isArray(rows) ? rows : [];
+      const columns = rowArray.length > 0 ? Object.keys(rowArray[0]) : [];
+
+      return new Response(JSON.stringify({
+        success: true,
+        columns,
+        rows: rowArray,
+        rowCount: rowArray.length,
+      }), {
+        headers: { ...corsHeaders, "Content-Type": "application/json" },
+      });
+    }
+
     if (action === "deploy") {
       if (!sql) {
         return new Response(JSON.stringify({ error: "No SQL to deploy" }), {
@@ -130,12 +265,15 @@ serve(async (req) => {
 
       if (batchRes.ok) {
         await batchRes.text();
-        // Count statements for the success message
-        const stmtCount = (cleanSql.match(/CREATE TABLE/gi) || []).length;
+        // Count all statement types for the success message
+        const createCount = (cleanSql.match(/CREATE TABLE/gi) || []).length;
+        const insertCount = (cleanSql.match(/INSERT INTO/gi) || []).length;
+        const parts = [`${createCount} table(s)`];
+        if (insertCount > 0) parts.push(`${insertCount} row(s)`);
         return new Response(JSON.stringify({
           success: true,
-          results: [{ statement: `All ${stmtCount} CREATE TABLE statements`, success: true }],
-          message: `Successfully deployed ${stmtCount} table(s)`,
+          results: [{ statement: `All statements executed: ${parts.join(", ")}`, success: true }],
+          message: `Successfully deployed ${parts.join(" and ")}`,
         }), {
           status: 200,
           headers: { ...corsHeaders, "Content-Type": "application/json" },
@@ -199,7 +337,7 @@ serve(async (req) => {
       });
     }
 
-    return new Response(JSON.stringify({ error: "Invalid action. Use 'test' or 'deploy'" }), {
+    return new Response(JSON.stringify({ error: "Invalid action. Use 'test', 'deploy', or 'query'" }), {
       status: 400,
       headers: { ...corsHeaders, "Content-Type": "application/json" },
     });

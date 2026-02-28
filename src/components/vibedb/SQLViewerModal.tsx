@@ -1,23 +1,8 @@
 import { motion, AnimatePresence } from "framer-motion";
-import { X, Copy, Check, Search, Code, AlertTriangle, CheckCircle2, Database } from "lucide-react";
+import { X, Copy, Check, Search, Code, AlertTriangle, CheckCircle2, Database, Wand2 } from "lucide-react";
 import React, { useState, useMemo, useRef, useEffect } from "react";
 
-interface Column {
-  name: string;
-  type: string;
-  isForeignKey?: boolean;
-  linkedTable?: string;
-  linkedColumn?: string;
-  constraints?: { type: string; value?: string }[];
-}
-
-interface TableNode {
-  id: string;
-  name: string;
-  columns: Column[];
-  x: number;
-  y: number;
-}
+import type { TableNode } from "@/lib/types";
 
 interface SQLViewerModalProps {
   open: boolean;
@@ -26,6 +11,7 @@ interface SQLViewerModalProps {
   tables: TableNode[];
   onCopy: (text: string) => void;
   copied: boolean;
+  onFixIssues?: () => void;
 }
 
 // Parse SQL string into per-table blocks
@@ -65,7 +51,7 @@ function validateFKs(tables: TableNode[]): { table: string; column: string; ref:
   return issues;
 }
 
-export default function SQLViewerModal({ open, onClose, sql, tables, onCopy, copied }: SQLViewerModalProps) {
+export default function SQLViewerModal({ open, onClose, sql, tables, onCopy, copied, onFixIssues }: SQLViewerModalProps) {
   const [searchTerm, setSearchTerm] = useState("");
   const [activeTab, setActiveTab] = useState<string>("__all__");
   const [copiedTable, setCopiedTable] = useState<string | null>(null);
@@ -176,7 +162,17 @@ export default function SQLViewerModal({ open, onClose, sql, tables, onCopy, cop
               {showValidation && invalidFKs.length > 0 && (
                 <motion.div initial={{ height: 0 }} animate={{ height: "auto" }} exit={{ height: 0 }} className="overflow-hidden border-b border-border/50">
                   <div className="px-6 py-3 bg-destructive/5 space-y-1.5">
-                    <p className="text-[10px] font-bold text-destructive uppercase tracking-wider">Invalid FK References</p>
+                    <div className="flex items-center justify-between">
+                      <p className="text-[10px] font-bold text-destructive uppercase tracking-wider">Invalid FK References</p>
+                      {onFixIssues && (
+                        <button
+                          onClick={onFixIssues}
+                          className="flex items-center gap-1.5 rounded-lg bg-accent px-3 py-1.5 text-[10px] font-bold text-accent-foreground hover:bg-accent/90 transition"
+                        >
+                          <Wand2 size={11} /> Fix Issues
+                        </button>
+                      )}
+                    </div>
                     {invalidFKs.map((fk, i) => (
                       <div key={i} className="flex items-center gap-2 text-xs text-destructive/80">
                         <AlertTriangle size={11} />
