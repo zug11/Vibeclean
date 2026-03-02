@@ -114,7 +114,7 @@ COLUMN TYPE RULES — use the CORRECT type for each column's semantic meaning:
 - int: counts, quantities, whole numbers (stock_count, download_count, max_retries, sort_order, port)
 - boolean: true/false flags (is_active, is_verified, is_public, is_featured, has_free_tier, enabled)
 - numeric OR decimal: money, prices, percentages, ratings (price, amount, total, discount, commission_rate, rating, latitude, longitude)
-- timestamp: dates and times (created_at, updated_at, published_at, expires_at, last_login_at, deleted_at)
+- timestamptz: dates and times (created_at, updated_at, published_at, expires_at, last_login_at, deleted_at)
 - jsonb: structured data, metadata, settings, configuration blobs
 
 NEVER use uuid for: names, emails, URLs, descriptions, statuses, versions, codes, slugs, titles, or any non-ID column.
@@ -131,12 +131,18 @@ MANDATORY RULES — violating these makes the schema invalid:
 6. Use snake_case for all table and column names. Pluralize table names (users, orders, products).
 7. Foreign key columns MUST be named: <singular_target_table>_id (e.g. user_id, project_id, category_id).
 8. NOT NULL CONSTRAINT: Add {"type":"notNull"} to EVERY column that is logically required. In a well-designed schema, 80%+ of columns should be NOT NULL. Only nullable: optional descriptions, deleted_at, secondary contact info, metadata fields.
-9. Generate INDEXES for: every FK column, columns commonly used in WHERE/ORDER BY, email/username (unique), composite indexes for multi-column queries, partial indexes with WHERE clauses for filtered queries (e.g. active records only).
+9. Generate INDEXES for: every FK column, columns commonly used in WHERE/ORDER BY, email/username (unique), composite indexes for multi-column queries, partial indexes with WHERE clauses for filtered queries (e.g. active records only), GIN indexes on JSONB columns.
 10. Generate CHECK CONSTRAINTS for ALL bounded columns: status/role/type enums (IN list), positive amounts (> 0), percentage/rating ranges (BETWEEN 0 AND 100 or BETWEEN 1 AND 5), non-negative counts (>= 0), priority levels. Name format: chk_<table>_<column>.
 11. For junction/mapping tables (many-to-many), add a COMPOSITE UNIQUE index on the two FK columns to prevent duplicate associations.
 12. For tables involving financial records, legal data, or user-generated content, add a "deleted_at" TIMESTAMP column (nullable, default null) for soft deletes.
 13. For columns storing secrets, tokens, or API keys, add companion columns: "expires_at" (timestamp), "last_rotated_at" (timestamp).
 14. For self-referential FK columns (e.g. parent_id referencing same table), add a CHECK constraint: parent_id != id.
+15. Prefer timestamptz over plain timestamp for all date/time columns — ensures timezone-aware storage.
+16. Prefer text over varchar when no max-length constraint exists — avoids silent truncation.
+17. Use numeric (not float/real/double) for money and financial amounts — prevents floating-point rounding.
+18. Add a GIN index on every JSONB column for efficient containment/key-exists queries.
+19. For tables with a soft-delete deleted_at column, add a partial index WHERE deleted_at IS NULL on commonly queried columns.
+20. For composite indexes, place high-selectivity columns first, then range/sort columns (e.g. user_id, created_at DESC).
 
 Generate as many tables as the idea genuinely requires — don't artificially limit. A simple blog might need 3-5 tables, but a full e-commerce platform or marketplace might need 15-25+. Be thorough and include all tables needed for a production-ready schema.
 Use double quotes for all JSON strings. Emit compact JSON (no pretty-printing, no unnecessary whitespace).`;
@@ -166,7 +172,13 @@ Rules:
         : `Generate mock data for this schema:\n${context}`;
     } else if (type === "generate-query") {
       systemPrompt = `You are a SQL query expert. Given the schema context and a user request, generate a valid PostgreSQL query.
-Return ONLY valid SQL, no markdown formatting.`;
+
+Rules:
+- Use EXISTS instead of COUNT(*) > 0 for existence checks.
+- Never use SELECT * — always list specific columns needed.
+- For paginated results, use cursor-based pagination (WHERE id > $cursor ORDER BY id LIMIT N) instead of OFFSET.
+- When the schema uses RLS or Supabase auth, wrap user-scoped queries with auth.uid() for the current user's ID.
+- Return ONLY valid SQL, no markdown formatting.`;
       userPrompt = `Schema:\n${context}\n\nRequest: ${prompt}`;
     } else if (type === "analyze-data") {
       systemPrompt = `You are a data analyst. You are given actual row data from database tables. Analyze the provided data and answer the user's question.
@@ -208,6 +220,9 @@ SCORING RUBRIC — calculate precisely:
   - Financial/legal table missing soft delete (deleted_at): -5 each
   - JSONB column without description or documentation comment: -2 each
   - Missing composite index on multi-column query patterns: -3 each
+  - JSONB column without a GIN index: -3 each
+  - Function marked SECURITY DEFINER without explicit search_path set: -5 each
+  - Using timestamp instead of timestamptz: -2 each
 - Minimum score: 0
 - A well-designed schema with PKs, timestamps, indexes, clean naming, and constraints → 90-100
 - A typical new schema with tables but no indexes → 50-65

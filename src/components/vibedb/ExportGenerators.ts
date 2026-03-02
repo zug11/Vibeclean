@@ -929,7 +929,7 @@ function generateSQLInternal(tables: TableNode[], deferFKs: boolean, enums?: Sch
             // The edge function treats "already exists" errors as success for idempotent re-deploys
             const constraintName = `fk_${t.name}_${col.name}`.toLowerCase();
             deferredFKs.push(
-              `ALTER TABLE ${t.name} ADD CONSTRAINT ${constraintName} FOREIGN KEY (${col.name}) REFERENCES ${col.linkedTable}(${targetCol}) DEFERRABLE INITIALLY DEFERRED;`
+              `DO $$ BEGIN\n  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = '${constraintName}') THEN\n    ALTER TABLE ${t.name} ADD CONSTRAINT ${constraintName} FOREIGN KEY (${col.name}) REFERENCES ${col.linkedTable}(${targetCol}) DEFERRABLE INITIALLY DEFERRED;\n  END IF;\nEND $$;`
             );
           } else {
             line += ` REFERENCES ${col.linkedTable}(${targetCol})`;
@@ -966,7 +966,7 @@ function generateSQLInternal(tables: TableNode[], deferFKs: boolean, enums?: Sch
     sql += "-- CHECK Constraints\n";
     for (const t of allChecks) {
       for (const chk of t.checkConstraints!) {
-        sql += `ALTER TABLE ${t.name} ADD CONSTRAINT ${chk.name} CHECK (${deduplicateInListExpression(chk.expression)});\n`;
+        sql += `DO $$ BEGIN\n  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = '${chk.name}') THEN\n    ALTER TABLE ${t.name} ADD CONSTRAINT ${chk.name} CHECK (${deduplicateInListExpression(chk.expression)});\n  END IF;\nEND $$;\n`;
       }
     }
     sql += "\n";
