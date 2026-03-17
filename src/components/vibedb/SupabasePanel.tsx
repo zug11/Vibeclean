@@ -14,6 +14,7 @@ import {
   ChevronRight,
 } from "lucide-react";
 import type { TableNode } from "@/lib/types";
+import { runCompilerPass } from "@/lib/compiler-pass";
 import {
   introspectSupabaseSchema,
   generateRLSPolicies,
@@ -122,16 +123,18 @@ const SupabasePanel: React.FC<SupabasePanelProps> = ({
     }
   };
 
-  // Generate RLS policies
+  // Generate RLS policies (compile first to ensure naming/constraints are enforced)
   const handleGenerateRLS = () => {
-    const sql = generateRLSPolicies(canvasItems);
+    const { tables: compiled } = runCompilerPass(canvasItems);
+    const sql = generateRLSPolicies(compiled);
     setRlsSql(sql);
     setRlsCopied(false);
   };
 
-  // Generate TypeScript types
+  // Generate TypeScript types (compile first for consistent naming)
   const handleGenerateTypes = () => {
-    const ts = generateSupabaseTypes(canvasItems);
+    const { tables: compiled } = runCompilerPass(canvasItems);
+    const ts = generateSupabaseTypes(compiled);
     setTypesTs(ts);
     setTypesCopied(false);
   };

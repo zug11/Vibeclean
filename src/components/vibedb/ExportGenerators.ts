@@ -903,23 +903,30 @@ function generateSQLInternal(tables: TableNode[], deferFKs: boolean, enums?: Sch
 
     cleanColumns.forEach(col => {
       let line = `  ${col.name} ${col.type.toUpperCase()}`;
-      col.constraints?.forEach(c => {
-        if (c.type === "primary" && pkCols.length === 1) line += " PRIMARY KEY";
-        if (c.type === "notNull") line += " NOT NULL";
-        if (c.type === "unique") line += " UNIQUE";
-        if (c.type === "default" && c.value) {
-          const val = c.value;
-          // SQL functions/keywords that should NOT be quoted as string literals
-          const sqlKeywords = ["now()", "gen_random_uuid()", "true", "false", "CURRENT_TIMESTAMP", "current_timestamp", "CURRENT_DATE", "current_date", "CURRENT_TIME", "current_time", "NULL", "null"];
-          if (sqlKeywords.includes(val) || !isNaN(Number(val))) {
-            line += ` DEFAULT ${val}`;
-          } else if (val.startsWith("'") || val.startsWith("(") || val.endsWith("()")) {
-            line += ` DEFAULT ${val}`;
-          } else {
-            line += ` DEFAULT '${val}'`;
-          }
+
+      // State-evaluated approach: deduplicate constraints and respect PG implicit rules
+      const isPk = col.constraints?.some(c => c.type === "primary") && pkCols.length === 1;
+      const isNotNull = col.constraints?.some(c => c.type === "notNull");
+      const isUnique = col.constraints?.some(c => c.type === "unique");
+      const def = col.constraints?.find(c => c.type === "default");
+
+      if (isPk) line += " PRIMARY KEY";
+      // PostgreSQL automatically enforces NOT NULL and UNIQUE on PRIMARY KEYs
+      if (isNotNull && !isPk) line += " NOT NULL";
+      if (isUnique && !isPk) line += " UNIQUE";
+
+      if (def && def.value) {
+        const val = def.value;
+        const isSqlFunction = /^[a-z_]+\(.*\)$/i.test(val);
+        const isSqlKeyword = /^(true|false|null|current_timestamp|current_date|current_time)$/i.test(val);
+        if (isSqlFunction || isSqlKeyword || !isNaN(Number(val))) {
+          line += ` DEFAULT ${val}`;
+        } else if (val.startsWith("'") || val.startsWith("(")) {
+          line += ` DEFAULT ${val}`;
+        } else {
+          line += ` DEFAULT '${val.replace(/'/g, "''")}'`;
         }
-      });
+      }
       if (col.isForeignKey && col.linkedTable) {
         // Resolve the target column: use linkedColumn if set, otherwise find the PK of the target table
         const targetCol = col.linkedColumn || findPKColumn(tables, col.linkedTable);

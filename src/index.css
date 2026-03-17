@@ -163,6 +163,15 @@
   }
 }
 
+/* FK Handshake: SVG line pulse when a foreign key resolves */
+@keyframes fk-line-pulse {
+  0% { stroke-width: 6; filter: drop-shadow(0 0 4px hsl(var(--accent))); }
+  100% { stroke-width: 2.5; filter: none; }
+}
+.fk-line-resolved {
+  animation: fk-line-pulse 1s ease-out forwards;
+}
+
 @media print {
   @page { margin: 2.5cm; }
   body * { visibility: hidden; }

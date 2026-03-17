@@ -86,12 +86,22 @@ export default {
           "0%, 100%": { opacity: "1" },
           "50%": { opacity: "0.7" },
         },
+        "fk-handshake": {
+          "0%": { backgroundColor: "hsl(var(--accent) / 0.35)" },
+          "100%": { backgroundColor: "transparent" },
+        },
+        "fk-line-handshake": {
+          "0%": { strokeWidth: "6", opacity: "1" },
+          "50%": { strokeWidth: "4", opacity: "0.9" },
+          "100%": { strokeWidth: "2.5", opacity: "0.9" },
+        },
       },
       animation: {
         "accordion-down": "accordion-down 0.2s ease-out",
         "accordion-up": "accordion-up 0.2s ease-out",
         "float": "float 3s ease-in-out infinite",
         "pulse-soft": "pulse-soft 2s ease-in-out infinite",
+        "fk-handshake": "fk-handshake 1s ease-out forwards",
       },
     },
   },

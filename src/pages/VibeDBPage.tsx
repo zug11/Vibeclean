@@ -16,6 +16,7 @@ import { createGenerationTracker, type GenerationProgress } from "@/lib/generati
 import { STRATEGIES, getDefaultStrategy, setDefaultStrategy } from "@/lib/generation-strategies";
 import { GenerationHistoryStore, type GenerationRecord } from "@/lib/generation-history";
 import { runCompilerPass } from "@/lib/compiler-pass";
+import { generateRLSPolicies } from "@/lib/supabase-integration";
 import GenerationHistoryPanel from "@/components/vibedb/GenerationHistoryPanel";
 import SchemaCompareModal from "@/components/vibedb/SchemaCompareModal";
 import DatabaseManagerPanel from "@/components/vibedb/DatabaseManagerPanel";
@@ -82,6 +83,51 @@ function smartPluralize(word: string): string {
   if (word.endsWith("y") && !/[aeiou]y$/i.test(word)) return word.slice(0, -1) + "ies";
   if (word.endsWith("s")) return word;
   return word + "s";
+}
+
+// ─── Canvas-aware FK Resolution ─────────────────────────
+// Pure function: given a list of all canvas tables, resolves FK links bidirectionally.
+// - Forward: columns on `newTables` pointing at existing canvas tables get resolved
+// - Backward: columns on existing canvas tables pointing at any new table get resolved
+// Returns the full merged array with all resolvable FKs green.
+function resolveCanvasFKsBidirectional(existingTables: TableNode[], newTables: TableNode[]): TableNode[] {
+  // Build name→id map for ALL tables (existing + new)
+  const tableMap = new Map<string, string>();
+  for (const t of existingTables) {
+    const name = t.name.toLowerCase();
+    tableMap.set(name, t.id);
+    tableMap.set(smartPluralize(name), t.id);
+    if (name.endsWith("ies")) tableMap.set(name.slice(0, -3) + "y", t.id);
+    else if (name.endsWith("s") && !name.endsWith("ss")) tableMap.set(name.slice(0, -1), t.id);
+  }
+  for (const t of newTables) {
+    const name = t.name.toLowerCase();
+    tableMap.set(name, t.id);
+    tableMap.set(smartPluralize(name), t.id);
+    if (name.endsWith("ies")) tableMap.set(name.slice(0, -3) + "y", t.id);
+    else if (name.endsWith("s") && !name.endsWith("ss")) tableMap.set(name.slice(0, -1), t.id);
+  }
+
+  const resolveColumns = (t: TableNode): TableNode => {
+    const fixedCols = t.columns.map(col => {
+      if (col.fkStatus === "resolved") return col;
+      if (!col.isForeignKey || !col.linkedTable) return col;
+      const targetName = col.linkedTable.toLowerCase();
+      const targetId = tableMap.get(targetName) || tableMap.get(smartPluralize(targetName));
+      if (targetId && targetId !== t.id) {
+        return { ...col, linkedTableId: targetId, fkStatus: "resolved" as const };
+      }
+      return col;
+    });
+    return { ...t, columns: fixedCols };
+  };
+
+  // Forward: resolve new tables' FKs against everything
+  const resolvedNew = newTables.map(resolveColumns);
+  // Backward: resolve existing tables' FKs that may point at new tables
+  const resolvedExisting = existingTables.map(resolveColumns);
+
+  return [...resolvedExisting, ...resolvedNew];
 }
 
 function applySmartFKResolution(tables: Omit<TableNode, "x" | "y">[]) {
@@ -555,6 +601,8 @@ function robustJsonParse(str: string): any {
     if (ch === "[") openBrackets++;
     if (ch === "]") openBrackets--;
   }
+  // Close the string if LLM truncated mid-value
+  if (inString) fixed += '"';
   // Remove any trailing comma before we close
   fixed = fixed.replace(/,\s*$/, "");
   for (let i = 0; i < openBrackets; i++) fixed += "]";
@@ -868,73 +916,22 @@ function inferCorrectType(colName: string, aiType: string, isForeignKey: boolean
   return aiType;
 }
 
-// Sanitize AI-generated tables: fix missing PKs, duplicate columns, multiple PKs, bad types
+// Sanitize AI-generated tables: deduplicate columns and fix AI type mistakes.
+// ID/timestamp injection is handled by compiler Pass 7 (ensureStandardColumns).
 function sanitizeGeneratedTables(tables: any[]): any[] {
   return tables.map(t => {
     const seen = new Set<string>();
-    const dedupedCols: any[] = [];
-
-    for (const c of (t.columns || [])) {
+    const cleanedCols = (t.columns || []).filter((c: any) => {
       const name = (c.name || "").toLowerCase();
-      if (!name || seen.has(name)) continue; // skip empty or duplicate names
+      if (!name || seen.has(name)) return false;
       seen.add(name);
-      dedupedCols.push(c);
-    }
+      return true;
+    }).map((c: any) => ({
+      ...c,
+      type: inferCorrectType(c.name, c.type || "varchar", !!c.isForeignKey),
+    }));
 
-    // Ensure exactly one 'id' column with PK
-    let hasId = false;
-    let pkCount = 0;
-    const fixedCols = dedupedCols.map(c => {
-      const isPK = c.constraints?.some((x: any) => x.type === "primary");
-      if (c.name.toLowerCase() === "id") {
-        hasId = true;
-        // Ensure id has PK constraint
-        if (!isPK) {
-          return { ...c, type: "uuid", constraints: [{ type: "primary" }, { type: "notNull" }, ...(c.constraints || []).filter((x: any) => x.type !== "primary")] };
-        }
-        pkCount++;
-        return c;
-      }
-      // Remove PK from non-id columns (should only be on id)
-      if (isPK) {
-        c = { ...c, constraints: (c.constraints || []).filter((x: any) => x.type !== "primary") };
-      }
-
-      // ─── Type correction: fix AI type mistakes ───
-      const correctedType = inferCorrectType(c.name, c.type || "varchar", !!c.isForeignKey);
-
-      // ─── NOT NULL enforcement: add notNull for columns that should logically be required ───
-      const constraints = [...(c.constraints || [])];
-      const hasNotNull = constraints.some((x: any) => x.type === "notNull");
-      if (!hasNotNull) {
-        const name = c.name.toLowerCase();
-        // Most columns should be NOT NULL except explicitly optional ones
-        const isOptional = name === "deleted_at" || name.includes("optional") || name.includes("bio") ||
-          name.includes("notes") || name.includes("description") || name === "avatar_url" ||
-          name === "last_login_at" || name === "phone" || name === "middle_name" ||
-          name.includes("metadata") || name.includes("config");
-        if (!isOptional && name !== "created_at" && name !== "updated_at") {
-          constraints.push({ type: "notNull" });
-        }
-      }
-
-      return { ...c, type: correctedType, constraints };
-    });
-
-    // If no id column, prepend one
-    if (!hasId) {
-      fixedCols.unshift({ name: "id", type: "uuid", isForeignKey: false, linkedTable: "", linkedColumn: "", constraints: [{ type: "primary" }, { type: "notNull" }] });
-    }
-
-    // Ensure created_at and updated_at exist
-    if (!seen.has("created_at")) {
-      fixedCols.push({ name: "created_at", type: "timestamp", isForeignKey: false, linkedTable: "", linkedColumn: "", constraints: [{ type: "default", value: "now()" }] });
-    }
-    if (!seen.has("updated_at")) {
-      fixedCols.push({ name: "updated_at", type: "timestamp", isForeignKey: false, linkedTable: "", linkedColumn: "", constraints: [{ type: "default", value: "now()" }] });
-    }
-
-    return { ...t, columns: fixedCols };
+    return { ...t, columns: cleanedCols };
   });
 }
 
@@ -1171,6 +1168,8 @@ function CompilerReportUI({ report }: { report: CompilerReport }) {
     "fk-index": "FK indexes added",
     "dedup": "Duplicates removed",
     "timestamp-default": "Timestamp defaults added",
+    "semantic-constraint": "Semantic constraint fixes",
+    "standard-columns": "Standard columns enforced",
   };
 
   return (
@@ -1228,6 +1227,37 @@ const VibeDBPage = () => {
   const [editingProjectName, setEditingProjectName] = useState(false);
   const saveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
+  // Track recently-resolved FK column IDs for green pulse animation
+  const prevFkStatusRef = useRef<Map<string, string>>(new Map());
+  const [recentlyResolvedIds, setRecentlyResolvedIds] = useState<Set<string>>(new Set());
+
+  useEffect(() => {
+    const prevMap = prevFkStatusRef.current;
+    const newlyResolved = new Set<string>();
+    for (const table of canvasItems) {
+      for (const col of table.columns) {
+        const prev = prevMap.get(col.id);
+        if (prev === "unresolved" && col.fkStatus === "resolved") {
+          newlyResolved.add(col.id);
+        }
+      }
+    }
+    // Update the previous map
+    const nextMap = new Map<string, string>();
+    for (const table of canvasItems) {
+      for (const col of table.columns) {
+        if (col.fkStatus) nextMap.set(col.id, col.fkStatus);
+      }
+    }
+    prevFkStatusRef.current = nextMap;
+
+    if (newlyResolved.size > 0) {
+      setRecentlyResolvedIds(newlyResolved);
+      const timer = setTimeout(() => setRecentlyResolvedIds(new Set()), 1000);
+      return () => clearTimeout(timer);
+    }
+  }, [canvasItems]);
+
   // Load projects list on mount
   useEffect(() => {
     const metas = ProjectStorage.listProjects();
@@ -1273,6 +1303,7 @@ const VibeDBPage = () => {
   }, [canvasItems, currentProjectId, projectName]);
 
   const saveProject = useCallback(async () => {
+    if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
     setIsSaving(true);
     try {
       if (currentProjectId) {
@@ -1361,6 +1392,8 @@ const VibeDBPage = () => {
   const [showSqlModal, setShowSqlModal] = useState(false);
   const [generatedSql, setGeneratedSql] = useState("");
   const [copied, setCopied] = useState(false);
+  const [showRlsModal, setShowRlsModal] = useState(false);
+  const [generatedRlsSql, setGeneratedRlsSql] = useState("");
   const [showPlayground, setShowPlayground] = useState(false);
   const [queryPrompt, setQueryPrompt] = useState("");
   const [isCallingAI, setIsCallingAI] = useState(false);
@@ -1588,23 +1621,10 @@ const VibeDBPage = () => {
         const { tables: compiled, report: cReport } = runCompilerPass(positioned);
         setCompilerReport(cReport);
 
-        // Resolve FK linkedTableId references
+        // Resolve FK linkedTableId references bidirectionally
         tracker.advanceStep();
         setCanvasItems(prev => {
-          const allTables = [...prev, ...compiled];
-          const tableMap = new Map<string, string>();
-          allTables.forEach(t => tableMap.set(t.name.toLowerCase(), t.id));
-          const resolved = compiled.map(t => ({
-            ...t,
-            columns: t.columns.map(col => {
-              if (col.isForeignKey && col.linkedTable) {
-                const targetId = tableMap.get(col.linkedTable.toLowerCase());
-                return { ...col, linkedTableId: targetId, fkStatus: targetId ? "resolved" as const : "unresolved" as const };
-              }
-              return col;
-            }),
-          }));
-          return [...prev, ...resolved];
+          return resolveCanvasFKsBidirectional(prev, compiled);
         });
         tracker.complete();
         const fixCount = cReport.actions.length;
@@ -1711,7 +1731,9 @@ const VibeDBPage = () => {
         startX = (-view.x / view.zoom) + 100 + (offset % 400);
         startY = (-view.y / view.zoom) + 100 + (offset % 300);
       }
-      return [...currentItems, { ...item, x: startX, y: startY } as TableNode];
+      const newTable = { ...item, x: startX, y: startY } as TableNode;
+      // Resolve FK links bidirectionally: new table → existing, existing → new table
+      return resolveCanvasFKsBidirectional(currentItems, [newTable]);
     });
     setSidebarItems(prev => prev.filter((_, i) => i !== itemIndex));
   }, [sidebarItems, setCanvasItems, view]);
@@ -1744,9 +1766,20 @@ const VibeDBPage = () => {
     if (normalizedSQL) {
       setGeneratedSql(normalizedSQL);
     } else {
-      setGeneratedSql(generateSQL(canvasItems));
+      // Always run through the deterministic compiler before generating SQL
+      const compiledAst = runCompilerPass(canvasItems).tables;
+      setGeneratedSql(generateSQL(compiledAst));
     }
     setShowSqlModal(true);
+  };
+
+  // ─── Generate RLS ──────────────────────────────────────
+  const handleGenerateRLS = () => {
+    if (canvasItems.length === 0) { addToast("Add tables first", "error"); return; }
+    const compiledAst = runCompilerPass(canvasItems).tables;
+    const rls = generateRLSPolicies(compiledAst);
+    setGeneratedRlsSql(rls);
+    setShowRlsModal(true);
   };
 
   // ─── Fix FK Issues from SQL Viewer ─────────────────
@@ -1759,10 +1792,11 @@ const VibeDBPage = () => {
 
     const result = diagnoseAndFixSchema(canvasItems, canvasIssues, view);
 
-    // Update canvas + SQL — new tables are already positioned at viewport-relative
-    // coordinates by diagnoseAndFixSchema, so no force layout needed.
-    setCanvasItems(result.fixedItems);
-    setGeneratedSql(generateSQL(result.fixedItems));
+    // Compile the fixed schema, then update canvas + SQL
+    const { tables: compiledFix, report: fixReport } = runCompilerPass(result.fixedItems);
+    setCompilerReport(fixReport);
+    setCanvasItems(compiledFix);
+    setGeneratedSql(generateSQL(compiledFix));
 
     const fixableCount = result.actions.filter(a => a.type !== "unfixable" && a.type !== "skip_existing").length;
     addToast(
@@ -1775,14 +1809,16 @@ const VibeDBPage = () => {
   // ─── Export ───────────────────────────────────────────
   const handleExport = (format: string) => {
     try {
+      // Always run through the deterministic compiler before exporting
+      const compiledAst = runCompilerPass(canvasItems).tables;
       let content = "";
       let filename = "";
       switch (format) {
-        case "prisma": content = generatePrismaSchema(canvasItems); filename = "schema.prisma"; break;
-        case "drizzle": content = generateDrizzleSchema(canvasItems); filename = "schema.ts"; break;
-        case "graphql": content = generateGraphQLTypes(canvasItems); filename = "schema.graphql"; break;
-        case "csv": content = generateCSV(canvasItems); filename = "schema.csv"; break;
-        case "sql": default: content = generateSQL(canvasItems); filename = "schema.sql"; break;
+        case "prisma": content = generatePrismaSchema(compiledAst); filename = "schema.prisma"; break;
+        case "drizzle": content = generateDrizzleSchema(compiledAst); filename = "schema.ts"; break;
+        case "graphql": content = generateGraphQLTypes(compiledAst); filename = "schema.graphql"; break;
+        case "csv": content = generateCSV(compiledAst); filename = "schema.csv"; break;
+        case "sql": default: content = generateSQL(compiledAst); filename = "schema.sql"; break;
       }
       const blob = new Blob([content], { type: "text/plain" });
       const url = URL.createObjectURL(blob);
@@ -1831,8 +1867,13 @@ const VibeDBPage = () => {
     // Clear previous fix results
     setDeployFixResult(null);
 
-    // Pre-Deploy Schema Validation
-    const preDeployIssues = preDeployValidateSchema(canvasItems);
+    // Compile before deploying — enforces naming, constraints, standard columns
+    const { tables: compiledItems, report: deployCompileReport } = runCompilerPass(canvasItems);
+    setCompilerReport(deployCompileReport);
+    setCanvasItems(compiledItems);
+
+    // Pre-Deploy Schema Validation (on compiled schema)
+    const preDeployIssues = preDeployValidateSchema(compiledItems);
     if (preDeployIssues.length > 0) {
       setDeployResults(preDeployIssues);
       addToast(`${preDeployIssues.length} schema issue${preDeployIssues.length !== 1 ? "s" : ""} found — fix before deploying`, "warning");
@@ -1841,7 +1882,7 @@ const VibeDBPage = () => {
 
     // Auto-heal deploy loop: deploy → if errors → classify → fix → retry (max 3 attempts)
     const MAX_ATTEMPTS = 3;
-    let currentItems = canvasItems;
+    let currentItems = compiledItems;
     let attempts = 0;
     let lastResult: { success: boolean; results: { statement: string; success: boolean; error?: string }[]; setupNeeded?: boolean } | null = null;
 
@@ -1895,8 +1936,10 @@ const VibeDBPage = () => {
           break;
         }
 
-        // Apply fixes and retry
+        // Apply fixes, compile, and retry
         currentItems = fixResult.fixedItems;
+        const { tables: compiledFix } = runCompilerPass(currentItems);
+        currentItems = compiledFix;
         setCanvasItems(currentItems);
         setDeployFixResult(fixResult);
         addToast(`Auto-healing: ${fixResult.actions.length} fix${fixResult.actions.length !== 1 ? "es" : ""} applied, retrying deploy...`, "info");
@@ -2074,19 +2117,24 @@ const VibeDBPage = () => {
   const handleSmartInference = () => {
     let count = 0;
     const tableMap = new Map<string, string>();
-    canvasItems.forEach(t => { tableMap.set(t.name.toLowerCase(), t.id); tableMap.set(t.name.toLowerCase() + "s", t.id); });
+    canvasItems.forEach(t => {
+      const name = t.name.toLowerCase();
+      tableMap.set(name, t.id);
+      tableMap.set(smartPluralize(name), t.id);
+      // Also map singularized form (strip trailing s/ies)
+      if (name.endsWith("ies")) tableMap.set(name.slice(0, -3) + "y", t.id);
+      else if (name.endsWith("s") && !name.endsWith("ss")) tableMap.set(name.slice(0, -1), t.id);
+    });
     const updated = canvasItems.map(t => ({
       ...t,
       columns: t.columns.map(col => {
-        if (!col.isForeignKey && col.name.endsWith("_id")) {
-          const target = col.name.replace("_id", "").toLowerCase();
-          if (tableMap.has(target)) {
-            const targetId = tableMap.get(target)!;
-            if (targetId !== t.id) {
-              count++;
-              return { ...col, isForeignKey: true, linkedTableId: targetId, linkedTable: canvasItems.find(ct => ct.id === targetId)?.name, linkedColumn: "id", fkStatus: "resolved" };
-            }
-          }
+        if (col.isForeignKey && col.fkStatus === "resolved") return col; // skip resolved
+        if (!col.name.endsWith("_id")) return col;
+        const target = col.name.replace(/_id$/, "").toLowerCase();
+        const targetId = tableMap.get(target);
+        if (targetId && targetId !== t.id) {
+          count++;
+          return { ...col, isForeignKey: true, linkedTableId: targetId, linkedTable: canvasItems.find(ct => ct.id === targetId)?.name, linkedColumn: "id", fkStatus: "resolved" };
         }
         return col;
       }),
@@ -2182,16 +2230,20 @@ const VibeDBPage = () => {
     if (canvasItems.length === 0) { addToast("Add tables first", "error"); return; }
     setShowAuditModal(true); setIsAuditing(true); setAuditReport(null); setAuditPhase("Analyzing schema...");
     try {
-      const lintIssues = lintSchema(canvasItems);
+      // Compile schema before auditing so AI sees post-compiler state
+      // and won't suggest fixes the compiler already handles
+      const { tables: compiledForAudit } = runCompilerPass(canvasItems);
+
+      const lintIssues = lintSchema(compiledForAudit);
       const fkIssues: { type: string; severity: string; message: string }[] = [];
-      canvasItems.forEach(table => {
+      compiledForAudit.forEach(table => {
         table.columns.forEach(col => {
           if (col.isForeignKey && col.fkStatus !== "resolved")
             fkIssues.push({ type: "fk", severity: "error", message: `Unresolved FK: ${table.name}.${col.name} → ${col.linkedTable}` });
         });
       });
       // Build compact schema context to avoid token limits
-      const compactSchema = canvasItems.map(t => {
+      const compactSchema = compiledForAudit.map(t => {
         const cols = t.columns.map(c => {
           let s = `${c.name}:${c.type}`;
           if (c.constraints?.some(x => x.type === "primary")) s += " PK";
@@ -2244,156 +2296,154 @@ const VibeDBPage = () => {
     addToast(`Removed ${parts.join(" and ")}`, "success");
   };
 
+  // Pure function: applies a single suggestion to a tables array, returns the new tables array.
+  // Used by both handleApplySuggestion (single) and handleApplyAllSuggestions (batch).
+  const applySuggestionToTables = (tables: TableNode[], suggestion: any): TableNode[] => {
+    const targetTable = suggestion.target_table || suggestion.targetTable || suggestion.payload?.targetTable || "";
+    const payload = suggestion.payload || {};
+
+    switch (suggestion.type) {
+      case "add_column": {
+        const colData = payload.columns ? payload.columns[0] : payload;
+        const colName = String(colData?.name || payload.name || "new_column");
+        const colType = String(colData?.type || payload.type || "varchar");
+        const isFK = !!(colData?.isForeignKey);
+        return tables.map(t => {
+          if (t.name.toLowerCase() !== targetTable.toLowerCase()) return t;
+          return { ...t, columns: [...t.columns, { id: uuidv4(), name: colName, type: colType, fkStatus: isFK ? "unresolved" : "resolved", constraints: colData?.constraints || [], isForeignKey: isFK, linkedTable: colData?.linkedTable || "", linkedColumn: colData?.linkedColumn || "" }] };
+        });
+      }
+      case "add_table": {
+        const tableName = payload.name || payload.table?.name || "new_table";
+        const cols = payload.columns || payload.table?.columns || [];
+        const newTable: TableNode = {
+          id: uuidv4(), name: tableName,
+          x: (-view.x / view.zoom) + 200 + Math.random() * 200, y: (-view.y / view.zoom) + 200 + Math.random() * 200,
+          columns: cols.map((c: any) => ({
+            ...c, id: uuidv4(), constraints: c.constraints || [],
+            isForeignKey: !!c.isForeignKey,
+            fkStatus: c.isForeignKey ? "unresolved" : "resolved",
+          })),
+        };
+        // Resolve FK links bidirectionally against the current table set
+        return resolveCanvasFKsBidirectional(tables, [newTable]);
+      }
+      case "add_index": {
+        const idxCols = payload.columns || [];
+        const chatTargetT = tables.find(t => t.name.toLowerCase() === targetTable.toLowerCase());
+        if (findDuplicateIndex(chatTargetT?.indexes, idxCols)) return tables;
+        return tables.map(t => {
+          if (t.name.toLowerCase() !== targetTable.toLowerCase()) return t;
+          return { ...t, indexes: [...(t.indexes || []), { name: payload.name || `idx_${t.name}_${idxCols.join("_")}`, columns: idxCols, type: "btree", unique: payload.unique || false }] };
+        });
+      }
+      case "rename_table": {
+        const newName = payload.newName || suggestion.newName || "";
+        if (!newName) return tables;
+        return tables.map(t => ({
+          ...t,
+          name: t.name.toLowerCase() === targetTable.toLowerCase() ? newName : t.name,
+          columns: t.columns.map(c => c.linkedTable?.toLowerCase() === targetTable.toLowerCase() ? { ...c, linkedTable: newName } : c),
+        }));
+      }
+      case "rename_column": {
+        const targetCol = payload.targetColumn || payload.column || "";
+        const newColName = payload.newName || "";
+        if (!targetCol || !newColName) return tables;
+        return tables.map(t => {
+          if (t.name.toLowerCase() !== targetTable.toLowerCase()) return t;
+          return {
+            ...t,
+            columns: t.columns.map(c => c.name.toLowerCase() === targetCol.toLowerCase() ? { ...c, name: newColName } : c),
+            dataRows: t.dataRows?.map(row => {
+              if (!(targetCol in row)) return row;
+              const { [targetCol]: val, ...rest } = row;
+              return { ...rest, [newColName]: val };
+            }),
+          };
+        });
+      }
+      case "change_type": {
+        const col = payload.targetColumn || payload.column || "";
+        const newType = payload.newType || "";
+        if (!col || !newType) return tables;
+        return tables.map(t => {
+          if (t.name.toLowerCase() !== targetTable.toLowerCase()) return t;
+          return { ...t, columns: t.columns.map(c => c.name.toLowerCase() === col.toLowerCase() ? { ...c, type: newType } : c) };
+        });
+      }
+      case "add_fk": {
+        const fkCol = payload.column || "";
+        const refTable = payload.referencesTable || "";
+        if (!fkCol || !refTable) return tables;
+        const refTableNode = tables.find(t => t.name.toLowerCase() === refTable.toLowerCase());
+        return tables.map(t => {
+          if (t.name.toLowerCase() !== targetTable.toLowerCase()) return t;
+          return { ...t, columns: t.columns.map(c => c.name.toLowerCase() === fkCol.toLowerCase() ? { ...c, isForeignKey: true, linkedTable: refTable, linkedTableId: refTableNode?.id, linkedColumn: payload.referencesColumn || "id", fkStatus: refTableNode ? "resolved" : "unresolved" } : c) };
+        });
+      }
+      case "remove_column": {
+        const rmCol = payload.column || "";
+        if (!rmCol) return tables;
+        return tables.map(t => {
+          if (t.name.toLowerCase() !== targetTable.toLowerCase()) return t;
+          return { ...t, columns: t.columns.filter(c => c.name.toLowerCase() !== rmCol.toLowerCase()) };
+        });
+      }
+      case "remove_table":
+        return tables.filter(t => t.name.toLowerCase() !== targetTable.toLowerCase());
+      case "add_constraint": {
+        const chkName = payload.name || `chk_${targetTable}`;
+        const chkExpr = payload.expression || "";
+        if (!chkExpr) return tables;
+        return tables.map(t => {
+          if (t.name.toLowerCase() !== targetTable.toLowerCase()) return t;
+          return { ...t, checkConstraints: [...(t.checkConstraints || []), { name: chkName, expression: chkExpr }] };
+        });
+      }
+      default:
+        return tables;
+    }
+  };
+
   const handleApplySuggestion = (suggestion: any, silent = false) => {
     try {
-      const targetTable = suggestion.target_table || suggestion.targetTable || suggestion.payload?.targetTable || "";
       const payload = suggestion.payload || {};
 
-      switch (suggestion.type) {
-        case "add_column": {
-          const colData = payload.columns ? payload.columns[0] : payload;
-          const colName = String(colData?.name || payload.name || "new_column");
-          const colType = String(colData?.type || payload.type || "varchar");
-          setCanvasItems(prev => prev.map(t => {
-            if (t.name.toLowerCase() !== targetTable.toLowerCase()) return t;
-            return { ...t, columns: [...t.columns, { id: uuidv4(), name: colName, type: colType, fkStatus: "resolved", constraints: colData?.constraints || [], isForeignKey: colData?.isForeignKey || false, linkedTable: colData?.linkedTable || "", linkedColumn: colData?.linkedColumn || "" }] };
-          }));
-          if (!silent) addToast(`Added ${colName} to ${targetTable}`, "success");
-          break;
+      // Handle non-table mutations separately
+      if (suggestion.type === "add_enum") {
+        const enumName = payload.name || "";
+        const enumValues = payload.values || [];
+        if (!enumName || !enumValues.length) { if (!silent) addToast("Missing enum name or values", "warning"); return; }
+        setSchemaEnums(prev => {
+          if (prev.some(e => e.name.toLowerCase() === enumName.toLowerCase())) return prev;
+          return [...prev, { name: enumName, values: enumValues }];
+        });
+        if (!silent) addToast(`Added enum type ${enumName}`, "success");
+      } else if (suggestion.type === "add_function") {
+        const fnName = payload.name || "";
+        const fnBody = payload.body || "";
+        if (!fnBody) { if (!silent) addToast("Missing function body", "warning"); return; }
+        setSchemaFunctions(prev => {
+          if (prev.some(f => f.name.toLowerCase() === fnName.toLowerCase())) return prev;
+          return [...prev, { name: fnName, body: fnBody }];
+        });
+        if (!silent) addToast(`Added function ${fnName}`, "success");
+      } else {
+        // Table mutation — use the pure function, then handshake + compile
+        let compilerFixCount = 0;
+        setCanvasItems(prev => {
+          const mutated = applySuggestionToTables(prev, suggestion);
+          const resolved = resolveCanvasFKsBidirectional([], mutated);
+          const { tables: compiled, report } = runCompilerPass(resolved);
+          compilerFixCount = report.actions.length;
+          setCompilerReport(report);
+          return compiled;
+        });
+        if (!silent) {
+          const compilerMsg = compilerFixCount > 0 ? ` · Compiler: ${compilerFixCount} auto-fix${compilerFixCount !== 1 ? "es" : ""}` : "";
+          addToast(`Applied: ${suggestion.reason || suggestion.description || suggestion.type}${compilerMsg}`, "success");
         }
-        case "add_table": {
-          const tableName = payload.name || payload.table?.name || "new_table";
-          const cols = payload.columns || payload.table?.columns || [];
-          const newTable: TableNode = {
-            id: uuidv4(), name: tableName,
-            x: (-view.x / view.zoom) + 200 + Math.random() * 200, y: (-view.y / view.zoom) + 200 + Math.random() * 200,
-            columns: cols.map((c: any) => ({ ...c, id: uuidv4(), fkStatus: "resolved", constraints: c.constraints || [] })),
-          };
-          setCanvasItems(prev => [...prev, newTable]);
-          if (!silent) addToast(`Added ${tableName} table`, "success");
-          break;
-        }
-        case "add_index": {
-          const idxCols = payload.columns || [];
-          const targetT = canvasItems.find(t => t.name.toLowerCase() === targetTable.toLowerCase());
-          const existingDup = findDuplicateIndex(targetT?.indexes, idxCols);
-          if (existingDup) {
-            if (!silent) addToast(`Index on ${targetTable}(${idxCols.join(", ")}) already exists — skipped`, "info");
-            break;
-          }
-          setCanvasItems(prev => prev.map(t => {
-            if (t.name.toLowerCase() !== targetTable.toLowerCase()) return t;
-            const newIdx = { name: `idx_${t.name}_${idxCols.join("_")}`, columns: idxCols, type: "btree", unique: payload.unique || false };
-            return { ...t, indexes: [...(t.indexes || []), newIdx] };
-          }));
-          if (!silent) addToast(`Added index on ${targetTable}(${idxCols.join(", ")})`, "success");
-          break;
-        }
-        case "rename_table": {
-          const newName = payload.newName || suggestion.newName || "";
-          if (!newName) { if (!silent) addToast("Missing new name", "warning"); break; }
-          setCanvasItems(prev => prev.map(t => ({
-            ...t,
-            name: t.name.toLowerCase() === targetTable.toLowerCase() ? newName : t.name,
-            columns: t.columns.map(c => c.linkedTable?.toLowerCase() === targetTable.toLowerCase() ? { ...c, linkedTable: newName } : c),
-          })));
-          if (!silent) addToast(`Renamed ${targetTable} → ${newName}`, "success");
-          break;
-        }
-        case "rename_column": {
-          const targetCol = payload.targetColumn || payload.column || "";
-          const newColName = payload.newName || "";
-          if (!targetCol || !newColName) { if (!silent) addToast("Missing column info", "warning"); break; }
-          setCanvasItems(prev => prev.map(t => {
-            if (t.name.toLowerCase() !== targetTable.toLowerCase()) return t;
-            return {
-              ...t,
-              columns: t.columns.map(c => c.name.toLowerCase() === targetCol.toLowerCase() ? { ...c, name: newColName } : c),
-              dataRows: t.dataRows?.map(row => {
-                if (!(targetCol in row)) return row;
-                const { [targetCol]: val, ...rest } = row;
-                return { ...rest, [newColName]: val };
-              }),
-            };
-          }));
-          if (!silent) addToast(`Renamed ${targetCol} → ${newColName}`, "success");
-          break;
-        }
-        case "change_type": {
-          const col = payload.targetColumn || payload.column || "";
-          const newType = payload.newType || "";
-          if (!col || !newType) { if (!silent) addToast("Missing type info", "warning"); break; }
-          setCanvasItems(prev => prev.map(t => {
-            if (t.name.toLowerCase() !== targetTable.toLowerCase()) return t;
-            return { ...t, columns: t.columns.map(c => c.name.toLowerCase() === col.toLowerCase() ? { ...c, type: newType } : c) };
-          }));
-          if (!silent) addToast(`Changed ${col} type to ${newType}`, "success");
-          break;
-        }
-        case "add_fk": {
-          const fkCol = payload.column || "";
-          const refTable = payload.referencesTable || "";
-          if (!fkCol || !refTable) { if (!silent) addToast("Missing FK info", "warning"); break; }
-          setCanvasItems(prev => {
-            const refTableNode = prev.find(t => t.name.toLowerCase() === refTable.toLowerCase());
-            return prev.map(t => {
-              if (t.name.toLowerCase() !== targetTable.toLowerCase()) return t;
-              return { ...t, columns: t.columns.map(c => c.name.toLowerCase() === fkCol.toLowerCase() ? { ...c, isForeignKey: true, linkedTable: refTable, linkedTableId: refTableNode?.id, linkedColumn: payload.referencesColumn || "id", fkStatus: refTableNode ? "resolved" : "unresolved" } : c) };
-            });
-          });
-          if (!silent) addToast(`Added FK ${fkCol} → ${refTable}`, "success");
-          break;
-        }
-        case "remove_column": {
-          const rmCol = payload.column || "";
-          if (!rmCol) { if (!silent) addToast("Missing column name", "warning"); break; }
-          setCanvasItems(prev => prev.map(t => {
-            if (t.name.toLowerCase() !== targetTable.toLowerCase()) return t;
-            return { ...t, columns: t.columns.filter(c => c.name.toLowerCase() !== rmCol.toLowerCase()) };
-          }));
-          if (!silent) addToast(`Removed ${rmCol} from ${targetTable}`, "success");
-          break;
-        }
-        case "remove_table": {
-          setCanvasItems(prev => prev.filter(t => t.name.toLowerCase() !== targetTable.toLowerCase()));
-          if (!silent) addToast(`Removed ${targetTable} table`, "success");
-          break;
-        }
-        case "add_constraint": {
-          const chkName = payload.name || `chk_${targetTable}`;
-          const chkExpr = payload.expression || "";
-          if (!chkExpr) { if (!silent) addToast("Missing constraint expression", "warning"); break; }
-          setCanvasItems(prev => prev.map(t => {
-            if (t.name.toLowerCase() !== targetTable.toLowerCase()) return t;
-            return { ...t, checkConstraints: [...(t.checkConstraints || []), { name: chkName, expression: chkExpr }] };
-          }));
-          if (!silent) addToast(`Added constraint ${chkName} on ${targetTable}`, "success");
-          break;
-        }
-        case "add_enum": {
-          const enumName = payload.name || "";
-          const enumValues = payload.values || [];
-          if (!enumName || !enumValues.length) { if (!silent) addToast("Missing enum name or values", "warning"); break; }
-          setSchemaEnums(prev => {
-            if (prev.some(e => e.name.toLowerCase() === enumName.toLowerCase())) return prev;
-            return [...prev, { name: enumName, values: enumValues }];
-          });
-          if (!silent) addToast(`Added enum type ${enumName}`, "success");
-          break;
-        }
-        case "add_function": {
-          const fnName = payload.name || "";
-          const fnBody = payload.body || "";
-          if (!fnBody) { if (!silent) addToast("Missing function body", "warning"); break; }
-          setSchemaFunctions(prev => {
-            if (prev.some(f => f.name.toLowerCase() === fnName.toLowerCase())) return prev;
-            return [...prev, { name: fnName, body: fnBody }];
-          });
-          if (!silent) addToast(`Added function ${fnName}`, "success");
-          break;
-        }
-        default:
-          if (!silent) addToast(`Noted: ${suggestion.reason || suggestion.description || suggestion.type}`, "info");
       }
       setAuditReport(prev => prev ? { ...prev, suggestions: prev.suggestions?.filter(s => s !== suggestion) } : prev);
     } catch { if (!silent) addToast("Failed to apply suggestion", "error"); }
@@ -2401,9 +2451,57 @@ const VibeDBPage = () => {
 
   const handleApplyAllSuggestions = () => {
     if (!auditReport?.suggestions) return;
-    const count = auditReport.suggestions.length;
-    auditReport.suggestions.forEach(s => handleApplySuggestion(s, true));
-    addToast(`Applied all ${count} suggestions`, "success");
+    const suggestions = auditReport.suggestions;
+    const count = suggestions.length;
+
+    // Single atomic update for all table mutations: apply → handshake → compile
+    let compilerFixCount = 0;
+    setCanvasItems(prev => {
+      let tables = prev;
+      for (const s of suggestions) {
+        if (s.type !== "add_enum" && s.type !== "add_function") {
+          tables = applySuggestionToTables(tables, s);
+        }
+      }
+      // Atomic handshake + compile: resolve all FK links, then enforce all compiler invariants
+      const resolved = resolveCanvasFKsBidirectional([], tables);
+      const { tables: compiled, report } = runCompilerPass(resolved);
+      compilerFixCount = report.actions.length;
+      setCompilerReport(report);
+      return compiled;
+    });
+
+    // Apply non-table mutations
+    const enumSuggestions = suggestions.filter(s => s.type === "add_enum");
+    const fnSuggestions = suggestions.filter(s => s.type === "add_function");
+    if (enumSuggestions.length) {
+      setSchemaEnums(prev => {
+        let enums = [...prev];
+        for (const s of enumSuggestions) {
+          const p = s.payload || {};
+          if (p.name && p.values?.length && !enums.some(e => e.name.toLowerCase() === p.name.toLowerCase())) {
+            enums = [...enums, { name: p.name, values: p.values }];
+          }
+        }
+        return enums;
+      });
+    }
+    if (fnSuggestions.length) {
+      setSchemaFunctions(prev => {
+        let fns = [...prev];
+        for (const s of fnSuggestions) {
+          const p = s.payload || {};
+          if (p.body && !fns.some(f => f.name.toLowerCase() === (p.name || "").toLowerCase())) {
+            fns = [...fns, { name: p.name || "", body: p.body }];
+          }
+        }
+        return fns;
+      });
+    }
+
+    setAuditReport(prev => prev ? { ...prev, suggestions: [] } : prev);
+    const compilerMsg = compilerFixCount > 0 ? ` · Compiler: ${compilerFixCount} auto-fix${compilerFixCount !== 1 ? "es" : ""}` : "";
+    addToast(`Applied all ${count} suggestions${compilerMsg}`, "success");
   };
 
   // ─── Batch Edit ───────────────────────────────────────
@@ -2428,129 +2526,151 @@ const VibeDBPage = () => {
       const changes = result?.changes || [];
       if (!changes.length) { setBatchError("No changes returned. Try rephrasing your command."); return; }
 
+      // Collect non-table mutations to apply after the single setCanvasItems call
+      const pendingEnums: { name: string; values: string[] }[] = [];
+      const pendingFunctions: { name: string; body: string }[] = [];
+
+      // Single atomic state update — all table mutations happen against the moving `tables` variable
       let applied = 0;
-      for (const c of changes) {
-        try {
-          const action = c.action;
-          const target = (c.targetTable || "").toLowerCase();
-          switch (action) {
-            case "add_column": {
-              const col = c.column || {};
-              setCanvasItems(prev => prev.map(t => {
-                if (t.name.toLowerCase() !== target) return t;
-                return { ...t, columns: [...t.columns, { id: uuidv4(), name: col.name || "new_col", type: col.type || "varchar", fkStatus: "resolved", constraints: col.constraints || [], isForeignKey: col.isForeignKey || false, linkedTable: col.linkedTable || "", linkedColumn: col.linkedColumn || "" }] };
-              }));
-              applied++;
-              break;
-            }
-            case "remove_column": {
-              const colName = (c.column || "").toLowerCase();
-              setCanvasItems(prev => prev.map(t => {
-                if (t.name.toLowerCase() !== target) return t;
-                return { ...t, columns: t.columns.filter(col => col.name.toLowerCase() !== colName) };
-              }));
-              applied++;
-              break;
-            }
-            case "rename_column": {
-              setCanvasItems(prev => prev.map(t => {
-                if (t.name.toLowerCase() !== target) return t;
-                return { ...t, columns: t.columns.map(col => col.name.toLowerCase() === (c.targetColumn || "").toLowerCase() ? { ...col, name: c.newName } : col) };
-              }));
-              applied++;
-              break;
-            }
-            case "change_type": {
-              setCanvasItems(prev => prev.map(t => {
-                if (t.name.toLowerCase() !== target) return t;
-                return { ...t, columns: t.columns.map(col => col.name.toLowerCase() === (c.targetColumn || "").toLowerCase() ? { ...col, type: c.newType } : col) };
-              }));
-              applied++;
-              break;
-            }
-            case "add_table": {
-              const tbl = c.table || {};
-              const newTable: TableNode = {
-                id: uuidv4(), name: tbl.name || "new_table",
-                x: (-view.x / view.zoom) + 200 + Math.random() * 300, y: (-view.y / view.zoom) + 200 + Math.random() * 300,
-                columns: (tbl.columns || []).map((col: any) => ({ id: uuidv4(), name: col.name, type: col.type || "varchar", fkStatus: "resolved", constraints: col.constraints || [], isForeignKey: col.isForeignKey || false, linkedTable: col.linkedTable || "", linkedColumn: col.linkedColumn || "" })),
-              };
-              setCanvasItems(prev => [...prev, newTable]);
-              applied++;
-              break;
-            }
-            case "remove_table": {
-              setCanvasItems(prev => prev.filter(t => t.name.toLowerCase() !== target));
-              applied++;
-              break;
-            }
-            case "rename_table": {
-              setCanvasItems(prev => prev.map(t => ({
-                ...t,
-                name: t.name.toLowerCase() === target ? c.newName : t.name,
-                columns: t.columns.map(col => col.linkedTable?.toLowerCase() === target ? { ...col, linkedTable: c.newName } : col),
-              })));
-              applied++;
-              break;
-            }
-            case "add_fk": {
-              setCanvasItems(prev => {
-                const refNode = prev.find(t => t.name.toLowerCase() === (c.referencesTable || "").toLowerCase());
-                return prev.map(t => {
+      setCanvasItems((prev: TableNode[]) => {
+        let tables = [...prev];
+
+        for (const c of changes) {
+          try {
+            const action = c.action;
+            const target = (c.targetTable || "").toLowerCase();
+            switch (action) {
+              case "add_column": {
+                const col = c.column || {};
+                const colIsFK = !!col.isForeignKey;
+                tables = tables.map(t => {
+                  if (t.name.toLowerCase() !== target) return t;
+                  return { ...t, columns: [...t.columns, { id: uuidv4(), name: col.name || "new_col", type: col.type || "varchar", fkStatus: colIsFK ? "unresolved" : "resolved", constraints: col.constraints || [], isForeignKey: colIsFK, linkedTable: col.linkedTable || "", linkedColumn: col.linkedColumn || "" }] };
+                });
+                applied++;
+                break;
+              }
+              case "remove_column": {
+                const colName = (c.column || "").toLowerCase();
+                tables = tables.map(t => {
+                  if (t.name.toLowerCase() !== target) return t;
+                  return { ...t, columns: t.columns.filter(col => col.name.toLowerCase() !== colName) };
+                });
+                applied++;
+                break;
+              }
+              case "rename_column": {
+                tables = tables.map(t => {
+                  if (t.name.toLowerCase() !== target) return t;
+                  return { ...t, columns: t.columns.map(col => col.name.toLowerCase() === (c.targetColumn || "").toLowerCase() ? { ...col, name: c.newName } : col) };
+                });
+                applied++;
+                break;
+              }
+              case "change_type": {
+                tables = tables.map(t => {
+                  if (t.name.toLowerCase() !== target) return t;
+                  return { ...t, columns: t.columns.map(col => col.name.toLowerCase() === (c.targetColumn || "").toLowerCase() ? { ...col, type: c.newType } : col) };
+                });
+                applied++;
+                break;
+              }
+              case "add_table": {
+                const tbl = c.table || {};
+                const newTable: TableNode = {
+                  id: uuidv4(), name: tbl.name || "new_table",
+                  x: (-view.x / view.zoom) + 200 + Math.random() * 300, y: (-view.y / view.zoom) + 200 + Math.random() * 300,
+                  columns: (tbl.columns || []).map((col: any) => ({ id: uuidv4(), name: col.name, type: col.type || "varchar", fkStatus: col.isForeignKey ? "unresolved" : "resolved", constraints: col.constraints || [], isForeignKey: !!col.isForeignKey, linkedTable: col.linkedTable || "", linkedColumn: col.linkedColumn || "" })),
+                };
+                tables = [...tables, newTable];
+                applied++;
+                break;
+              }
+              case "remove_table": {
+                tables = tables.filter(t => t.name.toLowerCase() !== target);
+                applied++;
+                break;
+              }
+              case "rename_table": {
+                tables = tables.map(t => ({
+                  ...t,
+                  name: t.name.toLowerCase() === target ? c.newName : t.name,
+                  columns: t.columns.map(col => col.linkedTable?.toLowerCase() === target ? { ...col, linkedTable: c.newName } : col),
+                }));
+                applied++;
+                break;
+              }
+              case "add_fk": {
+                const refNode = tables.find(t => t.name.toLowerCase() === (c.referencesTable || "").toLowerCase());
+                tables = tables.map(t => {
                   if (t.name.toLowerCase() !== target) return t;
                   return { ...t, columns: t.columns.map(col => col.name.toLowerCase() === (c.column || "").toLowerCase() ? { ...col, isForeignKey: true, linkedTable: c.referencesTable, linkedTableId: refNode?.id, linkedColumn: c.referencesColumn || "id", fkStatus: refNode ? "resolved" : "unresolved" } : col) };
                 });
-              });
-              applied++;
-              break;
+                applied++;
+                break;
+              }
+              case "add_index": {
+                const batchIdxCols = c.columns || [];
+                const batchTargetT = tables.find(t => t.name.toLowerCase() === target);
+                if (findDuplicateIndex(batchTargetT?.indexes, batchIdxCols)) break;
+                tables = tables.map(t => {
+                  if (t.name.toLowerCase() !== target) return t;
+                  return { ...t, indexes: [...(t.indexes || []), { name: c.name || `idx_${t.name}_${batchIdxCols.join("_")}`, columns: batchIdxCols, type: "btree", unique: c.unique || false }] };
+                });
+                applied++;
+                break;
+              }
+              case "add_constraint": {
+                const constraintName = c.name || `chk_${target}_${applied}`;
+                const expression = c.expression || "";
+                if (!expression) break;
+                tables = tables.map(t => {
+                  if (t.name.toLowerCase() !== target) return t;
+                  return { ...t, checkConstraints: [...(t.checkConstraints || []), { name: constraintName, expression }] };
+                });
+                applied++;
+                break;
+              }
+              case "add_enum": {
+                const enumName = c.name || "";
+                const enumValues = c.values || [];
+                if (enumName && enumValues.length) { pendingEnums.push({ name: enumName, values: enumValues }); applied++; }
+                break;
+              }
+              case "add_function": {
+                const fnName = c.name || `fn_${applied}`;
+                const fnBody = c.body || "";
+                if (fnBody) { pendingFunctions.push({ name: fnName, body: fnBody }); applied++; }
+                break;
+              }
             }
-            case "add_index": {
-              const batchIdxCols = c.columns || [];
-              const batchTargetT = canvasItems.find(t => t.name.toLowerCase() === target);
-              if (findDuplicateIndex(batchTargetT?.indexes, batchIdxCols)) break;
-              setCanvasItems(prev => prev.map(t => {
-                if (t.name.toLowerCase() !== target) return t;
-                return { ...t, indexes: [...(t.indexes || []), { name: c.name || `idx_${t.name}_${batchIdxCols.join("_")}`, columns: batchIdxCols, type: "btree", unique: c.unique || false }] };
-              }));
-              applied++;
-              break;
-            }
-            case "add_constraint": {
-              const constraintName = c.name || `chk_${target}_${applied}`;
-              const expression = c.expression || "";
-              if (!expression) break;
-              setCanvasItems(prev => prev.map(t => {
-                if (t.name.toLowerCase() !== target) return t;
-                return { ...t, checkConstraints: [...(t.checkConstraints || []), { name: constraintName, expression }] };
-              }));
-              applied++;
-              break;
-            }
-            case "add_enum": {
-              const enumName = c.name || "";
-              const enumValues = c.values || [];
-              if (!enumName || !enumValues.length) break;
-              setSchemaEnums(prev => {
-                if (prev.some(e => e.name.toLowerCase() === enumName.toLowerCase())) return prev;
-                return [...prev, { name: enumName, values: enumValues }];
-              });
-              applied++;
-              break;
-            }
-            case "add_function": {
-              const fnName = c.name || `fn_${applied}`;
-              const fnBody = c.body || "";
-              if (!fnBody) break;
-              setSchemaFunctions(prev => {
-                if (prev.some(f => f.name.toLowerCase() === fnName.toLowerCase())) return prev;
-                return [...prev, { name: fnName, body: fnBody }];
-              });
-              applied++;
-              break;
-            }
+          } catch { /* skip failed individual change */ }
+        }
+
+        // Atomic handshake: resolve all FK links across the entire batch
+        return resolveCanvasFKsBidirectional([], tables);
+      });
+
+      // Apply non-table state mutations
+      if (pendingEnums.length) {
+        setSchemaEnums(prev => {
+          let enums = [...prev];
+          for (const e of pendingEnums) {
+            if (!enums.some(ex => ex.name.toLowerCase() === e.name.toLowerCase())) enums = [...enums, e];
           }
-        } catch { /* skip failed individual change */ }
+          return enums;
+        });
       }
+      if (pendingFunctions.length) {
+        setSchemaFunctions(prev => {
+          let fns = [...prev];
+          for (const f of pendingFunctions) {
+            if (!fns.some(ex => ex.name.toLowerCase() === f.name.toLowerCase())) fns = [...fns, f];
+          }
+          return fns;
+        });
+      }
+
       addToast(`Batch edit: ${applied} change${applied !== 1 ? "s" : ""} applied`, "success");
       setShowBatchModal(false); setBatchPrompt("");
     } catch (e: any) {
@@ -2820,10 +2940,11 @@ const VibeDBPage = () => {
         }
         const pathD = `M ${startX} ${sourceRowY} C ${cp1X} ${sourceRowY}, ${cp2X} ${targetRowY}, ${endX} ${targetRowY}`;
 
+        const justResolved = recentlyResolvedIds.has(col.id);
         return (
           <g key={`${sourceTable.id}-${col.name}-${idx}`}>
             <path d={pathD} fill="none" stroke={stroke} strokeWidth={width + 4} opacity={opacity * 0.15} strokeLinecap="round" />
-            <path d={pathD} fill="none" stroke={stroke} strokeWidth={width} opacity={opacity} strokeLinecap="round" />
+            <path d={pathD} fill="none" stroke={stroke} strokeWidth={width} opacity={opacity} strokeLinecap="round" className={justResolved ? "fk-line-resolved" : ""} />
             <circle cx={startX} cy={sourceRowY} r={width + 1.5} fill={stroke} fillOpacity={opacity} />
             <circle cx={endX} cy={targetRowY} r={width + 1.5} fill={stroke} fillOpacity={opacity} />
             <polygon
@@ -2835,7 +2956,7 @@ const VibeDBPage = () => {
         );
       })
     ).filter(Boolean);
-  }, [canvasItems, hoveredTableId, connectionMode]);
+  }, [canvasItems, hoveredTableId, connectionMode, recentlyResolvedIds]);
 
   const relatedNodeIds = useMemo(() => {
     if (!hoveredTableId) return new Set<string>();
@@ -3051,6 +3172,7 @@ const VibeDBPage = () => {
         <div className="relative">
           <button onClick={handleCompileSQL} className="flex items-center gap-1.5 rounded-lg bg-foreground px-3 py-1.5 text-xs font-semibold text-background transition hover:opacity-90"><Code size={14} /> Export SQL</button>
         </div>
+        <button onClick={handleGenerateRLS} className="flex items-center gap-1.5 rounded-lg bg-secondary px-3 py-1.5 text-xs font-semibold text-secondary-foreground hover:bg-secondary/80 transition"><ShieldCheck size={14} /> RLS</button>
         <div className="relative">
           <button onClick={() => setShowExportMenu(!showExportMenu)} className="flex items-center gap-1.5 rounded-lg bg-secondary px-2 py-1.5 text-xs text-secondary-foreground hover:bg-secondary/80 transition"><Download size={14} /></button>
           {showExportMenu && (
@@ -3218,7 +3340,7 @@ const VibeDBPage = () => {
 
                 {/* Columns */}
                 {table.columns.map((col, idx) => (
-                  <div key={col.id} className={`group flex items-center gap-1 border-t border-border px-3 text-[11px] transition-colors ${connectionMode ? "cursor-crosshair hover:bg-accent/10" : ""} ${connectionMode?.sourceColumnId === col.id ? "bg-primary/10" : ""}`}
+                  <div key={col.id} className={`group flex items-center gap-1 border-t border-border px-3 text-[11px] transition-colors ${connectionMode ? "cursor-crosshair hover:bg-accent/10" : ""} ${connectionMode?.sourceColumnId === col.id ? "bg-primary/10" : ""} ${recentlyResolvedIds.has(col.id) ? "animate-fk-handshake" : ""}`}
                     style={{ height: ROW_HEIGHT }}
                     onClick={() => { if (connectionMode) completeConnection(table.id, col.id); }}
                   >
@@ -3464,6 +3586,16 @@ const VibeDBPage = () => {
         onCopy={handleCopy}
         copied={copied}
         onFixIssues={handleFixSqlIssues}
+      />
+
+      {/* RLS Modal */}
+      <SQLViewerModal
+        open={showRlsModal}
+        onClose={() => setShowRlsModal(false)}
+        sql={generatedRlsSql}
+        tables={canvasItems}
+        onCopy={handleCopy}
+        copied={copied}
       />
 
       {/* Import Modal */}

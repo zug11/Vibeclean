@@ -68,11 +68,12 @@ export interface Toast {
 // ─── Compiler Pipeline Types ─────────────────────────
 
 export interface CompilerAction {
-  pass: string;           // "naming" | "check-constraint" | "fk-index" | "dedup" | "timestamp-default"
+  pass: string;           // "naming" | "check-constraint" | "fk-index" | "dedup" | "timestamp-default" | "semantic-constraint"
   table: string;
   description: string;    // Human-readable: "Renamed Users → users"
   before?: string;
   after?: string;
+  severity?: "fix" | "warning";  // "warning" for non-auto-fixed issues (e.g. dual inventory)
 }
 
 export interface CompilerReport {
@@ -81,5 +82,7 @@ export interface CompilerReport {
   constraintsAdded: number;
   indexesAdded: number;
   namingFixes: number;
+  constraintFixes: number;
+  standardColumnFixes: number;
   durationMs: number;
 }

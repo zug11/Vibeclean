@@ -123,26 +123,38 @@ NEVER use timestamp for: codes, names, identifiers, or any non-date column.
 Constraint types: [{"type":"primary"},{"type":"notNull"},{"type":"unique"},{"type":"default","value":"now()"}]
 
 MANDATORY RULES — violating these makes the schema invalid:
-1. EVERY table MUST have exactly ONE "id" column as its FIRST column: {"name":"id","type":"uuid","constraints":[{"type":"primary"},{"type":"notNull"}]}
+1. EVERY table MUST have exactly ONE "id" column as its FIRST column: {"name":"id","type":"uuid","constraints":[{"type":"primary"},{"type":"notNull"},{"type":"default","value":"gen_random_uuid()"}]}
 2. EVERY table MUST have created_at and updated_at timestamp columns with default now().
 3. NEVER duplicate column names within a table. Each column name must be unique.
 4. NEVER have more than one primary key per table (only the id column).
 5. Foreign key columns must reference a column that EXISTS. Always reference "id" on the target table.
 6. Use snake_case for all table and column names. Pluralize table names (users, orders, products).
 7. Foreign key columns MUST be named: <singular_target_table>_id (e.g. user_id, project_id, category_id).
-8. NOT NULL CONSTRAINT: Add {"type":"notNull"} to EVERY column that is logically required. In a well-designed schema, 80%+ of columns should be NOT NULL. Only nullable: optional descriptions, deleted_at, secondary contact info, metadata fields.
+8. NOT NULL CONSTRAINT: Add {"type":"notNull"} to EVERY column that is logically required. In a well-designed schema, 80%+ of columns should be NOT NULL. MUST be nullable (NO notNull constraint): deleted_at, self-referential FKs (parent_id — root records have no parent), optional association FKs (coupon_id, referral_id — not every row has one), future-event timestamps (shipped_at, delivered_at, paid_at, refunded_at, completed_at — events that haven't happened yet), optional address fields (address_line2), optional descriptions, secondary contact info, metadata fields.
 9. Generate INDEXES for: every FK column, columns commonly used in WHERE/ORDER BY, email/username (unique), composite indexes for multi-column queries, partial indexes with WHERE clauses for filtered queries (e.g. active records only), GIN indexes on JSONB columns.
-10. Generate CHECK CONSTRAINTS for ALL bounded columns: status/role/type enums (IN list), positive amounts (> 0), percentage/rating ranges (BETWEEN 0 AND 100 or BETWEEN 1 AND 5), non-negative counts (>= 0), priority levels. Name format: chk_<table>_<column>.
+10. Generate CHECK CONSTRAINTS for ALL bounded columns: status/role/type enums (IN list), positive amounts (> 0), percentage/rating ranges (BETWEEN 0 AND 100 or BETWEEN 1 AND 5), non-negative counts (>= 0), priority levels, currency codes (IN ('USD','EUR','GBP','JPY','CAD','AUD') or similar). Name format: chk_<table>_<column>.
 11. For junction/mapping tables (many-to-many), add a COMPOSITE UNIQUE index on the two FK columns to prevent duplicate associations.
 12. For tables involving financial records, legal data, or user-generated content, add a "deleted_at" TIMESTAMP column (nullable, default null) for soft deletes.
 13. For columns storing secrets, tokens, or API keys, add companion columns: "expires_at" (timestamp), "last_rotated_at" (timestamp).
-14. For self-referential FK columns (e.g. parent_id referencing same table), add a CHECK constraint: parent_id != id.
+14. For self-referential FK columns (e.g. parent_id referencing same table): make them NULLABLE (root records have no parent) and add a CHECK constraint: parent_id != id.
 15. Prefer timestamptz over plain timestamp for all date/time columns — ensures timezone-aware storage.
 16. Prefer text over varchar when no max-length constraint exists — avoids silent truncation.
 17. Use numeric (not float/real/double) for money and financial amounts — prevents floating-point rounding.
 18. Add a GIN index on every JSONB column for efficient containment/key-exists queries.
 19. For tables with a soft-delete deleted_at column, add a partial index WHERE deleted_at IS NULL on commonly queried columns.
 20. For composite indexes, place high-selectivity columns first, then range/sort columns (e.g. user_id, created_at DESC).
+21. Never duplicate quantity/count/balance columns across parent-child tables (e.g. stock_count on both products AND product_variants). Store the value in ONE place — the most granular table — and derive the parent total via query or trigger.
+
+CRITICAL MISTAKES TO AVOID — your schema is INVALID if any of these occur:
+- id columns WITHOUT {"type":"default","value":"gen_random_uuid()"} → WRONG. Every id MUST have this default.
+- parent_id with {"type":"notNull"} → WRONG. Self-referential FKs MUST be nullable so root records can exist.
+- coupon_id / referral_id / discount_id with {"type":"notNull"} → WRONG. Optional association FKs MUST be nullable.
+- shipped_at / delivered_at / paid_at / refunded_at / completed_at with {"type":"notNull"} → WRONG. Future-event timestamps MUST be nullable — these events haven't happened at creation time.
+- address_line2 with {"type":"notNull"} → WRONG. Optional address fields MUST be nullable.
+- Tables with deleted_at but NO partial index WHERE deleted_at IS NULL → WRONG. Always add partial indexes on soft-delete tables.
+- JSONB columns without a GIN index → WRONG. Every JSONB column needs a GIN index.
+- currency/country columns without a CHECK constraint → WRONG. Constrain to valid ISO codes.
+Before emitting JSON, review every column: can this column realistically be empty at INSERT time? If yes, it MUST be nullable.
 
 Generate as many tables as the idea genuinely requires — don't artificially limit. A simple blog might need 3-5 tables, but a full e-commerce platform or marketplace might need 15-25+. Be thorough and include all tables needed for a production-ready schema.
 Use double quotes for all JSON strings. Emit compact JSON (no pretty-printing, no unnecessary whitespace).`;
