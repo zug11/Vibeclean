@@ -13,6 +13,7 @@ interface QueryBuilderPanelProps {
   canvasItems: TableNode[];
   callAI: (type: string, prompt: string, context?: string) => Promise<string>;
   deployConnected?: boolean;
+  initialSql?: string;
 }
 
 interface QueryHistoryEntry {
@@ -81,9 +82,15 @@ const QueryBuilderPanel: React.FC<QueryBuilderPanelProps> = ({
   canvasItems,
   callAI,
   deployConnected,
+  initialSql,
 }) => {
   // Editor state
   const [query, setQuery] = useState("");
+
+  // Accept initial SQL from external source (e.g. Mock Data modal)
+  useEffect(() => {
+    if (initialSql) setQuery(initialSql);
+  }, [initialSql]);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
 
   // Connection state

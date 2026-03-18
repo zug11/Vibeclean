@@ -11,6 +11,7 @@ interface MockDataModalProps {
   onCopy: (text: string) => void;
   copied: boolean;
   onCancel?: () => void;
+  onLoadInPlayground?: (sql: string) => void;
 }
 
 // Split INSERT statements by table
@@ -82,7 +83,7 @@ function LoadingTimer({ tableCount }: { tableCount: number }) {
   );
 }
 
-export default function MockDataModal({ open, onClose, sql, isGenerating, tableCount, onCopy, copied, onCancel }: MockDataModalProps) {
+export default function MockDataModal({ open, onClose, sql, isGenerating, tableCount, onCopy, copied, onCancel, onLoadInPlayground }: MockDataModalProps) {
   const [searchTerm, setSearchTerm] = useState("");
   const [collapsedTables, setCollapsedTables] = useState<Set<string>>(new Set());
   const [copiedTable, setCopiedTable] = useState<string | null>(null);
@@ -142,11 +143,16 @@ export default function MockDataModal({ open, onClose, sql, isGenerating, tableC
                     Cancel
                   </button>
                 )}
-                {!isGenerating && sql && (
+                {!isGenerating && sql && (<>
                   <button onClick={() => onCopy(sql)} className="flex items-center gap-1.5 rounded-lg bg-secondary px-3 py-1.5 text-xs font-semibold hover:bg-secondary/80 transition">
                     {copied ? <Check size={12} /> : <Copy size={12} />} {copied ? "Copied" : "Copy All"}
                   </button>
-                )}
+                  {onLoadInPlayground && (
+                    <button onClick={() => onLoadInPlayground(sql)} className="flex items-center gap-1.5 rounded-lg bg-accent/20 text-accent px-3 py-1.5 text-xs font-semibold hover:bg-accent/30 transition">
+                      <DatabaseZap size={12} /> Query Lab
+                    </button>
+                  )}
+                </>)}
                 <button onClick={onClose} className="flex h-8 w-8 items-center justify-center rounded-lg hover:bg-secondary transition">
                   <X size={16} />
                 </button>

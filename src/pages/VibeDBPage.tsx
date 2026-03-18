@@ -6,7 +6,7 @@ import {
   Table as TableIcon, Code, Upload, ShieldCheck, Edit3, ChevronDown,
   Settings, GitCompare, Key, Hash, LinkIcon, GripVertical, DatabaseZap,
   Box, Columns, Webhook, FileText, Rocket, Plug, CheckCircle2, AlertCircle,
-  FolderOpen, Save, FilePlus, PanelLeftOpen, PanelLeftClose, MessageCircle, Clock, Activity
+  FolderOpen, Save, FilePlus, PanelLeftOpen, PanelLeftClose, MessageCircle, Clock, Activity, BookOpen
 } from "lucide-react";
 import { Link } from "react-router-dom";
 import { v4 as uuidv4 } from "uuid";
@@ -34,6 +34,7 @@ import {
   generateGraphQLTypes, generateCSV, detectMissingFKTargets,
   diagnoseAndFixSchema, preDeployValidateSchema, type FixResult,
   findDuplicateIndex, deduplicateSchema, buildSchemaFromIntent,
+  generateZodSchema, generateDataDictionary,
 } from "@/components/vibedb/ExportGenerators";
 
 // ─── Types ──────────────────────────────────────────────
@@ -1395,6 +1396,7 @@ const VibeDBPage = () => {
   const [showRlsModal, setShowRlsModal] = useState(false);
   const [generatedRlsSql, setGeneratedRlsSql] = useState("");
   const [showPlayground, setShowPlayground] = useState(false);
+  const [playgroundInitialSql, setPlaygroundInitialSql] = useState("");
   const [queryPrompt, setQueryPrompt] = useState("");
   const [isCallingAI, setIsCallingAI] = useState(false);
   const [generatedQuery, setGeneratedQuery] = useState("");
@@ -1818,6 +1820,8 @@ const VibeDBPage = () => {
         case "drizzle": content = generateDrizzleSchema(compiledAst); filename = "schema.ts"; break;
         case "graphql": content = generateGraphQLTypes(compiledAst); filename = "schema.graphql"; break;
         case "csv": content = generateCSV(compiledAst); filename = "schema.csv"; break;
+        case "zod": content = generateZodSchema(compiledAst); filename = "schema.zod.ts"; break;
+        case "docs": content = generateDataDictionary(compiledAst); filename = "schema-docs.md"; break;
         case "sql": default: content = generateSQL(compiledAst); filename = "schema.sql"; break;
       }
       const blob = new Blob([content], { type: "text/plain" });
@@ -2941,6 +2945,19 @@ const VibeDBPage = () => {
         const pathD = `M ${startX} ${sourceRowY} C ${cp1X} ${sourceRowY}, ${cp2X} ${targetRowY}, ${endX} ${targetRowY}`;
 
         const justResolved = recentlyResolvedIds.has(col.id);
+
+        // Cardinality detection
+        const isUnique = col.constraints?.some(c => c.type === "unique");
+        const fkCols = sourceTable.columns.filter(c => c.isForeignKey && c.linkedTable);
+        const isJunction = fkCols.length === 2 && (sourceTable.indexes || []).some(ix =>
+          ix.unique && ix.columns.length === 2 &&
+          fkCols.every(fk => ix.columns.some(ic => ic.toLowerCase() === fk.name.toLowerCase()))
+        );
+        const srcLabel = isUnique ? "1" : "N";
+        const tgtLabel = isJunction ? "N" : "1";
+        const goesRight = targetCenter > sourceCenter;
+        const labelDx = goesRight ? 16 : -16;
+
         return (
           <g key={`${sourceTable.id}-${col.name}-${idx}`}>
             <path d={pathD} fill="none" stroke={stroke} strokeWidth={width + 4} opacity={opacity * 0.15} strokeLinecap="round" />
@@ -2948,10 +2965,12 @@ const VibeDBPage = () => {
             <circle cx={startX} cy={sourceRowY} r={width + 1.5} fill={stroke} fillOpacity={opacity} />
             <circle cx={endX} cy={targetRowY} r={width + 1.5} fill={stroke} fillOpacity={opacity} />
             <polygon
-              points={`${endX},${targetRowY - 5} ${endX + (targetCenter > sourceCenter ? -10 : 10)},${targetRowY} ${endX},${targetRowY + 5}`}
+              points={`${endX},${targetRowY - 5} ${endX + (goesRight ? -10 : 10)},${targetRowY} ${endX},${targetRowY + 5}`}
               fill={stroke}
               fillOpacity={opacity}
             />
+            <text x={startX + labelDx} y={sourceRowY - 6} fontSize={9} fontFamily="monospace" fill={stroke} fillOpacity={opacity * 0.8} textAnchor="middle">{srcLabel}</text>
+            <text x={endX - labelDx} y={targetRowY - 6} fontSize={9} fontFamily="monospace" fill={stroke} fillOpacity={opacity * 0.8} textAnchor="middle">{tgtLabel}</text>
           </g>
         );
       })
@@ -3182,6 +3201,8 @@ const VibeDBPage = () => {
                 { key: "prisma", icon: <Box size={14} className="text-primary" />, label: "Prisma" },
                 { key: "drizzle", icon: <Columns size={14} className="text-accent" />, label: "Drizzle" },
                 { key: "graphql", icon: <Webhook size={14} className="text-destructive" />, label: "GraphQL" },
+                { key: "zod", icon: <ShieldCheck size={14} className="text-emerald-500" />, label: "Zod" },
+                { key: "docs", icon: <BookOpen size={14} className="text-blue-400" />, label: "Docs" },
                 { key: "csv", icon: <FileText size={14} className="text-primary" />, label: "CSV" },
               ].map(fmt => (
                 <button key={fmt.key} onClick={() => handleExport(fmt.key)} className="w-full text-left px-4 py-2.5 hover:bg-secondary flex items-center gap-3 text-sm font-medium">
@@ -3697,6 +3718,11 @@ const VibeDBPage = () => {
         onCopy={handleCopy}
         copied={copied}
         onCancel={handleCancelMockData}
+        onLoadInPlayground={(sql) => {
+          setPlaygroundInitialSql(sql);
+          setShowMockDataModal(false);
+          setShowQueryBuilder(true);
+        }}
       />
 
       {/* Deploy Modal */}
@@ -3942,10 +3968,11 @@ $$ LANGUAGE plpgsql SECURITY DEFINER;`}</pre>
       {/* Query Builder Panel */}
       <QueryBuilderPanel
         open={showQueryBuilder}
-        onClose={() => setShowQueryBuilder(false)}
+        onClose={() => { setShowQueryBuilder(false); setPlaygroundInitialSql(""); }}
         canvasItems={canvasItems}
         callAI={callAI}
         deployConnected={deployConnected}
+        initialSql={playgroundInitialSql}
       />
 
       {/* Supabase Panel */}
@@ -3985,6 +4012,7 @@ $$ LANGUAGE plpgsql SECURITY DEFINER;`}</pre>
         projectId={currentProjectId}
         onAddEnum={(e) => setSchemaEnums(prev => prev.some(x => x.name === e.name) ? prev : [...prev, e])}
         onAddFunction={(f) => setSchemaFunctions(prev => prev.some(x => x.name === f.name) ? prev : [...prev, f])}
+        onApplySuggestion={handleApplySuggestion}
       />
 
       {/* Toasts */}

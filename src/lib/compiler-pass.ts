@@ -720,7 +720,38 @@ function fixSemanticConstraints(tables: TableNode[]): { tables: TableNode[]; act
     }
   }
 
-  return { tables: fixed, actions };
+  // ── Rule 7: Auto-assign ON DELETE cascade behavior ──
+  const withCascade = fixed.map(t => {
+    const fkCols = t.columns.filter(c => c.isForeignKey && c.linkedTable);
+    const hasSoftDelete = t.columns.some(c => c.name.toLowerCase() === "deleted_at");
+
+    // Junction table detection: exactly 2 FK cols + a composite unique index covering both
+    const isJunction = fkCols.length === 2 && (t.indexes || []).some(idx =>
+      idx.unique && idx.columns.length === 2 &&
+      fkCols.every(fk => idx.columns.some(ic => ic.toLowerCase() === fk.name.toLowerCase()))
+    );
+
+    const fixedCols = t.columns.map(col => {
+      if (!col.isForeignKey || !col.linkedTable || col.onDelete) return col;
+      let onDelete: "CASCADE" | "SET NULL" | "RESTRICT";
+      if (isJunction) {
+        onDelete = "CASCADE";
+      } else if (hasSoftDelete) {
+        onDelete = "SET NULL";
+      } else {
+        onDelete = "RESTRICT";
+      }
+      actions.push({
+        pass: "semantic-constraint",
+        table: t.name,
+        description: `Set ${col.name} ON DELETE ${onDelete}${isJunction ? " (junction table)" : hasSoftDelete ? " (soft-delete table)" : ""}`,
+      });
+      return { ...col, onDelete };
+    });
+    return { ...t, columns: fixedCols };
+  });
+
+  return { tables: withCascade, actions };
 }
 
 // ─── Pass 7: Ensure Standard Columns (id, created_at, updated_at) ───

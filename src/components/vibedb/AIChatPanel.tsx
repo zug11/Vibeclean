@@ -2,7 +2,6 @@ import React, { useState, useRef, useEffect, useCallback } from "react";
 import { AnimatePresence, motion } from "framer-motion";
 import { MessageCircle, Send, X, Loader2, CheckCircle2, Sparkles, ChevronRight, AlertCircle } from "lucide-react";
 import { v4 as uuidv4 } from "uuid";
-import { findDuplicateIndex } from "@/components/vibedb/ExportGenerators";
 
 // ─── Types ───────────────────────────────────────────────
 
@@ -36,6 +35,7 @@ interface AIChatPanelProps {
   projectId?: string | null;
   onAddEnum?: (e: { name: string; values: string[] }) => void;
   onAddFunction?: (f: { name: string; body: string }) => void;
+  onApplySuggestion?: (suggestion: any, silent?: boolean) => void;
 }
 
 // ─── Utilities ───────────────────────────────────────────
@@ -133,6 +133,7 @@ const AIChatPanel: React.FC<AIChatPanelProps> = ({
   projectId,
   onAddEnum,
   onAddFunction,
+  onApplySuggestion,
 }) => {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [inputValue, setInputValue] = useState("");
@@ -299,172 +300,37 @@ const AIChatPanel: React.FC<AIChatPanelProps> = ({
     }
   };
 
-  // Apply suggestion (silent=true skips individual toast, used by Apply All)
+  // Map chat suggestion format → parent's audit suggestion format, then delegate.
+  // This routes all table mutations through the compiler pipeline (naming, CHECK, FK resolution).
   const handleApplySuggestion = (suggestion: ChatSuggestion, silent = false) => {
     const p = suggestion.payload;
     try {
-      switch (p.action) {
-        case "add_table": {
-          const newTable: TableNode = {
-            id: uuidv4(),
-            name: p.table.name,
-            x: (-view.x / view.zoom) + 200 + Math.random() * 200,
-            y: (-view.y / view.zoom) + 200 + Math.random() * 200,
-            columns: (p.table.columns || []).map((c: any) => ({
-              id: uuidv4(),
-              name: c.name,
-              type: c.type || "varchar",
-              isForeignKey: c.isForeignKey || false,
-              linkedTable: c.linkedTable || "",
-              linkedColumn: c.linkedColumn || "",
-              fkStatus: "resolved",
-              constraints: c.constraints || [],
-            })),
-          };
-          setCanvasItems((prev: TableNode[]) => [...prev, newTable]);
-          break;
-        }
-        case "add_column": {
-          const col = p.column;
-          setCanvasItems((prev: TableNode[]) => prev.map(t => {
-            if (t.name.toLowerCase() !== p.targetTable.toLowerCase()) return t;
-            return {
-              ...t,
-              columns: [...t.columns, {
-                id: uuidv4(),
-                name: col.name,
-                type: col.type || "varchar",
-                isForeignKey: col.isForeignKey || false,
-                linkedTable: col.linkedTable || "",
-                linkedColumn: col.linkedColumn || "",
-                fkStatus: "resolved",
-                constraints: col.constraints || [],
-              }],
-            };
-          }));
-          break;
-        }
-        case "rename_table": {
-          setCanvasItems((prev: TableNode[]) => prev.map(t => ({
-            ...t,
-            name: t.name.toLowerCase() === p.targetTable.toLowerCase() ? p.newName : t.name,
-            columns: t.columns.map(c =>
-              c.linkedTable?.toLowerCase() === p.targetTable.toLowerCase()
-                ? { ...c, linkedTable: p.newName }
-                : c
-            ),
-          })));
-          break;
-        }
-        case "rename_column": {
-          setCanvasItems((prev: TableNode[]) => prev.map(t => {
-            if (t.name.toLowerCase() !== p.targetTable.toLowerCase()) return t;
-            return {
-              ...t,
-              columns: t.columns.map(c =>
-                c.name.toLowerCase() === p.targetColumn.toLowerCase()
-                  ? { ...c, name: p.newName }
-                  : c
-              ),
-            };
-          }));
-          break;
-        }
-        case "change_type": {
-          setCanvasItems((prev: TableNode[]) => prev.map(t => {
-            if (t.name.toLowerCase() !== p.targetTable.toLowerCase()) return t;
-            return {
-              ...t,
-              columns: t.columns.map(c =>
-                c.name.toLowerCase() === p.targetColumn.toLowerCase()
-                  ? { ...c, type: p.newType }
-                  : c
-              ),
-            };
-          }));
-          break;
-        }
-        case "add_fk": {
-          setCanvasItems((prev: TableNode[]) => {
-            const refTable = prev.find(t => t.name.toLowerCase() === p.referencesTable.toLowerCase());
-            return prev.map(t => {
-              if (t.name.toLowerCase() !== p.targetTable.toLowerCase()) return t;
-              return {
-                ...t,
-                columns: t.columns.map(c =>
-                  c.name.toLowerCase() === p.column.toLowerCase()
-                    ? {
-                        ...c,
-                        isForeignKey: true,
-                        linkedTable: p.referencesTable,
-                        linkedTableId: refTable?.id,
-                        linkedColumn: p.referencesColumn || "id",
-                        fkStatus: refTable ? "resolved" : "unresolved",
-                      }
-                    : c
-                ),
-              };
-            });
-          });
-          break;
-        }
-        case "remove_column": {
-          setCanvasItems((prev: TableNode[]) => prev.map(t => {
-            if (t.name.toLowerCase() !== p.targetTable.toLowerCase()) return t;
-            return {
-              ...t,
-              columns: t.columns.filter(c => c.name.toLowerCase() !== p.column.toLowerCase()),
-            };
-          }));
-          break;
-        }
-        case "remove_table": {
-          setCanvasItems((prev: TableNode[]) => prev.filter(t => t.name.toLowerCase() !== p.targetTable.toLowerCase()));
-          break;
-        }
-        case "add_index": {
-          const chatTargetT = canvasItems.find(t => t.name.toLowerCase() === p.targetTable.toLowerCase());
-          if (findDuplicateIndex(chatTargetT?.indexes, p.columns)) break;
-          setCanvasItems((prev: TableNode[]) => prev.map(t => {
-            if (t.name.toLowerCase() !== p.targetTable.toLowerCase()) return t;
-            const newIdx = {
-              name: p.name || `idx_${t.name}_${p.columns.join("_")}`,
-              columns: p.columns,
-              type: "btree",
-              unique: p.unique || false,
-            };
-            return { ...t, indexes: [...(t.indexes || []), newIdx] };
-          }));
-          break;
-        }
-        case "add_constraint": {
-          const chkName = p.name || `chk_${p.targetTable}`;
-          const chkExpr = p.expression || "";
-          if (!chkExpr) break;
-          setCanvasItems((prev: TableNode[]) => prev.map(t => {
-            if (t.name.toLowerCase() !== p.targetTable.toLowerCase()) return t;
-            return { ...t, checkConstraints: [...(t.checkConstraints || []), { name: chkName, expression: chkExpr }] };
-          }));
-          break;
-        }
-        case "add_enum": {
-          if (onAddEnum && p.name && p.values?.length) {
-            onAddEnum({ name: p.name, values: p.values });
-          }
-          break;
-        }
-        case "add_function": {
-          if (onAddFunction && p.body) {
-            onAddFunction({ name: p.name || "", body: p.body });
-          }
-          break;
-        }
-        default:
-          if (!silent) addToast(`Unknown action: ${p.action}`, "warning");
-          return;
+      // Non-table mutations: handle locally (enums/functions don't go through compiler)
+      if (p.action === "add_enum") {
+        if (onAddEnum && p.name && p.values?.length) onAddEnum({ name: p.name, values: p.values });
+      } else if (p.action === "add_function") {
+        if (onAddFunction && p.body) onAddFunction({ name: p.name || "", body: p.body });
+      } else if (onApplySuggestion) {
+        // Delegate table mutations to parent (compiler-aware pipeline)
+        const mapped = {
+          type: p.action,
+          target_table: p.targetTable,
+          targetTable: p.targetTable,
+          payload: {
+            ...p,
+            name: p.table?.name || p.column?.name || p.newName || p.name,
+            columns: p.table?.columns || (p.column ? [p.column] : p.columns),
+          },
+          reason: suggestion.description,
+          description: suggestion.description,
+        };
+        onApplySuggestion(mapped, silent);
+      } else {
+        if (!silent) addToast(`Cannot apply: no handler connected`, "warning");
+        return;
       }
 
-      // Mark as applied
+      // Mark as applied in local chat state
       setMessages(prev =>
         prev.map(msg => ({
           ...msg,
@@ -473,7 +339,6 @@ const AIChatPanel: React.FC<AIChatPanelProps> = ({
           ),
         }))
       );
-      if (!silent) addToast(`Applied: ${suggestion.description}`, "success");
     } catch (e: any) {
       if (!silent) addToast(`Failed to apply: ${e.message}`, "error");
     }
@@ -487,11 +352,9 @@ const AIChatPanel: React.FC<AIChatPanelProps> = ({
     let appliedCount = 0;
     for (const s of unapplied) {
       try {
-        handleApplySuggestion(s, true); // silent — no individual toasts
+        handleApplySuggestion(s, true);
         appliedCount++;
-      } catch {
-        // continue applying the rest
-      }
+      } catch { /* continue */ }
     }
     addToast(`Applied all ${appliedCount} changes`, "success");
   };

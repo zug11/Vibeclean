@@ -209,6 +209,7 @@ function createTableDDL(table: TableNode): string {
     }
     if (col.isForeignKey && col.linkedTable) {
       line += ` REFERENCES ${col.linkedTable}(${col.linkedColumn || "id"})`;
+      if (col.onDelete) line += ` ON DELETE ${col.onDelete}`;
     }
     lines.push(line);
   }
@@ -267,6 +268,7 @@ export function generateMigrationSQL(diff: SchemaDiff): string {
         line += columnConstraintsSQL(col);
         if (col.isForeignKey && col.linkedTable) {
           line += ` REFERENCES ${col.linkedTable}(${col.linkedColumn || "id"})`;
+          if (col.onDelete) line += ` ON DELETE ${col.onDelete}`;
         }
         line += ";";
         statements.push(line);

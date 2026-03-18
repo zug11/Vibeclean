@@ -9,6 +9,7 @@ export interface Column {
   linkedTableId?: string;
   linkedColumn?: string;
   fkStatus?: string;
+  onDelete?: "CASCADE" | "SET NULL" | "RESTRICT" | "NO ACTION";
   constraints?: { type: string; value?: string }[];
   description?: string;
 }
