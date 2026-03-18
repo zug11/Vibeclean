@@ -1165,7 +1165,9 @@ function CompilerReportUI({ report }: { report: CompilerReport }) {
 
   const passLabels: Record<string, string> = {
     "naming": "Naming fixes",
+    "domain-detection": "Domain detected",
     "check-constraint": "CHECK constraints added",
+    "domain-type-upgrade": "Domain type upgrades",
     "fk-index": "FK indexes added",
     "dedup": "Duplicates removed",
     "timestamp-default": "Timestamp defaults added",
@@ -1182,6 +1184,9 @@ function CompilerReportUI({ report }: { report: CompilerReport }) {
         <ChevronDown size={10} className={`transition-transform ${expanded ? "" : "-rotate-90"}`} />
         <Zap size={11} className="text-amber-500" />
         <span className="font-medium">Compiler: {report.actions.length} fix{report.actions.length !== 1 ? "es" : ""} applied</span>
+        {report.detectedDomains?.map(d => (
+          <span key={d.domain} className="px-1.5 py-0.5 rounded text-[9px] bg-purple-500/20 text-purple-400 font-medium">{d.domain.replace(/-/g, " ")}</span>
+        ))}
         <span className="ml-auto text-[10px] text-muted-foreground/50">{report.durationMs}ms</span>
       </button>
       {expanded && (

@@ -86,4 +86,62 @@ export interface CompilerReport {
   constraintFixes: number;
   standardColumnFixes: number;
   durationMs: number;
+  detectedDomains?: DomainDetectionResult[];
+  typeUpgrades?: number;
+  companionTableSuggestions?: CompanionTableSuggestion[];
+  domainTriggers?: DomainTrigger[];
+  domainRLSPolicies?: DomainRLSPolicy[];
+}
+
+// ─── Domain Module Types ──────────────────────────────
+
+export type DomainId = "quant-finance" | "pe-vc" | "healthcare" | "none";
+
+export interface DomainDetectionResult {
+  domain: DomainId;
+  confidence: number;
+  matchedSignals: string[];
+}
+
+export interface TypeUpgrade {
+  tableName: string;
+  columnName: string;
+  fromType: string;
+  toType: string;
+  reason: string;
+}
+
+export interface CompanionTableSuggestion {
+  name: string;
+  columns: { name: string; type: string; constraints?: { type: string; value?: string }[] }[];
+  reason: string;
+}
+
+export interface DomainTrigger {
+  functionName: string;
+  triggerName: string;
+  tableName: string;
+  body: string;
+  description: string;
+}
+
+export interface DomainRLSPolicy {
+  tableName: string;
+  policyName: string;
+  sql: string;
+  description: string;
+}
+
+// DomainModule interface — CheckRule/CrossColumnCheckRule are imported from compiler-pass.ts
+// at the call site, not here (avoids circular dependency)
+export interface DomainModule {
+  id: DomainId;
+  label: string;
+  detect: (tables: TableNode[]) => DomainDetectionResult;
+  checkRules: { pattern: (name: string, type: string) => boolean; expression: (colName: string) => string; label: string; category: "enum" | "range" | "format" | "length" }[];
+  crossColumnCheckRules: { detect: (columns: { name: string; type: string }[]) => { col1: string; col2: string } | null; expression: (col1: string, col2: string) => string; constraintName: (tableName: string, col1: string, col2: string) => string; label: string }[];
+  typeUpgrades: (tables: TableNode[]) => TypeUpgrade[];
+  triggers: (tables: TableNode[]) => DomainTrigger[];
+  companionTables: (tables: TableNode[]) => CompanionTableSuggestion[];
+  rlsPolicies: (tables: TableNode[]) => DomainRLSPolicy[];
 }

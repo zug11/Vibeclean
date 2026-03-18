@@ -3,8 +3,9 @@
 // Runs after AI generation + sanitization + FK resolution.
 // Each pass is pure: (tables) → (tables, actions)
 
-import type { TableNode, CompilerAction, CompilerReport } from "@/lib/types";
+import type { TableNode, CompilerAction, CompilerReport, TypeUpgrade } from "@/lib/types";
 import { deduplicateSchema } from "@/components/vibedb/ExportGenerators";
+import { detectDomains, getDomainModule } from "@/lib/domains";
 
 // ─── Naming Helpers ──────────────────────────────────
 
@@ -96,7 +97,7 @@ function enforceSnakeCaseNaming(tables: TableNode[]): { tables: TableNode[]; act
 
 // ─── Pass 2: Inject CHECK Constraints ────────────────
 
-interface CheckRule {
+export interface CheckRule {
   pattern: (name: string, type: string) => boolean;
   expression: (colName: string) => string;
   label: string;
@@ -332,7 +333,7 @@ const CHECK_RULES: CheckRule[] = [
 
 // ─── Cross-Column CHECK Constraints ──────────────────
 
-interface CrossColumnCheckRule {
+export interface CrossColumnCheckRule {
   detect: (columns: { name: string; type: string }[]) => { col1: string; col2: string } | null;
   expression: (col1: string, col2: string) => string;
   constraintName: (tableName: string, col1: string, col2: string) => string;
@@ -405,7 +406,7 @@ const CROSS_COLUMN_CHECK_RULES: CrossColumnCheckRule[] = [
   },
 ];
 
-function injectCheckConstraints(tables: TableNode[]): { tables: TableNode[]; actions: CompilerAction[] } {
+function injectCheckConstraints(tables: TableNode[], rules: CheckRule[] = CHECK_RULES, crossRules: CrossColumnCheckRule[] = CROSS_COLUMN_CHECK_RULES): { tables: TableNode[]; actions: CompilerAction[] } {
   const actions: CompilerAction[] = [];
 
   const fixed = tables.map(t => {
@@ -424,7 +425,7 @@ function injectCheckConstraints(tables: TableNode[]): { tables: TableNode[]; act
 
       const appliedCategories = new Set<string>();
 
-      for (const rule of CHECK_RULES) {
+      for (const rule of rules) {
         // Allow one constraint per category per column (enum + length = OK, two enums = skip)
         if (appliedCategories.has(rule.category)) continue;
 
@@ -445,7 +446,7 @@ function injectCheckConstraints(tables: TableNode[]): { tables: TableNode[]; act
 
     // ── Cross-column CHECK rules ──
     const colSpecs = t.columns.map(c => ({ name: c.name, type: (c.type || "").toLowerCase() }));
-    for (const rule of CROSS_COLUMN_CHECK_RULES) {
+    for (const rule of crossRules) {
       const match = rule.detect(colSpecs);
       if (!match) continue;
 
@@ -873,6 +874,40 @@ function ensureStandardColumns(tables: TableNode[]): { tables: TableNode[]; acti
 
 // ─── Main Compiler Pipeline ──────────────────────────
 
+// ─── Domain Type Upgrades ─────────────────────────────
+
+function applyTypeUpgrades(tables: TableNode[], upgrades: TypeUpgrade[]): { tables: TableNode[]; actions: CompilerAction[] } {
+  const actions: CompilerAction[] = [];
+  if (upgrades.length === 0) return { tables, actions };
+
+  const upgradeMap = new Map<string, Map<string, TypeUpgrade>>();
+  for (const u of upgrades) {
+    if (!upgradeMap.has(u.tableName)) upgradeMap.set(u.tableName, new Map());
+    upgradeMap.get(u.tableName)!.set(u.columnName.toLowerCase(), u);
+  }
+
+  const fixed = tables.map(t => {
+    const tableUpgrades = upgradeMap.get(t.name);
+    if (!tableUpgrades) return t;
+    const fixedColumns = t.columns.map(col => {
+      const upgrade = tableUpgrades.get(col.name.toLowerCase());
+      if (!upgrade) return col;
+      if (col.type.toLowerCase() === upgrade.toType.toLowerCase()) return col;
+      actions.push({
+        pass: "domain-type-upgrade",
+        table: t.name,
+        description: `Upgraded ${t.name}.${col.name}: ${col.type} → ${upgrade.toType} (${upgrade.reason})`,
+        before: col.type,
+        after: upgrade.toType,
+      });
+      return { ...col, type: upgrade.toType };
+    });
+    return { ...t, columns: fixedColumns };
+  });
+
+  return { tables: fixed, actions };
+}
+
 /**
  * CONVENTION: Every code path that produces output from canvasItems
  * (deploy, export, audit AI context, generate RLS/types, apply suggestions)
@@ -892,10 +927,40 @@ export function runCompilerPass(tables: TableNode[]): { tables: TableNode[]; rep
   current = naming.tables;
   allActions.push(...naming.actions);
 
-  // Pass 2: CHECK constraints
-  const checks = injectCheckConstraints(current);
+  // Domain detection (after naming normalization, before CHECK injection)
+  const detected = detectDomains(current);
+  const activeMods = detected.map(d => getDomainModule(d.domain)).filter((m): m is NonNullable<typeof m> => !!m);
+
+  for (const d of detected) {
+    const mod = getDomainModule(d.domain);
+    allActions.push({
+      pass: "domain-detection",
+      table: "(global)",
+      description: `Detected domain: ${mod?.label || d.domain} (${(d.confidence * 100).toFixed(0)}% confidence, ${d.matchedSignals.length} signals)`,
+    });
+  }
+
+  // Pass 2: CHECK constraints (merge base + domain rules)
+  const mergedCheckRules = activeMods.length > 0
+    ? [...CHECK_RULES, ...activeMods.flatMap(m => m.checkRules)]
+    : CHECK_RULES;
+  const mergedCrossRules = activeMods.length > 0
+    ? [...CROSS_COLUMN_CHECK_RULES, ...activeMods.flatMap(m => m.crossColumnCheckRules)]
+    : CROSS_COLUMN_CHECK_RULES;
+
+  const checks = injectCheckConstraints(current, mergedCheckRules, mergedCrossRules);
   current = checks.tables;
   allActions.push(...checks.actions);
+
+  // Pass 2b: Domain type upgrades (only if domains detected)
+  let typeUpgradeCount = 0;
+  if (activeMods.length > 0) {
+    const upgrades = activeMods.flatMap(m => m.typeUpgrades(current));
+    const typeResult = applyTypeUpgrades(current, upgrades);
+    current = typeResult.tables;
+    allActions.push(...typeResult.actions);
+    typeUpgradeCount = typeResult.actions.length;
+  }
 
   // Pass 3: FK indexes
   const fkIndexes = injectMissingFKIndexes(current);
@@ -922,6 +987,11 @@ export function runCompilerPass(tables: TableNode[]): { tables: TableNode[]; rep
   current = stdCols.tables;
   allActions.push(...stdCols.actions);
 
+  // Gather domain artifacts for the report (computed but NOT applied to tables)
+  const companionTableSuggestions = activeMods.flatMap(m => m.companionTables(current));
+  const domainTriggers = activeMods.flatMap(m => m.triggers(current));
+  const domainRLSPolicies = activeMods.flatMap(m => m.rlsPolicies(current));
+
   const durationMs = Math.round(performance.now() - startTime);
 
   const report: CompilerReport = {
@@ -933,6 +1003,12 @@ export function runCompilerPass(tables: TableNode[]): { tables: TableNode[]; rep
     constraintFixes: semantic.actions.length,
     standardColumnFixes: stdCols.actions.length,
     durationMs,
+    // Domain fields (undefined when no domain detected — backward-compatible)
+    detectedDomains: detected.length > 0 ? detected : undefined,
+    typeUpgrades: typeUpgradeCount > 0 ? typeUpgradeCount : undefined,
+    companionTableSuggestions: companionTableSuggestions.length > 0 ? companionTableSuggestions : undefined,
+    domainTriggers: domainTriggers.length > 0 ? domainTriggers : undefined,
+    domainRLSPolicies: domainRLSPolicies.length > 0 ? domainRLSPolicies : undefined,
   };
 
   return { tables: current, report };

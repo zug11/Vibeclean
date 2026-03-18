@@ -1,6 +1,6 @@
 // ─── Export Generators for VibeDB ────────────────────────
 
-import type { Column, TableNode, SchemaEnum, SchemaFunction } from "@/lib/types";
+import type { Column, TableNode, SchemaEnum, SchemaFunction, DomainTrigger } from "@/lib/types";
 export type { SchemaEnum, SchemaFunction };
 
 // ─── Sanitize a single table's columns before SQL generation ─────────
@@ -811,13 +811,13 @@ export function detectPolymorphicRelationships(tables: TableNode[]): Polymorphic
 // ─── SQL Generation ─────────────────────────────────────────────────
 
 // Generate SQL with all FK constraints inline (original mode)
-export function generateSQL(tables: TableNode[], enums?: SchemaEnum[], functions?: SchemaFunction[]): string {
-  return generateSQLInternal(tables, false, enums, functions);
+export function generateSQL(tables: TableNode[], enums?: SchemaEnum[], functions?: SchemaFunction[], domainTriggers?: DomainTrigger[]): string {
+  return generateSQLInternal(tables, false, enums, functions, domainTriggers);
 }
 
 // Generate SQL with deferred FK constraints (ALTER TABLE at the end)
-export function generateSQLDeferred(tables: TableNode[], enums?: SchemaEnum[], functions?: SchemaFunction[]): string {
-  return generateSQLInternal(tables, true, enums, functions);
+export function generateSQLDeferred(tables: TableNode[], enums?: SchemaEnum[], functions?: SchemaFunction[], domainTriggers?: DomainTrigger[]): string {
+  return generateSQLInternal(tables, true, enums, functions, domainTriggers);
 }
 
 // Find the PK column name for a given table — returns "id" as fallback
@@ -844,7 +844,7 @@ function deduplicateInListExpression(expression: string): string {
   });
 }
 
-function generateSQLInternal(tables: TableNode[], deferFKs: boolean, enums?: SchemaEnum[], functions?: SchemaFunction[]): string {
+function generateSQLInternal(tables: TableNode[], deferFKs: boolean, enums?: SchemaEnum[], functions?: SchemaFunction[], domainTriggers?: DomainTrigger[]): string {
   // Topological sort: create parent tables before child tables
   const sorted = topologicalSort(tables);
   const tableNames = new Set(tables.map(t => t.name.toLowerCase()));
@@ -1015,6 +1015,15 @@ function generateSQLInternal(tables: TableNode[], deferFKs: boolean, enums?: Sch
     sql += "-- Functions & Triggers\n";
     for (const fn of functions) {
       sql += fn.body + "\n\n";
+    }
+  }
+
+  // Domain-Specific Triggers (auto-detected)
+  if (domainTriggers && domainTriggers.length > 0) {
+    sql += "-- Domain-Specific Triggers\n";
+    for (const dt of domainTriggers) {
+      sql += `-- ${dt.description}\n`;
+      sql += dt.body + "\n\n";
     }
   }
 
