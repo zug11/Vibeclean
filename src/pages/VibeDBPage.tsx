@@ -3042,9 +3042,8 @@ const VibeDBPage = () => {
               onChange={e => setPrompt(e.target.value)}
               onKeyDown={e => e.key === "Enter" && handleGenerate()}
               placeholder="Describe your database... e.g. 'E-commerce with users, products, orders'"
-              className="w-full rounded-xl border border-border bg-card px-4 py-2.5 pr-10 text-sm outline-none transition focus:border-primary focus:ring-1 focus:ring-primary"
+              className="w-full rounded-xl border border-border bg-card px-4 py-2.5 text-sm outline-none transition focus:border-primary focus:ring-1 focus:ring-primary"
             />
-            <Search size={16} className="absolute right-3 top-1/2 -translate-y-1/2 text-muted-foreground" />
           </div>
           <button onClick={handleGenerate} disabled={isGenerating || !prompt.trim()} className="flex items-center gap-2 rounded-xl bg-accent px-4 py-2.5 text-sm font-semibold text-accent-foreground transition hover:opacity-90 disabled:opacity-50">
             {isGenerating ? <Loader2 size={16} className="animate-spin" /> : <Sparkles size={16} />}
