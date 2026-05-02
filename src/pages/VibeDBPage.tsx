@@ -1388,7 +1388,14 @@ const VibeDBPage = () => {
   }, [currentProjectId]);
 
   // Feature states
-  const [expertMode, setExpertMode] = useState(false);
+  const [expertMode, setExpertMode] = useState<boolean>(() => {
+    if (typeof window === "undefined") return false;
+    return window.localStorage.getItem("vibeclean_expert_mode") === "true";
+  });
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    window.localStorage.setItem("vibeclean_expert_mode", String(expertMode));
+  }, [expertMode]);
   const [editingTable, setEditingTable] = useState<string | null>(null);
   const [editingTableName, setEditingTableName] = useState("");
   const [editingColumn, setEditingColumn] = useState<{ tableId: string; columnId: string } | null>(null);
@@ -3163,60 +3170,73 @@ const VibeDBPage = () => {
           )}
         </div>
 
-        <button onClick={handleAutoLayout} className="flex items-center gap-1.5 rounded-lg bg-secondary px-3 py-1.5 text-xs font-semibold text-secondary-foreground hover:bg-secondary/80 transition"><LayoutTemplate size={14} /> Auto Layout</button>
-        <button onClick={handleSmartInference} className="flex items-center gap-1.5 rounded-lg bg-secondary px-3 py-1.5 text-xs font-semibold text-secondary-foreground hover:bg-secondary/80 transition"><Wand2 size={14} /> Magic Link</button>
         <button onClick={() => setShowImportModal(true)} className="flex items-center gap-1.5 rounded-lg bg-secondary px-3 py-1.5 text-xs font-semibold text-secondary-foreground hover:bg-secondary/80 transition"><Upload size={14} /> Import</button>
-        <button onClick={() => setShowBatchModal(true)} className="flex items-center gap-1.5 rounded-lg bg-secondary px-3 py-1.5 text-xs font-semibold text-secondary-foreground hover:bg-secondary/80 transition"><Edit3 size={14} /> Batch Edit</button>
-        <button onClick={handleAudit} className="flex items-center gap-1.5 rounded-lg bg-secondary px-3 py-1.5 text-xs font-semibold text-secondary-foreground hover:bg-secondary/80 transition">
-          {isAuditing ? <Loader2 size={14} className="animate-spin" /> : <ShieldCheck size={14} />} Audit
-        </button>
-        <button onClick={handleDeduplicate} className="flex items-center gap-1.5 rounded-lg bg-secondary px-3 py-1.5 text-xs font-semibold text-secondary-foreground hover:bg-secondary/80 transition">
-          <RefreshCw size={14} /> Dedup
-        </button>
-        <button onClick={handleGenerateMockData} className="flex items-center gap-1.5 rounded-lg bg-secondary px-3 py-1.5 text-xs font-semibold text-secondary-foreground hover:bg-secondary/80 transition"><DatabaseZap size={14} /> Seed Data</button>
 
-        {/* Diff */}
-        <button onClick={saveSnapshot} className="flex items-center gap-1.5 rounded-lg bg-secondary px-3 py-1.5 text-xs font-semibold text-secondary-foreground hover:bg-secondary/80 transition"><GitCompare size={14} /> Snapshot</button>
-        {diffBase && <button onClick={() => setShowDiff(!showDiff)} className="flex items-center gap-1.5 rounded-lg bg-primary/10 px-3 py-1.5 text-xs font-semibold text-primary hover:bg-primary/20 transition"><Eye size={14} /> Diff</button>}
-        {diffBase && <button onClick={() => setShowSchemaCompare(true)} className="flex items-center gap-1.5 rounded-lg bg-primary/10 px-3 py-1.5 text-xs font-semibold text-primary hover:bg-primary/20 transition"><GitCompare size={14} /> Compare</button>}
+        {expertMode && (
+          <>
+            <button onClick={handleAutoLayout} className="flex items-center gap-1.5 rounded-lg bg-secondary px-3 py-1.5 text-xs font-semibold text-secondary-foreground hover:bg-secondary/80 transition"><LayoutTemplate size={14} /> Auto Layout</button>
+            <button onClick={handleSmartInference} className="flex items-center gap-1.5 rounded-lg bg-secondary px-3 py-1.5 text-xs font-semibold text-secondary-foreground hover:bg-secondary/80 transition"><Wand2 size={14} /> Magic Link</button>
+            <button onClick={() => setShowBatchModal(true)} className="flex items-center gap-1.5 rounded-lg bg-secondary px-3 py-1.5 text-xs font-semibold text-secondary-foreground hover:bg-secondary/80 transition"><Edit3 size={14} /> Batch Edit</button>
+            <button onClick={handleAudit} className="flex items-center gap-1.5 rounded-lg bg-secondary px-3 py-1.5 text-xs font-semibold text-secondary-foreground hover:bg-secondary/80 transition">
+              {isAuditing ? <Loader2 size={14} className="animate-spin" /> : <ShieldCheck size={14} />} Audit
+            </button>
+            <button onClick={handleDeduplicate} className="flex items-center gap-1.5 rounded-lg bg-secondary px-3 py-1.5 text-xs font-semibold text-secondary-foreground hover:bg-secondary/80 transition">
+              <RefreshCw size={14} /> Dedup
+            </button>
+            <button onClick={handleGenerateMockData} className="flex items-center gap-1.5 rounded-lg bg-secondary px-3 py-1.5 text-xs font-semibold text-secondary-foreground hover:bg-secondary/80 transition"><DatabaseZap size={14} /> Seed Data</button>
+
+            {/* Diff */}
+            <button onClick={saveSnapshot} className="flex items-center gap-1.5 rounded-lg bg-secondary px-3 py-1.5 text-xs font-semibold text-secondary-foreground hover:bg-secondary/80 transition"><GitCompare size={14} /> Snapshot</button>
+            {diffBase && <button onClick={() => setShowDiff(!showDiff)} className="flex items-center gap-1.5 rounded-lg bg-primary/10 px-3 py-1.5 text-xs font-semibold text-primary hover:bg-primary/20 transition"><Eye size={14} /> Diff</button>}
+            {diffBase && <button onClick={() => setShowSchemaCompare(true)} className="flex items-center gap-1.5 rounded-lg bg-primary/10 px-3 py-1.5 text-xs font-semibold text-primary hover:bg-primary/20 transition"><GitCompare size={14} /> Compare</button>}
+          </>
+        )}
 
         <div className="flex-1" />
 
-        {/* Feature Panel Toggles */}
-        <button onClick={() => setShowDBManager(!showDBManager)} className={`flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-xs font-semibold transition ${showDBManager ? "bg-accent text-accent-foreground" : "bg-secondary text-secondary-foreground hover:bg-secondary/80"}`}><Plug size={14} /> DB</button>
-        <button onClick={() => setShowQueryBuilder(!showQueryBuilder)} className={`flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-xs font-semibold transition ${showQueryBuilder ? "bg-accent text-accent-foreground" : "bg-secondary text-secondary-foreground hover:bg-secondary/80"}`}><Terminal size={14} /> Query</button>
-        <button onClick={() => setShowSupabasePanel(!showSupabasePanel)} className={`flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-xs font-semibold transition ${showSupabasePanel ? "bg-accent text-accent-foreground" : "bg-secondary text-secondary-foreground hover:bg-secondary/80"}`}><DatabaseZap size={14} /> Supa</button>
-        <button onClick={() => setShowSREMode(!showSREMode)} className={`flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-xs font-semibold transition ${showSREMode ? "bg-primary/10 text-primary" : "bg-secondary text-secondary-foreground hover:bg-secondary/80"}`}><Activity size={14} /> SRE</button>
+        {expertMode && (
+          <>
+            {/* Feature Panel Toggles */}
+            <button onClick={() => setShowDBManager(!showDBManager)} className={`flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-xs font-semibold transition ${showDBManager ? "bg-accent text-accent-foreground" : "bg-secondary text-secondary-foreground hover:bg-secondary/80"}`}><Plug size={14} /> DB</button>
+            <button onClick={() => setShowQueryBuilder(!showQueryBuilder)} className={`flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-xs font-semibold transition ${showQueryBuilder ? "bg-accent text-accent-foreground" : "bg-secondary text-secondary-foreground hover:bg-secondary/80"}`}><Terminal size={14} /> Query</button>
+            <button onClick={() => setShowSupabasePanel(!showSupabasePanel)} className={`flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-xs font-semibold transition ${showSupabasePanel ? "bg-accent text-accent-foreground" : "bg-secondary text-secondary-foreground hover:bg-secondary/80"}`}><DatabaseZap size={14} /> Supa</button>
+            <button onClick={() => setShowSREMode(!showSREMode)} className={`flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-xs font-semibold transition ${showSREMode ? "bg-primary/10 text-primary" : "bg-secondary text-secondary-foreground hover:bg-secondary/80"}`}><Activity size={14} /> SRE</button>
 
-        <button onClick={() => setShowAskData(!showAskData)} className={`flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-xs font-semibold transition ${showAskData ? "bg-violet-600 text-white" : "bg-violet-500/10 text-violet-600 dark:text-violet-400 hover:bg-violet-500/20"}`}><MessageCircle size={14} /> Ask Data</button>
+            <button onClick={() => setShowAskData(!showAskData)} className={`flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-xs font-semibold transition ${showAskData ? "bg-violet-600 text-white" : "bg-violet-500/10 text-violet-600 dark:text-violet-400 hover:bg-violet-500/20"}`}><MessageCircle size={14} /> Ask Data</button>
 
-        <button onClick={() => setShowPlayground(!showPlayground)} className="flex items-center gap-1.5 rounded-lg bg-secondary px-3 py-1.5 text-xs font-semibold text-secondary-foreground hover:bg-secondary/80 transition"><Terminal size={14} /> Query Lab</button>
+            <button onClick={() => setShowPlayground(!showPlayground)} className="flex items-center gap-1.5 rounded-lg bg-secondary px-3 py-1.5 text-xs font-semibold text-secondary-foreground hover:bg-secondary/80 transition"><Terminal size={14} /> Query Lab</button>
+          </>
+        )}
 
         {/* Export Menu */}
         <div className="relative">
           <button onClick={handleCompileSQL} className="flex items-center gap-1.5 rounded-lg bg-foreground px-3 py-1.5 text-xs font-semibold text-background transition hover:opacity-90"><Code size={14} /> Export SQL</button>
         </div>
-        <button onClick={handleGenerateRLS} className="flex items-center gap-1.5 rounded-lg bg-secondary px-3 py-1.5 text-xs font-semibold text-secondary-foreground hover:bg-secondary/80 transition"><ShieldCheck size={14} /> RLS</button>
-        <div className="relative">
-          <button onClick={() => setShowExportMenu(!showExportMenu)} className="flex items-center gap-1.5 rounded-lg bg-secondary px-2 py-1.5 text-xs text-secondary-foreground hover:bg-secondary/80 transition"><Download size={14} /></button>
-          {showExportMenu && (
-            <div className="absolute right-0 top-full mt-1 w-48 bg-card border border-border shadow-xl rounded-xl overflow-hidden z-50">
-              {[
-                { key: "sql", icon: <Database size={14} className="text-accent" />, label: "SQL" },
-                { key: "prisma", icon: <Box size={14} className="text-primary" />, label: "Prisma" },
-                { key: "drizzle", icon: <Columns size={14} className="text-accent" />, label: "Drizzle" },
-                { key: "graphql", icon: <Webhook size={14} className="text-destructive" />, label: "GraphQL" },
-                { key: "zod", icon: <ShieldCheck size={14} className="text-emerald-500" />, label: "Zod" },
-                { key: "docs", icon: <BookOpen size={14} className="text-blue-400" />, label: "Docs" },
-                { key: "csv", icon: <FileText size={14} className="text-primary" />, label: "CSV" },
-              ].map(fmt => (
-                <button key={fmt.key} onClick={() => handleExport(fmt.key)} className="w-full text-left px-4 py-2.5 hover:bg-secondary flex items-center gap-3 text-sm font-medium">
-                  {fmt.icon} Export {fmt.label}
-                </button>
-              ))}
+        {expertMode && (
+          <>
+            <button onClick={handleGenerateRLS} className="flex items-center gap-1.5 rounded-lg bg-secondary px-3 py-1.5 text-xs font-semibold text-secondary-foreground hover:bg-secondary/80 transition"><ShieldCheck size={14} /> RLS</button>
+            <div className="relative">
+              <button onClick={() => setShowExportMenu(!showExportMenu)} className="flex items-center gap-1.5 rounded-lg bg-secondary px-2 py-1.5 text-xs text-secondary-foreground hover:bg-secondary/80 transition"><Download size={14} /></button>
+              {showExportMenu && (
+                <div className="absolute right-0 top-full mt-1 w-48 bg-card border border-border shadow-xl rounded-xl overflow-hidden z-50">
+                  {[
+                    { key: "sql", icon: <Database size={14} className="text-accent" />, label: "SQL" },
+                    { key: "prisma", icon: <Box size={14} className="text-primary" />, label: "Prisma" },
+                    { key: "drizzle", icon: <Columns size={14} className="text-accent" />, label: "Drizzle" },
+                    { key: "graphql", icon: <Webhook size={14} className="text-destructive" />, label: "GraphQL" },
+                    { key: "zod", icon: <ShieldCheck size={14} className="text-emerald-500" />, label: "Zod" },
+                    { key: "docs", icon: <BookOpen size={14} className="text-blue-400" />, label: "Docs" },
+                    { key: "csv", icon: <FileText size={14} className="text-primary" />, label: "CSV" },
+                  ].map(fmt => (
+                    <button key={fmt.key} onClick={() => handleExport(fmt.key)} className="w-full text-left px-4 py-2.5 hover:bg-secondary flex items-center gap-3 text-sm font-medium">
+                      {fmt.icon} Export {fmt.label}
+                    </button>
+                  ))}
+                </div>
+              )}
             </div>
-          )}
-        </div>
+          </>
+        )}
         <button
           onClick={() => setShowChatPanel(!showChatPanel)}
           className={`flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-xs font-semibold transition ${showChatPanel ? "bg-accent text-accent-foreground" : "bg-secondary text-secondary-foreground hover:bg-secondary/80"
