@@ -1452,6 +1452,7 @@ const VibeDBPage = () => {
   useEffect(() => {
     localStorage.setItem("vibeclean_expert_mode", String(expertMode));
   }, [expertMode]);
+  const [showSidebar, setShowSidebar] = useState(true);
   const [editingTable, setEditingTable] = useState<string | null>(null);
   const [editingTableName, setEditingTableName] = useState("");
   const [editingColumn, setEditingColumn] = useState<{ tableId: string; columnId: string } | null>(null);
@@ -3216,6 +3217,19 @@ const VibeDBPage = () => {
 
       {/* Toolbar */}
       <div className="flex items-center gap-2 border-b border-border px-4 py-2">
+        <button
+          onClick={() => setShowSidebar(s => !s)}
+          aria-pressed={showSidebar}
+          title={showSidebar ? "Hide tables panel" : "Show tables panel"}
+          className={`flex items-center gap-1.5 rounded-lg border px-3 py-1.5 text-xs font-semibold transition-colors ${
+            showSidebar
+              ? "border-emerald-500/30 bg-emerald-500/10 text-foreground"
+              : "border-border bg-transparent text-muted-foreground hover:bg-secondary"
+          }`}
+        >
+          <TableIcon size={14} className={showSidebar ? "text-emerald-500" : "text-muted-foreground"} />
+          Tables
+        </button>
         <div className="relative">
           <div className="flex rounded-lg overflow-hidden border border-border">
             <button onClick={addManualTable} className="flex items-center gap-1.5 bg-secondary px-3 py-1.5 text-xs font-semibold text-secondary-foreground hover:bg-secondary/80 transition"><Plus size={14} /> Add Table</button>
@@ -3348,15 +3362,17 @@ const VibeDBPage = () => {
           </div>
         )}
 
-        {/* Suggestions Sidebar */}
-        <VibeDBSidebar
-          sidebarItems={sidebarItems}
-          setSidebarItems={setSidebarItems}
-          expertMode={expertMode}
-          onAddToCanvas={addItemToCanvas}
-          onGenerateMore={handleGenerateSidebarTables}
-          isGeneratingMore={isGeneratingSidebar}
-        />
+        {/* Tables Sidebar */}
+        {showSidebar && (
+          <VibeDBSidebar
+            sidebarItems={sidebarItems}
+            setSidebarItems={setSidebarItems}
+            expertMode={expertMode}
+            onAddToCanvas={addItemToCanvas}
+            onGenerateMore={handleGenerateSidebarTables}
+            isGeneratingMore={isGeneratingSidebar}
+          />
+        )}
 
         {/* Canvas */}
         <div className="relative flex-1 overflow-hidden" ref={canvasRef} onMouseDown={handleCanvasMouseDown} onWheel={handleWheel}
@@ -3507,7 +3523,7 @@ const VibeDBPage = () => {
               <div className="text-center">
                 <Database size={48} className="mx-auto mb-4 text-muted-foreground/30" />
                 <h3 className="mb-2 text-lg font-bold text-muted-foreground">Canvas is Empty</h3>
-                <p className="text-sm text-muted-foreground/70">Generate a schema, then drag tables here.</p>
+                <p className="text-sm text-muted-foreground/70">Describe your database above to generate your schema.</p>
               </div>
             </div>
           )}

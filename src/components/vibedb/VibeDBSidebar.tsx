@@ -68,7 +68,7 @@ const VibeDBSidebar: React.FC<VibeDBSidebarProps> = ({
       {/* Header */}
       <div className="p-3 border-b border-border">
         <div className="flex items-center justify-between mb-2">
-          <span className="text-xs font-bold text-muted-foreground uppercase tracking-wider">Suggestions</span>
+          <span className="text-xs font-bold text-muted-foreground uppercase tracking-wider">Tables</span>
           {expertMode && (
             <button
               onClick={() =>
@@ -93,7 +93,7 @@ const VibeDBSidebar: React.FC<VibeDBSidebarProps> = ({
                 setSidebarPrompt("");
               }
             }}
-            placeholder="Add more tables..."
+            placeholder="Generate some tables…"
             className="flex-1 rounded-lg border border-border bg-background px-2.5 py-1.5 text-xs outline-none focus:border-primary"
           />
           <button
@@ -116,8 +116,8 @@ const VibeDBSidebar: React.FC<VibeDBSidebarProps> = ({
         {sidebarItems.length === 0 && (
           <div className="text-center py-8 text-muted-foreground">
             <Sparkles size={20} className="mx-auto mb-2 opacity-30" />
-            <p className="text-xs">No tables suggested.</p>
-            <p className="text-[10px] opacity-70 mt-1">Try generating a new idea.</p>
+            <p className="text-xs">No tables yet.</p>
+            <p className="text-[10px] opacity-70 mt-1">Generate or create one manually.</p>
           </div>
         )}
 
