@@ -42,6 +42,26 @@ import type { Column, TableNode, SchemaEnum, SchemaFunction, Toast, Project, Aud
 
 // ─── Constants ──────────────────────────────────────────
 const COLUMN_TYPES = ["uuid", "varchar", "int", "timestamp", "boolean", "numeric", "text", "jsonb", "decimal", "float"];
+const PROMPT_SUGGESTIONS = [
+  "E-commerce with users, products, orders",
+  "SaaS app with workspaces, subscriptions, billing",
+  "Social network with posts, likes, followers",
+  "Project management with tasks, sprints, teams",
+  "CRM with contacts, deals, pipelines, activities",
+  "Marketplace with sellers, listings, reviews",
+  "Hotel booking with rooms, guests, reservations",
+  "Learning platform with courses, lessons, progress",
+  "Healthcare app with patients, doctors, appointments",
+  "Forum with threads, comments, votes",
+  "Music streaming with artists, albums, playlists",
+  "Issue tracker with bugs, milestones, assignees",
+  "Restaurant POS with menus, tables, staff",
+  "Event ticketing with venues, attendees, tickets",
+  "Job board with postings, companies, applicants",
+  "Fitness tracker with workouts, exercises, logs",
+  "Banking app with accounts, transfers, cards",
+  "Inventory system with warehouses, stock, suppliers",
+];
 const MAX_CONTINUATION_CALLS = 4; // max 5 total calls (1 initial + 4 continuations)
 const MAX_AUDIT_CONTINUATIONS = 2; // max 3 total audit calls (1 initial + 2 continuations)
 const TABLE_WIDTH = 260;
@@ -1213,6 +1233,43 @@ function CompilerReportUI({ report }: { report: CompilerReport }) {
 // ─── Main Component ─────────────────────────────────────
 const VibeDBPage = () => {
   const [prompt, setPrompt] = useState("");
+  const [isPromptFocused, setIsPromptFocused] = useState(false);
+  const [typewriterText, setTypewriterText] = useState("");
+
+  useEffect(() => {
+    if (prompt !== "" || isPromptFocused) {
+      setTypewriterText("");
+      return;
+    }
+    let cancelled = false;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    let suggestionIndex = 0;
+    let charIndex = 0;
+
+    const tick = () => {
+      if (cancelled) return;
+      const current = PROMPT_SUGGESTIONS[suggestionIndex];
+      if (charIndex < current.length) {
+        charIndex += 1;
+        setTypewriterText(current.slice(0, charIndex));
+        timer = setTimeout(tick, 50);
+      } else {
+        timer = setTimeout(() => {
+          if (cancelled) return;
+          suggestionIndex = (suggestionIndex + 1) % PROMPT_SUGGESTIONS.length;
+          charIndex = 0;
+          setTypewriterText("");
+          timer = setTimeout(tick, 50);
+        }, 2000);
+      }
+    };
+
+    tick();
+    return () => {
+      cancelled = true;
+      if (timer) clearTimeout(timer);
+    };
+  }, [prompt, isPromptFocused]);
   const [isGenerating, setIsGenerating] = useState(false);
   const [sidebarItems, setSidebarItems] = useState<Omit<TableNode, "x" | "y">[]>([]);
   const [canvasItems, setCanvasItems, undo, redo, canUndo, canRedo] = useHistory<TableNode[]>([]);
@@ -3041,9 +3098,18 @@ const VibeDBPage = () => {
               value={prompt}
               onChange={e => setPrompt(e.target.value)}
               onKeyDown={e => e.key === "Enter" && handleGenerate()}
-              placeholder="Describe your database... e.g. 'E-commerce with users, products, orders'"
+              onFocus={() => setIsPromptFocused(true)}
+              onBlur={() => setIsPromptFocused(false)}
               className="w-full rounded-xl border border-border bg-card px-4 py-2.5 text-sm outline-none transition focus:border-primary focus:ring-1 focus:ring-primary"
             />
+            {prompt === "" && !isPromptFocused && (
+              <span
+                aria-hidden="true"
+                className="pointer-events-none absolute inset-y-0 left-4 right-4 flex items-center text-sm text-muted-foreground select-none truncate"
+              >
+                {typewriterText}
+              </span>
+            )}
           </div>
           <button onClick={handleGenerate} disabled={isGenerating || !prompt.trim()} className="flex items-center gap-2 rounded-xl bg-accent px-4 py-2.5 text-sm font-semibold text-accent-foreground transition hover:opacity-90 disabled:opacity-50">
             {isGenerating ? <Loader2 size={16} className="animate-spin" /> : <Sparkles size={16} />}
