@@ -3249,7 +3249,6 @@ const VibeDBPage = () => {
         </div>
 
         {expertMode && <button onClick={handleAutoLayout} className="flex items-center gap-1.5 rounded-lg bg-secondary px-3 py-1.5 text-xs font-semibold text-secondary-foreground hover:bg-secondary/80 transition"><LayoutTemplate size={14} /> Auto Layout</button>}
-        {expertMode && <button onClick={handleSmartInference} className="flex items-center gap-1.5 rounded-lg bg-secondary px-3 py-1.5 text-xs font-semibold text-secondary-foreground hover:bg-secondary/80 transition"><Wand2 size={14} /> Magic Link</button>}
         <button onClick={() => setShowImportModal(true)} className="flex items-center gap-1.5 rounded-lg bg-secondary px-3 py-1.5 text-xs font-semibold text-secondary-foreground hover:bg-secondary/80 transition"><Upload size={14} /> Import</button>
         {expertMode && <button onClick={() => setShowBatchModal(true)} className="flex items-center gap-1.5 rounded-lg bg-secondary px-3 py-1.5 text-xs font-semibold text-secondary-foreground hover:bg-secondary/80 transition"><Edit3 size={14} /> Batch Edit</button>}
         {expertMode && <button onClick={handleAudit} className="flex items-center gap-1.5 rounded-lg bg-secondary px-3 py-1.5 text-xs font-semibold text-secondary-foreground hover:bg-secondary/80 transition">
@@ -3258,12 +3257,6 @@ const VibeDBPage = () => {
         {expertMode && <button onClick={handleDeduplicate} className="flex items-center gap-1.5 rounded-lg bg-secondary px-3 py-1.5 text-xs font-semibold text-secondary-foreground hover:bg-secondary/80 transition">
           <RefreshCw size={14} /> Dedup
         </button>}
-        {expertMode && <button onClick={handleGenerateMockData} className="flex items-center gap-1.5 rounded-lg bg-secondary px-3 py-1.5 text-xs font-semibold text-secondary-foreground hover:bg-secondary/80 transition"><DatabaseZap size={14} /> Seed Data</button>}
-
-        {/* Diff */}
-        {expertMode && <button onClick={saveSnapshot} className="flex items-center gap-1.5 rounded-lg bg-secondary px-3 py-1.5 text-xs font-semibold text-secondary-foreground hover:bg-secondary/80 transition"><GitCompare size={14} /> Snapshot</button>}
-        {expertMode && diffBase && <button onClick={() => setShowDiff(!showDiff)} className="flex items-center gap-1.5 rounded-lg bg-primary/10 px-3 py-1.5 text-xs font-semibold text-primary hover:bg-primary/20 transition"><Eye size={14} /> Diff</button>}
-        {expertMode && diffBase && <button onClick={() => setShowSchemaCompare(true)} className="flex items-center gap-1.5 rounded-lg bg-primary/10 px-3 py-1.5 text-xs font-semibold text-primary hover:bg-primary/20 transition"><GitCompare size={14} /> Compare</button>}
 
         <div className="flex-1" />
 
@@ -3271,11 +3264,8 @@ const VibeDBPage = () => {
         {expertMode && <button onClick={() => setShowDBManager(!showDBManager)} className={`flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-xs font-semibold transition ${showDBManager ? "bg-accent text-accent-foreground" : "bg-secondary text-secondary-foreground hover:bg-secondary/80"}`}><Plug size={14} /> DB</button>}
         {expertMode && <button onClick={() => setShowQueryBuilder(!showQueryBuilder)} className={`flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-xs font-semibold transition ${showQueryBuilder ? "bg-accent text-accent-foreground" : "bg-secondary text-secondary-foreground hover:bg-secondary/80"}`}><Terminal size={14} /> Query</button>}
         {expertMode && <button onClick={() => setShowSupabasePanel(!showSupabasePanel)} className={`flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-xs font-semibold transition ${showSupabasePanel ? "bg-accent text-accent-foreground" : "bg-secondary text-secondary-foreground hover:bg-secondary/80"}`}><DatabaseZap size={14} /> Supa</button>}
-        {expertMode && <button onClick={() => setShowSREMode(!showSREMode)} className={`flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-xs font-semibold transition ${showSREMode ? "bg-primary/10 text-primary" : "bg-secondary text-secondary-foreground hover:bg-secondary/80"}`}><Activity size={14} /> SRE</button>}
 
         {expertMode && <button onClick={() => setShowAskData(!showAskData)} className={`flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-xs font-semibold transition ${showAskData ? "bg-violet-600 text-white" : "bg-violet-500/10 text-violet-600 dark:text-violet-400 hover:bg-violet-500/20"}`}><MessageCircle size={14} /> Ask Data</button>}
-
-        {expertMode && <button onClick={() => setShowPlayground(!showPlayground)} className="flex items-center gap-1.5 rounded-lg bg-secondary px-3 py-1.5 text-xs font-semibold text-secondary-foreground hover:bg-secondary/80 transition"><Terminal size={14} /> Query Lab</button>}
 
         {/* Export Menu */}
         <div className="relative">
