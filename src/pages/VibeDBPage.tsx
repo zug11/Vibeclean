@@ -1,6 +1,6 @@
 import React, { useState, useCallback, useRef, useEffect, useMemo } from "react";
 import {
-  Database, Plus, Search, Sparkles, Trash2, X, Loader2, Copy, Check,
+  Database, Plus, Sparkles, Trash2, X, Loader2, Copy, Check,
   Zap, Download, Lightbulb, RefreshCw, Undo2, Redo2, Eye,
   Wand2, Terminal, ArrowLeft, LayoutTemplate, ArrowUpDown,
   Table as TableIcon, Code, Upload, ShieldCheck, Edit3, ChevronDown,
@@ -74,6 +74,7 @@ const CANVAS_ZOOM_SENSITIVITY = 0.0005;
 const MAX_CANVAS_ZOOM_STEP = 0.05;
 const WHEEL_LINE_HEIGHT = 16;
 const WHEEL_PAGE_HEIGHT = 800;
+const PROMPT_TEXTAREA_MAX_HEIGHT = 116;
 
 function cloneTables(tables: TableNode[]): TableNode[] {
   return typeof structuredClone === "function"
@@ -1354,6 +1355,7 @@ const VibeDBPage = () => {
   const [prompt, setPrompt] = useState("");
   const [isPromptFocused, setIsPromptFocused] = useState(false);
   const [typewriterText, setTypewriterText] = useState("");
+  const promptTextareaRef = useRef<HTMLTextAreaElement>(null);
 
   useEffect(() => {
     if (prompt !== "" || isPromptFocused) {
@@ -1389,6 +1391,16 @@ const VibeDBPage = () => {
       if (timer) clearTimeout(timer);
     };
   }, [prompt, isPromptFocused]);
+
+  useEffect(() => {
+    const textarea = promptTextareaRef.current;
+    if (!textarea) return;
+
+    textarea.style.height = "auto";
+    const nextHeight = Math.min(textarea.scrollHeight, PROMPT_TEXTAREA_MAX_HEIGHT);
+    textarea.style.height = `${nextHeight}px`;
+    textarea.style.overflowY = textarea.scrollHeight > PROMPT_TEXTAREA_MAX_HEIGHT ? "auto" : "hidden";
+  }, [prompt]);
   const [isGenerating, setIsGenerating] = useState(false);
   const [sidebarItems, setSidebarItems] = useState<Omit<TableNode, "x" | "y">[]>([]);
   const [canvasItems, setCanvasItems, undo, redo, canUndo, canRedo] = useHistory<TableNode[]>([]);
@@ -3471,6 +3483,13 @@ const VibeDBPage = () => {
     return relatedNodeIds.has(tableId) ? 1 : 0.3;
   };
 
+  const handlePromptKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
+    if (e.key === "Enter" && !e.shiftKey) {
+      e.preventDefault();
+      handleGenerate();
+    }
+  };
+
   return (
     <div className="flex h-screen flex-col bg-background">
       {/* Top Bar */}
@@ -3497,46 +3516,11 @@ const VibeDBPage = () => {
           {isSaving ? <Loader2 size={14} className="animate-spin" /> : <Save size={14} />}
           Save
         </button>
-        <div className="ml-4 flex flex-1 items-center gap-2">
-          <div className="relative flex-1 max-w-xl">
-            <input
-              value={prompt}
-              onChange={e => setPrompt(e.target.value)}
-              onKeyDown={e => e.key === "Enter" && handleGenerate()}
-              onFocus={() => setIsPromptFocused(true)}
-              onBlur={() => setIsPromptFocused(false)}
-              className="w-full rounded-xl border border-border bg-card px-4 py-2.5 text-sm outline-none transition focus:border-primary focus:ring-1 focus:ring-primary"
-            />
-            {prompt === "" && !isPromptFocused && (
-              <span
-                aria-hidden="true"
-                className="pointer-events-none absolute inset-y-0 left-4 right-4 flex items-center text-sm text-muted-foreground select-none truncate"
-              >
-                {typewriterText}
-              </span>
-            )}
-          </div>
-          <button onClick={handleGenerate} disabled={isGenerating || !prompt.trim()} className="flex items-center gap-2 rounded-xl bg-accent px-4 py-2.5 text-sm font-semibold text-accent-foreground transition hover:opacity-90 disabled:opacity-50">
-            {isGenerating ? <Loader2 size={16} className="animate-spin" /> : <Sparkles size={16} />}
-            Generate
-          </button>
-          {/* Strategy Selector */}
-          <select
-            value={selectedStrategy}
-            onChange={e => { setSelectedStrategy(e.target.value); setDefaultStrategy(e.target.value); }}
-            className="rounded-lg border border-border bg-card px-2 py-2 text-xs outline-none focus:border-primary"
-            title="Generation strategy"
-          >
-            {STRATEGIES.map(s => (
-              <option key={s.id} value={s.id}>{s.name}</option>
-            ))}
-          </select>
-        </div>
 
         {/* History Toggle */}
         <button
           onClick={() => setShowHistoryPanel(!showHistoryPanel)}
-          className={`flex items-center gap-1.5 px-2.5 py-2 rounded-lg text-xs font-medium transition-colors ${showHistoryPanel ? "bg-primary/10 text-primary" : "text-muted-foreground hover:bg-secondary"}`}
+          className={`ml-auto flex items-center gap-1.5 px-2.5 py-2 rounded-lg text-xs font-medium transition-colors ${showHistoryPanel ? "bg-primary/10 text-primary" : "text-muted-foreground hover:bg-secondary"}`}
           title="Generation history"
         >
           <Clock size={14} />
@@ -3920,12 +3904,65 @@ const VibeDBPage = () => {
           </div>
 
           {canvasItems.length === 0 && (
-            <div className="absolute inset-0 flex items-center justify-center">
-              <div className="text-center">
-                <Database size={48} className="mx-auto mb-4 text-muted-foreground/30" />
-                <h3 className="mb-2 text-lg font-bold text-muted-foreground">Canvas is Empty</h3>
-                <p className="text-sm text-muted-foreground/70">Describe your database above to generate your schema.</p>
-              </div>
+            <div className="pointer-events-none absolute inset-0 z-30 flex items-center justify-center px-4">
+              <motion.div
+                initial={{ opacity: 0, y: 12, scale: 0.98 }}
+                animate={{ opacity: 1, y: 0, scale: 1 }}
+                transition={{ duration: 0.22, ease: "easeOut" }}
+                className="pointer-events-auto relative w-full max-w-[520px] rounded-2xl border border-accent/45 bg-card/95 px-7 pb-7 pt-10 text-center shadow-[0_24px_70px_rgba(15,23,42,0.12),0_4px_16px_rgba(15,23,42,0.07)] backdrop-blur"
+              >
+                <div className="absolute left-1/2 top-0 flex h-14 w-14 -translate-x-1/2 -translate-y-1/2 items-center justify-center rounded-full border border-border bg-card shadow-sm">
+                  <Database size={28} className="text-accent" />
+                </div>
+                <h3 className="text-2xl font-bold tracking-tight text-foreground">Describe your database</h3>
+                <p className="mt-2 text-sm leading-6 text-muted-foreground">
+                  Describe what you're building. VibeDB will draft tables, fields, and relationships.
+                </p>
+
+                <div className="relative mt-5">
+                  <textarea
+                    ref={promptTextareaRef}
+                    rows={1}
+                    value={prompt}
+                    onChange={e => setPrompt(e.target.value)}
+                    onKeyDown={handlePromptKeyDown}
+                    onFocus={() => setIsPromptFocused(true)}
+                    onBlur={() => setIsPromptFocused(false)}
+                    aria-label="Describe your database"
+                    className="min-h-[48px] w-full resize-none rounded-xl border border-border bg-background px-4 py-3 text-left text-sm leading-6 outline-none transition focus:border-accent focus:ring-2 focus:ring-accent/20"
+                  />
+                  {prompt === "" && !isPromptFocused && (
+                    <span
+                      aria-hidden="true"
+                      className="pointer-events-none absolute left-4 right-4 top-3.5 truncate text-left text-sm text-muted-foreground select-none"
+                    >
+                      {typewriterText}
+                    </span>
+                  )}
+                </div>
+
+                <div className="mt-4 flex flex-col gap-2 sm:flex-row">
+                  <select
+                    value={selectedStrategy}
+                    onChange={e => { setSelectedStrategy(e.target.value); setDefaultStrategy(e.target.value); }}
+                    className="h-12 rounded-xl border border-border bg-background px-3 text-xs font-medium text-muted-foreground outline-none transition focus:border-accent focus:ring-2 focus:ring-accent/20 sm:w-36"
+                    title="Generation strategy"
+                    aria-label="Generation strategy"
+                  >
+                    {STRATEGIES.map(s => (
+                      <option key={s.id} value={s.id}>{s.name}</option>
+                    ))}
+                  </select>
+                  <button
+                    onClick={handleGenerate}
+                    disabled={isGenerating || !prompt.trim()}
+                    className="flex h-12 flex-1 items-center justify-center gap-2 rounded-xl bg-accent px-4 text-base font-bold text-accent-foreground shadow-[0_12px_28px_rgba(16,185,129,0.22)] transition hover:opacity-90 disabled:opacity-50"
+                  >
+                    {isGenerating ? <Loader2 size={18} className="animate-spin" /> : <Sparkles size={18} />}
+                    Generate schema
+                  </button>
+                </div>
+              </motion.div>
             </div>
           )}
 
