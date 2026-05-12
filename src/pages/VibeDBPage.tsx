@@ -68,6 +68,12 @@ const MAX_AUDIT_CONTINUATIONS = 2; // max 3 total audit calls (1 initial + 2 con
 const TABLE_WIDTH = 260;
 const HEADER_HEIGHT = 40;
 const ROW_HEIGHT = 32;
+const MIN_CANVAS_ZOOM = 0.3;
+const MAX_CANVAS_ZOOM = 3;
+const CANVAS_ZOOM_SENSITIVITY = 0.0005;
+const MAX_CANVAS_ZOOM_STEP = 0.05;
+const WHEEL_LINE_HEIGHT = 16;
+const WHEEL_PAGE_HEIGHT = 800;
 
 function cloneTables(tables: TableNode[]): TableNode[] {
   return typeof structuredClone === "function"
@@ -3327,11 +3333,46 @@ const VibeDBPage = () => {
     return () => { window.removeEventListener("mousemove", handleMove); window.removeEventListener("mouseup", handleUp); };
   }, [draggingTable, dragOffset, view]);
 
-  const handleWheel = (e: React.WheelEvent) => {
+  const handleWheel = useCallback((e: WheelEvent) => {
     e.preventDefault();
-    const delta = e.deltaY > 0 ? 0.9 : 1.1;
-    setView(v => ({ ...v, zoom: Math.max(0.3, Math.min(3, v.zoom * delta)) }));
-  };
+    e.stopPropagation();
+    const rect = canvasRef.current?.getBoundingClientRect();
+    const pointerX = rect ? e.clientX - rect.left : 0;
+    const pointerY = rect ? e.clientY - rect.top : 0;
+    const normalizedDelta = e.deltaY * (
+      e.deltaMode === WheelEvent.DOM_DELTA_LINE
+        ? WHEEL_LINE_HEIGHT
+        : e.deltaMode === WheelEvent.DOM_DELTA_PAGE
+          ? WHEEL_PAGE_HEIGHT
+          : 1
+    );
+    const zoomFactor = Math.max(
+      1 - MAX_CANVAS_ZOOM_STEP,
+      Math.min(1 + MAX_CANVAS_ZOOM_STEP, Math.exp(-normalizedDelta * CANVAS_ZOOM_SENSITIVITY))
+    );
+
+    setView(v => {
+      const nextZoom = Math.max(MIN_CANVAS_ZOOM, Math.min(MAX_CANVAS_ZOOM, v.zoom * zoomFactor));
+      if (!rect || nextZoom === v.zoom) return { ...v, zoom: nextZoom };
+
+      const worldX = (pointerX - v.x) / v.zoom;
+      const worldY = (pointerY - v.y) / v.zoom;
+
+      return {
+        x: pointerX - worldX * nextZoom,
+        y: pointerY - worldY * nextZoom,
+        zoom: nextZoom,
+      };
+    });
+  }, []);
+
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+
+    canvas.addEventListener("wheel", handleWheel, { passive: false });
+    return () => canvas.removeEventListener("wheel", handleWheel);
+  }, [handleWheel]);
 
   const handleCanvasDrop = (e: React.DragEvent) => {
     e.preventDefault();
@@ -3735,7 +3776,7 @@ const VibeDBPage = () => {
         )}
 
         {/* Canvas */}
-        <div className="relative flex-1 overflow-hidden" ref={canvasRef} onMouseDown={handleCanvasMouseDown} onWheel={handleWheel}
+        <div className="relative flex-1 overflow-hidden overscroll-contain" ref={canvasRef} onMouseDown={handleCanvasMouseDown}
           onDrop={handleCanvasDrop} onDragOver={e => { e.preventDefault(); e.dataTransfer.dropEffect = "move"; }}
         >
           <div className="pointer-events-none absolute inset-0 opacity-[0.04]" style={{
