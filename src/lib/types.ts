@@ -31,6 +31,12 @@ export interface TableNode {
   };
 }
 
+export interface SupabaseBaseline {
+  url: string;
+  importedAt: string;
+  tables: TableNode[];
+}
+
 export interface SchemaEnum {
   name: string;
   values: string[];
@@ -45,13 +51,14 @@ export interface Project {
   id: string;
   name: string;
   definition: TableNode[];
+  supabaseBaseline?: SupabaseBaseline;
   updated_at: string;
 }
 
 export interface AuditReport {
   score?: number;
   issues?: { severity: string; message: string }[];
-  suggestions?: { type: string; target_table?: string; payload?: any; reason: string; description?: string }[];
+  suggestions?: { type: string; target_table?: string; payload?: unknown; reason: string; description?: string }[];
   lintIssues?: { type: string; severity: string; message: string }[];
   fkIssues?: { type: string; severity: string; message: string }[];
   strengths?: string[];

@@ -16,7 +16,8 @@ import { createGenerationTracker, type GenerationProgress } from "@/lib/generati
 import { STRATEGIES, getDefaultStrategy, setDefaultStrategy } from "@/lib/generation-strategies";
 import { GenerationHistoryStore, type GenerationRecord } from "@/lib/generation-history";
 import { runCompilerPass } from "@/lib/compiler-pass";
-import { generateRLSPolicies } from "@/lib/supabase-integration";
+import { generateRLSPolicies, introspectSupabaseSchema } from "@/lib/supabase-integration";
+import { computeSchemaDiff, generateMigrationSQL, type SchemaDiff } from "@/lib/schema-diff";
 import GenerationHistoryPanel from "@/components/vibedb/GenerationHistoryPanel";
 import SchemaCompareModal from "@/components/vibedb/SchemaCompareModal";
 import DatabaseManagerPanel from "@/components/vibedb/DatabaseManagerPanel";
@@ -38,7 +39,7 @@ import {
 } from "@/components/vibedb/ExportGenerators";
 
 // ─── Types ──────────────────────────────────────────────
-import type { Column, TableNode, SchemaEnum, SchemaFunction, Toast, Project, AuditReport, CompilerReport } from "@/lib/types";
+import type { Column, TableNode, SchemaEnum, SchemaFunction, Toast, Project, AuditReport, CompilerReport, SupabaseBaseline } from "@/lib/types";
 
 // ─── Constants ──────────────────────────────────────────
 const COLUMN_TYPES = ["uuid", "varchar", "int", "timestamp", "boolean", "numeric", "text", "jsonb", "decimal", "float"];
@@ -67,6 +68,86 @@ const MAX_AUDIT_CONTINUATIONS = 2; // max 3 total audit calls (1 initial + 2 con
 const TABLE_WIDTH = 260;
 const HEADER_HEIGHT = 40;
 const ROW_HEIGHT = 32;
+
+function cloneTables(tables: TableNode[]): TableNode[] {
+  return typeof structuredClone === "function"
+    ? structuredClone(tables)
+    : JSON.parse(JSON.stringify(tables));
+}
+
+function hasSchemaDiffChanges(diff: SchemaDiff | null): boolean {
+  return !!diff && (
+    diff.addedTables.length > 0 ||
+    diff.removedTables.length > 0 ||
+    diff.modifiedTables.length > 0
+  );
+}
+
+function countSchemaDiffChanges(diff: SchemaDiff | null): number {
+  if (!diff) return 0;
+  const tableChanges = diff.addedTables.length + diff.removedTables.length;
+  const modifiedChanges = diff.modifiedTables.reduce((sum, mod) => (
+    sum +
+    mod.addedColumns.length +
+    mod.removedColumns.length +
+    mod.modifiedColumns.length +
+    mod.addedIndexes.length +
+    mod.removedIndexes.length
+  ), 0);
+  return tableChanges + modifiedChanges;
+}
+
+function summarizeSchemaDiff(diff: SchemaDiff | null): string[] {
+  if (!diff) return [];
+  const summary: string[] = [];
+  if (diff.addedTables.length > 0) summary.push(`${diff.addedTables.length} table${diff.addedTables.length !== 1 ? "s" : ""} added`);
+  if (diff.removedTables.length > 0) summary.push(`${diff.removedTables.length} table${diff.removedTables.length !== 1 ? "s" : ""} removed`);
+
+  const addedColumns = diff.modifiedTables.reduce((sum, mod) => sum + mod.addedColumns.length, 0);
+  const removedColumns = diff.modifiedTables.reduce((sum, mod) => sum + mod.removedColumns.length, 0);
+  const modifiedColumns = diff.modifiedTables.reduce((sum, mod) => sum + mod.modifiedColumns.length, 0);
+  const addedIndexes = diff.modifiedTables.reduce((sum, mod) => sum + mod.addedIndexes.length, 0);
+  const removedIndexes = diff.modifiedTables.reduce((sum, mod) => sum + mod.removedIndexes.length, 0);
+
+  if (addedColumns > 0) summary.push(`${addedColumns} column${addedColumns !== 1 ? "s" : ""} added`);
+  if (removedColumns > 0) summary.push(`${removedColumns} column${removedColumns !== 1 ? "s" : ""} removed`);
+  if (modifiedColumns > 0) summary.push(`${modifiedColumns} column${modifiedColumns !== 1 ? "s" : ""} modified`);
+  if (addedIndexes > 0) summary.push(`${addedIndexes} index${addedIndexes !== 1 ? "es" : ""} added`);
+  if (removedIndexes > 0) summary.push(`${removedIndexes} index${removedIndexes !== 1 ? "es" : ""} removed`);
+
+  return summary;
+}
+
+function analyzeMigrationRisks(sql: string): string[] {
+  const risks: string[] = [];
+  if (/\bDROP\s+TABLE\b/i.test(sql)) risks.push("Drops table data or dependent objects");
+  if (/\bDROP\s+COLUMN\b/i.test(sql)) risks.push("Drops column data");
+  if (/\bALTER\s+COLUMN\b[\s\S]*?\bTYPE\b/i.test(sql)) risks.push("Alters a column type and may require casts/backfills");
+  if (/\bCASCADE\b/i.test(sql)) risks.push("Uses CASCADE and may affect dependent objects");
+  return [...new Set(risks)];
+}
+
+function mergeImportedTablesWithLayout(importedTables: TableNode[], currentTables: TableNode[]): TableNode[] {
+  const currentByName = new Map(currentTables.map(t => [t.name.toLowerCase(), t]));
+
+  return importedTables.map((table) => {
+    const existingTable = currentByName.get(table.name.toLowerCase());
+    const existingColumnsByName = new Map(
+      (existingTable?.columns || []).map(col => [col.name.toLowerCase(), col])
+    );
+
+    return {
+      ...table,
+      id: existingTable?.id || table.id,
+      x: existingTable?.x ?? table.x,
+      y: existingTable?.y ?? table.y,
+      columns: table.columns.map(col => ({
+        ...col,
+        id: existingColumnsByName.get(col.name.toLowerCase())?.id || col.id,
+      })),
+    };
+  });
+}
 
 // ─── Naming Convention Linter ───────────────────────────
 const NAMING_PATTERNS: Record<string, RegExp> = {
@@ -1285,6 +1366,7 @@ const VibeDBPage = () => {
   const [projects, setProjects] = useState<Project[]>([]);
   const [currentProjectId, setCurrentProjectId] = useState<string | null>(null);
   const [projectName, setProjectName] = useState("Untitled Schema");
+  const [supabaseBaseline, setSupabaseBaseline] = useState<SupabaseBaseline | null>(null);
   const [showProjectsPanel, setShowProjectsPanel] = useState(false);
   const [isSaving, setIsSaving] = useState(false);
   const [editingProjectName, setEditingProjectName] = useState(false);
@@ -1338,7 +1420,10 @@ const VibeDBPage = () => {
         setProjectName(meta.name);
         // Load full project data (with definition + dataRows) from IndexedDB
         ProjectStorage.getProject(meta.id).then(full => {
-          if (full) setCanvasItems(full.definition);
+          if (full) {
+            setCanvasItems(full.definition);
+            setSupabaseBaseline(full.supabaseBaseline || null);
+          }
         });
       }
     }
@@ -1353,6 +1438,7 @@ const VibeDBPage = () => {
         id: currentProjectId,
         name: projectName,
         definition: canvasItems,
+        supabaseBaseline: supabaseBaseline || undefined,
         updated_at: new Date().toISOString(),
         created_at: new Date().toISOString(),
       });
@@ -1363,7 +1449,7 @@ const VibeDBPage = () => {
       ));
     }, 2000);
     return () => { if (saveTimerRef.current) clearTimeout(saveTimerRef.current); };
-  }, [canvasItems, currentProjectId, projectName]);
+  }, [canvasItems, currentProjectId, projectName, supabaseBaseline]);
 
   const saveProject = useCallback(async () => {
     if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
@@ -1374,6 +1460,7 @@ const VibeDBPage = () => {
           id: currentProjectId,
           name: projectName,
           definition: canvasItems,
+          supabaseBaseline: supabaseBaseline || undefined,
           updated_at: new Date().toISOString(),
           created_at: new Date().toISOString(),
         });
@@ -1390,6 +1477,7 @@ const VibeDBPage = () => {
           id: newId,
           name: projectName,
           definition: canvasItems,
+          supabaseBaseline: supabaseBaseline || undefined,
           updated_at: now,
           created_at: now,
         });
@@ -1408,7 +1496,7 @@ const VibeDBPage = () => {
     } finally {
       setIsSaving(false);
     }
-  }, [currentProjectId, canvasItems, projectName]);
+  }, [currentProjectId, canvasItems, projectName, supabaseBaseline]);
 
   const loadProject = useCallback(async (project: Project) => {
     setCurrentProjectId(project.id);
@@ -1417,6 +1505,7 @@ const VibeDBPage = () => {
     // Load full project data (with dataRows) from IndexedDB
     const full = await ProjectStorage.getProject(project.id);
     setCanvasItems(full ? full.definition : project.definition);
+    setSupabaseBaseline(full?.supabaseBaseline || null);
     setSidebarItems([]);
     setShowProjectsPanel(false);
     addToast(`Opened "${project.name}"`, "info");
@@ -1427,6 +1516,7 @@ const VibeDBPage = () => {
     ProjectStorage.setCurrentProjectId(null);
     setProjectName("Untitled Schema");
     setCanvasItems([]);
+    setSupabaseBaseline(null);
     setSidebarItems([]);
     setShowProjectsPanel(false);
     addToast("New project created", "info");
@@ -1440,6 +1530,7 @@ const VibeDBPage = () => {
       ProjectStorage.setCurrentProjectId(null);
       setProjectName("Untitled Schema");
       setCanvasItems([]);
+      setSupabaseBaseline(null);
     }
     addToast("Project deleted", "success");
   }, [currentProjectId]);
@@ -1517,6 +1608,10 @@ const VibeDBPage = () => {
   const [isImportingRows, setIsImportingRows] = useState(false);
   const [deployFixResult, setDeployFixResult] = useState<FixResult | null>(null);
   const [compilerReport, setCompilerReport] = useState<CompilerReport | null>(null);
+  const [showSyncReview, setShowSyncReview] = useState(false);
+  const [syncSql, setSyncSql] = useState("");
+  const [syncDiff, setSyncDiff] = useState<SchemaDiff | null>(null);
+  const [isSyncing, setIsSyncing] = useState(false);
 
   // Schema Diff
   const [diffBase, setDiffBase] = useState<TableNode[] | null>(null);
@@ -1538,6 +1633,27 @@ const VibeDBPage = () => {
     });
     setTimeout(() => setToasts(prev => prev.filter(t => t.id !== id)), 2500);
   }, []);
+
+  const supabaseSyncDiff = useMemo(
+    () => supabaseBaseline ? computeSchemaDiff(supabaseBaseline.tables, canvasItems) : null,
+    [supabaseBaseline, canvasItems]
+  );
+  const hasSupabaseBaseline = !!supabaseBaseline;
+  const hasSupabaseSyncChanges = hasSchemaDiffChanges(supabaseSyncDiff);
+  const supabaseSyncChangeCount = countSchemaDiffChanges(supabaseSyncDiff);
+  const syncReviewSummary = useMemo(() => summarizeSchemaDiff(syncDiff), [syncDiff]);
+  const syncReviewRisks = useMemo(() => analyzeMigrationRisks(syncSql), [syncSql]);
+  const deployNavLabel = hasSupabaseBaseline
+    ? deployConnected
+      ? hasSupabaseSyncChanges ? "Sync" : "Synced"
+      : "Connect & Sync"
+    : deployConnected ? "Deploy" : "Connect & Deploy";
+  const deployModalTitle = hasSupabaseBaseline ? "Sync to Supabase" : "Deploy to Supabase";
+  const deployPrimaryLabel = hasSupabaseBaseline
+    ? isSyncing
+      ? "Syncing..."
+      : hasSupabaseSyncChanges ? "Review Sync" : "Synced"
+    : isDeploying ? "Deploying..." : deployFixResult ? "Re-deploy Fixed Schema" : "Deploy Schema";
 
   // Track whether we're in the middle of a normalization import
   const skipNormalizedClearRef = useRef(false);
@@ -1562,7 +1678,7 @@ const VibeDBPage = () => {
         setShowDBManager(false); setShowQueryBuilder(false);
         setShowSupabasePanel(false); setShowSREMode(false);
         setShowHistoryPanel(false); setShowSchemaCompare(false);
-        setShowAskData(false);
+        setShowAskData(false); setShowSyncReview(false);
       }
       if ((e.metaKey || e.ctrlKey) && e.key === "z") { e.preventDefault(); undo(); }
       if ((e.metaKey || e.ctrlKey) && e.key === "y") { e.preventDefault(); redo(); }
@@ -2020,27 +2136,15 @@ const VibeDBPage = () => {
 
       // If we get here, deploy failed after all attempts
       addToast(lastResult?.success === false ? "Deploy had errors — see details" : "Deploy failed", "warning");
-    } catch (e: any) {
-      addToast("Deploy failed: " + e.message, "error");
+    } catch (e: unknown) {
+      addToast("Deploy failed: " + (e instanceof Error ? e.message : "Unknown error"), "error");
     } finally {
       setIsDeploying(false);
     }
   };
 
 
-  const executeDeployCall = async (itemsToDeploy: TableNode[]): Promise<{ success: boolean; results: { statement: string; success: boolean; error?: string }[]; setupNeeded?: boolean }> => {
-    // Generate SQL from canvas items (always deferred FK mode unless we have normalized SQL)
-    let sqlToRun: string;
-    if (normalizedSQL) {
-      sqlToRun = normalizedSQL;
-      console.log("[VibeDB Deploy] Using AI-generated normalized SQL (length:", sqlToRun.length, ")");
-    } else {
-      sqlToRun = generateSQLDeferred(itemsToDeploy, schemaEnums, schemaFunctions);
-      console.log("[VibeDB Deploy] Using DEFERRED FK SQL generation (always-on)");
-    }
-    const insertCount = (sqlToRun.match(/INSERT INTO/gi) || []).length;
-    console.log("[VibeDB Deploy] INSERT count:", insertCount, "| Tables with dataRows:", itemsToDeploy.filter(t => t.dataRows && t.dataRows.length > 0).map(t => `${t.name}(${t.dataRows!.length} rows)`).join(", ") || "none");
-
+  const executeDeploySql = async (sqlToRun: string): Promise<{ success: boolean; results: { statement: string; success: boolean; error?: string }[]; setupNeeded?: boolean }> => {
     const res = await fetch(`${import.meta.env.VITE_SUPABASE_URL}/functions/v1/vibedb-deploy`, {
       method: "POST",
       headers: {
@@ -2060,6 +2164,108 @@ const VibeDBPage = () => {
       success: !!data.success,
       results: data.results || [],
     };
+  };
+
+  const executeDeployCall = async (itemsToDeploy: TableNode[]): Promise<{ success: boolean; results: { statement: string; success: boolean; error?: string }[]; setupNeeded?: boolean }> => {
+    // Generate SQL from canvas items (always deferred FK mode unless we have normalized SQL)
+    let sqlToRun: string;
+    if (normalizedSQL) {
+      sqlToRun = normalizedSQL;
+      console.log("[VibeDB Deploy] Using AI-generated normalized SQL (length:", sqlToRun.length, ")");
+    } else {
+      sqlToRun = generateSQLDeferred(itemsToDeploy, schemaEnums, schemaFunctions);
+      console.log("[VibeDB Deploy] Using DEFERRED FK SQL generation (always-on)");
+    }
+    const insertCount = (sqlToRun.match(/INSERT INTO/gi) || []).length;
+    console.log("[VibeDB Deploy] INSERT count:", insertCount, "| Tables with dataRows:", itemsToDeploy.filter(t => t.dataRows && t.dataRows.length > 0).map(t => `${t.name}(${t.dataRows!.length} rows)`).join(", ") || "none");
+
+    return executeDeploySql(sqlToRun);
+  };
+
+  const handleOpenSyncReview = () => {
+    if (!supabaseBaseline) return;
+    const diff = computeSchemaDiff(supabaseBaseline.tables, canvasItems);
+
+    if (!hasSchemaDiffChanges(diff)) {
+      addToast("Supabase schema is already synced", "success");
+      return;
+    }
+
+    setSyncDiff(diff);
+    setSyncSql(generateMigrationSQL(diff));
+    setDeployFixResult(null);
+    setDeployResults(null);
+    setShowSyncReview(true);
+  };
+
+  const handleRunSync = async () => {
+    if (!supabaseBaseline) {
+      addToast("Import a Supabase schema before syncing", "error");
+      return;
+    }
+    if (!syncSql.trim()) {
+      addToast("No migration SQL to run", "error");
+      return;
+    }
+
+    setIsSyncing(true);
+    setDeploySetupNeeded(false);
+    setDeployResults(null);
+
+    try {
+      const result = await executeDeploySql(syncSql);
+      if (result.setupNeeded) {
+        setDeploySetupNeeded(true);
+        setShowSyncReview(false);
+        addToast("Setup required - see instructions in the deploy modal", "warning");
+        return;
+      }
+
+      setDeployResults(result.results);
+      if (!result.success) {
+        addToast("Sync had errors - see details", "warning");
+        return;
+      }
+
+      try {
+        const liveTables = await introspectSupabaseSchema({
+          url: supabaseBaseline.url,
+          anonKey: deployKey,
+        });
+        const confirmedTables = mergeImportedTablesWithLayout(liveTables, canvasItems);
+        setCanvasItems(confirmedTables);
+        setSupabaseBaseline({
+          url: supabaseBaseline.url,
+          importedAt: new Date().toISOString(),
+          tables: cloneTables(confirmedTables),
+        });
+      } catch {
+        setSupabaseBaseline({
+          url: supabaseBaseline.url,
+          importedAt: new Date().toISOString(),
+          tables: cloneTables(canvasItems),
+        });
+        addToast("Sync succeeded, but live schema refresh failed", "warning");
+      }
+
+      setShowSyncReview(false);
+      setSyncSql("");
+      setSyncDiff(null);
+      addToast("Supabase schema synced", "success");
+    } catch (e: unknown) {
+      addToast("Sync failed: " + (e instanceof Error ? e.message : "Unknown error"), "error");
+    } finally {
+      setIsSyncing(false);
+    }
+  };
+
+  const handlePrimaryDeployAction = () => {
+    setDeployFixResult(null);
+    if (supabaseBaseline) {
+      handleOpenSyncReview();
+    } else {
+      handleDeploy();
+    }
   };
 
   // ─── Fix Deploy Errors ─────────────────────────────────
@@ -3301,7 +3507,7 @@ const VibeDBPage = () => {
         </button>
         <button onClick={() => setShowDeployModal(true)} className={`flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-xs font-semibold transition ${deployConnected ? "bg-accent text-accent-foreground hover:bg-accent/90" : "bg-primary text-primary-foreground hover:bg-primary/90"}`}>
           {deployConnected ? <CheckCircle2 size={14} /> : <Rocket size={14} />}
-          {deployConnected ? "Deploy" : "Connect & Deploy"}
+          {deployNavLabel}
         </button>
       </div>
 
@@ -3813,13 +4019,17 @@ const VibeDBPage = () => {
           <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} className="fixed inset-0 z-50 flex items-center justify-center bg-foreground/20 backdrop-blur-sm" onClick={() => setShowDeployModal(false)}>
             <motion.div initial={{ scale: 0.95 }} animate={{ scale: 1 }} exit={{ scale: 0.95 }} className="mx-4 w-full max-w-lg rounded-2xl bg-card p-6 shadow-xl" onClick={e => e.stopPropagation()}>
               <div className="mb-4 flex items-center justify-between">
-                <h2 className="text-lg font-bold flex items-center gap-2"><Rocket size={18} /> Deploy to Supabase</h2>
+                <h2 className="text-lg font-bold flex items-center gap-2"><Rocket size={18} /> {deployModalTitle}</h2>
                 <button onClick={() => setShowDeployModal(false)} className="flex h-8 w-8 items-center justify-center rounded-lg bg-secondary"><X size={16} /></button>
               </div>
 
               {!deployConnected ? (
                 <>
-                  <p className="mb-4 text-sm text-muted-foreground">Connect to your Supabase project to deploy your schema directly.</p>
+                  <p className="mb-4 text-sm text-muted-foreground">
+                    {hasSupabaseBaseline
+                      ? "Connect with a service role key to sync changes back to the imported Supabase project."
+                      : "Connect to your Supabase project to deploy your schema directly."}
+                  </p>
                   <div className="space-y-3">
                     <div>
                       <label className="text-xs font-semibold text-muted-foreground mb-1 block">Supabase Project URL</label>
@@ -3860,14 +4070,25 @@ const VibeDBPage = () => {
                   ) : (
                     <div className="space-y-3">
                       <div className="rounded-lg bg-background border border-border p-3">
-                        <div className="text-xs font-semibold text-muted-foreground mb-2">Schema to deploy</div>
+                        <div className="text-xs font-semibold text-muted-foreground mb-2">
+                          {hasSupabaseBaseline ? "Linked Supabase schema" : "Schema to deploy"}
+                        </div>
                         <div className="flex flex-wrap gap-1.5">
                           {canvasItems.map(t => (
                             <span key={t.id} className="rounded-md bg-secondary px-2 py-0.5 text-xs font-medium">{t.name} ({t.columns.length} cols{t.dataRows && t.dataRows.length > 0 ? `, ${t.dataRows.length} rows` : ""})</span>
                           ))}
                         </div>
                       </div>
-                      <p className="text-xs text-muted-foreground"><AlertCircle size={12} className="inline mr-1" />This will run CREATE TABLE statements. Existing tables with the same name may cause errors.</p>
+                      {hasSupabaseBaseline ? (
+                        <p className={`text-xs ${hasSupabaseSyncChanges ? "text-muted-foreground" : "text-accent"}`}>
+                          <AlertCircle size={12} className="inline mr-1" />
+                          {hasSupabaseSyncChanges
+                            ? `${supabaseSyncChangeCount} pending schema change${supabaseSyncChangeCount !== 1 ? "s" : ""} will be reviewed as migration SQL before execution.`
+                            : "No pending schema changes. The imported Supabase baseline matches the canvas."}
+                        </p>
+                      ) : (
+                        <p className="text-xs text-muted-foreground"><AlertCircle size={12} className="inline mr-1" />This will run CREATE TABLE statements. Existing tables with the same name may cause errors.</p>
+                      )}
                     </div>
                   )}
 
@@ -3894,7 +4115,7 @@ BEGIN
   RETURN COALESCE(result, '[]'::json);
 END;
 $$ LANGUAGE plpgsql SECURITY DEFINER;`}</pre>
-                      <p className="text-xs text-muted-foreground">Then click <strong>Deploy Schema</strong> again.</p>
+                      <p className="text-xs text-muted-foreground">Then click <strong>{hasSupabaseBaseline ? "Review Sync" : "Deploy Schema"}</strong> again.</p>
                     </div>
                   )}
 
@@ -3903,19 +4124,19 @@ $$ LANGUAGE plpgsql SECURITY DEFINER;`}</pre>
                     <div className="mt-3 rounded-lg bg-accent/10 border border-accent/20 p-4 text-center space-y-3">
                       <div className="flex items-center justify-center gap-2">
                         <CheckCircle2 size={20} className="text-accent" />
-                        <span className="text-sm font-semibold text-accent">Everything deployed successfully!</span>
+                        <span className="text-sm font-semibold text-accent">{hasSupabaseBaseline ? "Supabase schema synced!" : "Everything deployed successfully!"}</span>
                       </div>
                       <p className="text-xs text-muted-foreground">
                         {deployResults.filter(r => r.success).length} statement{deployResults.filter(r => r.success).length !== 1 ? "s" : ""} executed
                       </p>
                       <div className="flex items-center justify-center gap-2">
                         <button
-                          onClick={() => { setDeployFixResult(null); handleDeploy(); }}
-                          disabled={isDeploying}
+                          onClick={handlePrimaryDeployAction}
+                          disabled={isDeploying || isSyncing || (hasSupabaseBaseline && !hasSupabaseSyncChanges)}
                           className="flex items-center gap-2 rounded-lg bg-secondary px-3 py-1.5 text-xs font-semibold hover:bg-secondary/80 transition"
                         >
-                          {isDeploying ? <Loader2 size={12} className="animate-spin" /> : <RefreshCw size={12} />}
-                          Re-deploy
+                          {isDeploying || isSyncing ? <Loader2 size={12} className="animate-spin" /> : <RefreshCw size={12} />}
+                          {hasSupabaseBaseline ? hasSupabaseSyncChanges ? "Review Sync" : "Synced" : "Re-deploy"}
                         </button>
                         <button
                           onClick={handleImportRows}
@@ -3999,16 +4220,117 @@ $$ LANGUAGE plpgsql SECURITY DEFINER;`}</pre>
                       {isImportingRows ? "Importing..." : "Import Rows"}
                     </button>
                     <button
-                      onClick={() => { setDeployFixResult(null); handleDeploy(); }}
-                      disabled={isDeploying || canvasItems.length === 0}
+                      onClick={handlePrimaryDeployAction}
+                      disabled={isDeploying || isSyncing || canvasItems.length === 0 || (hasSupabaseBaseline && !hasSupabaseSyncChanges)}
                       className="flex items-center gap-2 rounded-lg bg-accent px-4 py-2 text-sm font-semibold text-accent-foreground disabled:opacity-50"
                     >
-                      {isDeploying ? <Loader2 size={14} className="animate-spin" /> : <Rocket size={14} />}
-                      {isDeploying ? "Deploying..." : deployFixResult ? "Re-deploy Fixed Schema" : "Deploy Schema"}
+                      {isDeploying || isSyncing ? <Loader2 size={14} className="animate-spin" /> : <Rocket size={14} />}
+                      {deployPrimaryLabel}
                     </button>
                   </div>
                 </>
               )}
+            </motion.div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
+      {/* Supabase Sync Review Modal */}
+      <AnimatePresence>
+        {showSyncReview && (
+          <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} className="fixed inset-0 z-[60] flex items-center justify-center bg-foreground/20 backdrop-blur-sm" onClick={() => setShowSyncReview(false)}>
+            <motion.div initial={{ scale: 0.95, y: 12 }} animate={{ scale: 1, y: 0 }} exit={{ scale: 0.95, y: 12 }} className="mx-4 flex max-h-[88vh] w-full max-w-5xl flex-col overflow-hidden rounded-2xl bg-card shadow-2xl border border-border" onClick={e => e.stopPropagation()}>
+              <div className="flex items-center justify-between border-b border-border px-5 py-4 shrink-0">
+                <div className="flex items-center gap-3">
+                  <div className="flex h-9 w-9 items-center justify-center rounded-lg bg-accent/10">
+                    <DatabaseZap size={18} className="text-accent" />
+                  </div>
+                  <div>
+                    <h2 className="text-base font-bold">Review Supabase Sync</h2>
+                    <p className="text-[11px] text-muted-foreground">
+                      {supabaseBaseline?.url.replace(/https?:\/\//, "").split(".")[0] || "Supabase"} · {syncReviewSummary.length > 0 ? syncReviewSummary.join(", ") : "No structural changes"}
+                    </p>
+                  </div>
+                </div>
+                <button onClick={() => setShowSyncReview(false)} className="flex h-8 w-8 items-center justify-center rounded-lg bg-secondary hover:bg-secondary/80">
+                  <X size={16} />
+                </button>
+              </div>
+
+              <div className="grid min-h-0 flex-1 grid-cols-1 gap-0 overflow-hidden md:grid-cols-[320px_1fr]">
+                <div className="overflow-y-auto border-b border-border bg-background/50 p-4 md:border-b-0 md:border-r">
+                  <div className="space-y-3">
+                    <div>
+                      <div className="mb-2 text-[10px] font-bold uppercase tracking-wider text-muted-foreground">Schema Diff</div>
+                      {syncReviewSummary.length === 0 ? (
+                        <div className="rounded-lg border border-border bg-card px-3 py-2 text-xs text-muted-foreground">No changes detected.</div>
+                      ) : (
+                        <div className="space-y-1.5">
+                          {syncReviewSummary.map((item) => (
+                            <div key={item} className="flex items-center gap-2 rounded-lg border border-border bg-card px-3 py-2 text-xs">
+                              <GitCompare size={12} className="text-accent" />
+                              <span>{item}</span>
+                            </div>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+
+                    {syncReviewRisks.length > 0 && (
+                      <div className="rounded-lg border border-destructive/30 bg-destructive/10 p-3">
+                        <div className="mb-2 flex items-center gap-2 text-xs font-bold text-destructive">
+                          <AlertCircle size={13} />
+                          Review destructive or risky SQL
+                        </div>
+                        <div className="space-y-1">
+                          {syncReviewRisks.map((risk) => (
+                            <div key={risk} className="text-[11px] text-destructive/90">- {risk}</div>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+
+                    <div className="rounded-lg border border-border bg-card p-3">
+                      <div className="mb-1 text-xs font-bold">Execution Artifact</div>
+                      <p className="text-[11px] leading-relaxed text-muted-foreground">
+                        This SQL editor is the exact migration that will run. Canvas diff generated it; your edits here are preserved for this sync.
+                      </p>
+                    </div>
+                  </div>
+                </div>
+
+                <div className="flex min-h-0 flex-col">
+                  <div className="flex items-center justify-between border-b border-border px-4 py-2.5">
+                    <div className="flex items-center gap-2 text-xs font-bold">
+                      <Code size={13} />
+                      Migration SQL
+                    </div>
+                    <button onClick={() => handleCopy(syncSql)} className="flex items-center gap-1.5 rounded-lg bg-secondary px-2.5 py-1.5 text-[10px] font-semibold hover:bg-secondary/80">
+                      {copied ? <Check size={10} /> : <Copy size={10} />}
+                      Copy SQL
+                    </button>
+                  </div>
+                  <textarea
+                    value={syncSql}
+                    onChange={e => setSyncSql(e.target.value)}
+                    spellCheck={false}
+                    className="min-h-[420px] flex-1 resize-none bg-background p-4 font-mono text-xs leading-relaxed outline-none"
+                  />
+                </div>
+              </div>
+
+              <div className="flex items-center justify-between border-t border-border px-5 py-3 shrink-0">
+                <div className="text-[11px] text-muted-foreground">
+                  {syncReviewRisks.length > 0 ? "Risky statements are allowed only after this review." : "Data-preserving migration review is ready."}
+                </div>
+                <div className="flex items-center gap-2">
+                  <button onClick={() => setShowSyncReview(false)} className="rounded-lg bg-secondary px-4 py-2 text-sm font-semibold hover:bg-secondary/80">Cancel</button>
+                  <button onClick={handleRunSync} disabled={isSyncing || !syncSql.trim()} className="flex items-center gap-2 rounded-lg bg-accent px-4 py-2 text-sm font-semibold text-accent-foreground disabled:opacity-50">
+                    {isSyncing ? <Loader2 size={14} className="animate-spin" /> : <DatabaseZap size={14} />}
+                    {isSyncing ? "Syncing..." : "Run Reviewed SQL"}
+                  </button>
+                </div>
+              </div>
             </motion.div>
           </motion.div>
         )}
@@ -4062,8 +4384,18 @@ $$ LANGUAGE plpgsql SECURITY DEFINER;`}</pre>
         open={showSupabasePanel}
         onClose={() => setShowSupabasePanel(false)}
         canvasItems={canvasItems}
-        onImportSchema={(tables) => {
-          setCanvasItems(prev => [...prev, ...tables]);
+        onImportSchema={(tables, projectUrl) => {
+          const importedTables = cloneTables(tables);
+          setCanvasItems(prev => [...prev, ...importedTables]);
+          setSupabaseBaseline({
+            url: projectUrl,
+            importedAt: new Date().toISOString(),
+            tables: cloneTables(importedTables),
+          });
+          if (!deployUrl || deployUrl !== projectUrl) {
+            setDeployUrl(projectUrl);
+            setDeployConnected(false);
+          }
           addToast(`Imported ${tables.length} tables from Supabase`, "success");
         }}
       />

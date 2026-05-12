@@ -26,7 +26,7 @@ interface SupabasePanelProps {
   open: boolean;
   onClose: () => void;
   canvasItems: TableNode[];
-  onImportSchema: (tables: TableNode[]) => void;
+  onImportSchema: (tables: TableNode[], projectUrl: string) => void;
 }
 
 const STORAGE_KEY = "vibedb_supabase_project";
@@ -113,11 +113,11 @@ const SupabasePanel: React.FC<SupabasePanelProps> = ({
       }
 
       saveProject(project.url, project.anonKey);
-      onImportSchema(tables);
+      onImportSchema(tables, project.url);
       setConnected(true);
       setImportedCount(tables.length);
-    } catch (e: any) {
-      setConnectError(e.message || "Failed to connect to Supabase project.");
+    } catch (e: unknown) {
+      setConnectError(e instanceof Error ? e.message : "Failed to connect to Supabase project.");
     } finally {
       setConnecting(false);
     }
