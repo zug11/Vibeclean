@@ -1933,6 +1933,8 @@ const VibeDBPage = () => {
         const fixCount = cReport.actions.length;
         const batchNote = continuationCount > 0 ? ` across ${continuationCount + 1} batches` : "";
         addToast(`Generated ${generatedTables.length} tables${batchNote}${fixCount > 0 ? ` · Compiler: ${fixCount} fix${fixCount !== 1 ? "es" : ""} applied` : ""}`, "success");
+        setGenerationProgress(null);
+        setThinkingExpanded(false);
       } else {
         tracker.complete();
         addToast("No tables extracted from prompt", "warning");
@@ -3544,65 +3546,6 @@ const VibeDBPage = () => {
         </div>
       </div>
 
-      {/* AI Generation Progress */}
-      <AnimatePresence>
-        {(isGenerating || generationProgress) && (
-          <motion.div
-            initial={{ height: 0, opacity: 0 }}
-            animate={{ height: "auto", opacity: 1 }}
-            exit={{ height: 0, opacity: 0 }}
-            transition={{ duration: 0.2 }}
-            className="overflow-hidden border-b border-border bg-secondary/20"
-          >
-            <div className="px-4 py-2">
-              <button
-                onClick={() => setThinkingExpanded(!thinkingExpanded)}
-                className="flex items-center gap-2 text-xs text-muted-foreground hover:text-foreground transition"
-              >
-                <ChevronDown size={12} className={`transition-transform ${thinkingExpanded ? "" : "-rotate-90"}`} />
-                {isGenerating && <Loader2 size={12} className="animate-spin text-accent" />}
-                {isGenerating ? (
-                  <span className="font-medium text-accent">Generating schema...</span>
-                ) : generationProgress?.overallStatus === "completed" ? (
-                  <span className="font-medium text-emerald-500">Generation complete</span>
-                ) : generationProgress?.overallStatus === "error" ? (
-                  <span className="font-medium text-red-500">Generation failed</span>
-                ) : (
-                  <span className="font-medium">View generation steps</span>
-                )}
-                {!isGenerating && generationProgress && (
-                  <button
-                    onClick={(e) => { e.stopPropagation(); setGenerationProgress(null); setThinkingExpanded(false); }}
-                    className="ml-2 text-muted-foreground/50 hover:text-muted-foreground"
-                  >
-                    <X size={10} />
-                  </button>
-                )}
-              </button>
-              <AnimatePresence>
-                {thinkingExpanded && generationProgress && (
-                  <motion.div
-                    initial={{ height: 0, opacity: 0 }}
-                    animate={{ height: "auto", opacity: 1 }}
-                    exit={{ height: 0, opacity: 0 }}
-                    transition={{ duration: 0.15 }}
-                    className="overflow-hidden"
-                  >
-                    <div className="mt-2 rounded-lg bg-background/60 border border-border/50 p-3">
-                      <GenerationProgressUI progress={generationProgress} />
-                      {/* Compiler Report */}
-                      {compilerReport && compilerReport.actions.length > 0 && !isGenerating && (
-                        <CompilerReportUI report={compilerReport} />
-                      )}
-                    </div>
-                  </motion.div>
-                )}
-              </AnimatePresence>
-            </div>
-          </motion.div>
-        )}
-      </AnimatePresence>
-
       {/* Toolbar */}
       <div className="flex items-center gap-2 border-b border-border px-4 py-2">
         <button
@@ -3941,27 +3884,99 @@ const VibeDBPage = () => {
                   )}
                 </div>
 
-                <div className="mt-4 flex flex-col gap-2 sm:flex-row">
-                  <select
-                    value={selectedStrategy}
-                    onChange={e => { setSelectedStrategy(e.target.value); setDefaultStrategy(e.target.value); }}
-                    className="h-12 rounded-xl border border-border bg-background px-3 text-xs font-medium text-muted-foreground outline-none transition focus:border-accent focus:ring-2 focus:ring-accent/20 sm:w-36"
-                    title="Generation strategy"
-                    aria-label="Generation strategy"
-                  >
-                    {STRATEGIES.map(s => (
-                      <option key={s.id} value={s.id}>{s.name}</option>
-                    ))}
-                  </select>
+                <div className="mt-4">
                   <button
                     onClick={handleGenerate}
                     disabled={isGenerating || !prompt.trim()}
-                    className="flex h-12 flex-1 items-center justify-center gap-2 rounded-xl bg-accent px-4 text-base font-bold text-accent-foreground shadow-[0_12px_28px_rgba(16,185,129,0.22)] transition hover:opacity-90 disabled:opacity-50"
+                    className="flex h-12 w-full items-center justify-center gap-2 rounded-xl bg-accent px-4 text-base font-bold text-accent-foreground shadow-[0_12px_28px_rgba(16,185,129,0.22)] transition hover:opacity-90 disabled:opacity-50"
                   >
                     {isGenerating ? <Loader2 size={18} className="animate-spin" /> : <Sparkles size={18} />}
                     Generate schema
                   </button>
                 </div>
+
+                <AnimatePresence>
+                  {(isGenerating || generationProgress) && (
+                    <motion.div
+                      initial={{ height: 0, opacity: 0 }}
+                      animate={{ height: "auto", opacity: 1 }}
+                      exit={{ height: 0, opacity: 0 }}
+                      transition={{ duration: 0.2 }}
+                      className="mt-4 overflow-hidden rounded-xl border border-border/70 bg-background/70 text-left"
+                    >
+                      <button
+                        onClick={() => setThinkingExpanded(!thinkingExpanded)}
+                        className="flex w-full items-center gap-2 px-3 py-2.5 text-xs text-muted-foreground transition hover:text-foreground"
+                      >
+                        <ChevronDown size={12} className={`transition-transform ${thinkingExpanded ? "" : "-rotate-90"}`} />
+                        {isGenerating && <Loader2 size={12} className="animate-spin text-accent" />}
+                        {isGenerating ? (
+                          <span className="font-medium text-accent">Generating schema...</span>
+                        ) : generationProgress?.overallStatus === "completed" ? (
+                          <span className="font-medium text-emerald-500">Generation complete</span>
+                        ) : generationProgress?.overallStatus === "error" ? (
+                          <span className="font-medium text-red-500">Generation failed</span>
+                        ) : (
+                          <span className="font-medium">View generation steps</span>
+                        )}
+                        {!isGenerating && generationProgress && (
+                          <span
+                            onClick={(e) => { e.stopPropagation(); setGenerationProgress(null); setThinkingExpanded(false); }}
+                            className="ml-auto text-muted-foreground/50 hover:text-muted-foreground"
+                          >
+                            <X size={10} />
+                          </span>
+                        )}
+                      </button>
+                      <AnimatePresence>
+                        {thinkingExpanded && generationProgress && (
+                          <motion.div
+                            initial={{ height: 0, opacity: 0 }}
+                            animate={{ height: "auto", opacity: 1 }}
+                            exit={{ height: 0, opacity: 0 }}
+                            transition={{ duration: 0.15 }}
+                            className="overflow-hidden"
+                          >
+                            <div className="border-t border-border/60 p-3">
+                              <GenerationProgressUI progress={generationProgress} />
+                              {compilerReport && compilerReport.actions.length > 0 && !isGenerating && (
+                                <CompilerReportUI report={compilerReport} />
+                              )}
+                            </div>
+                          </motion.div>
+                        )}
+                      </AnimatePresence>
+                    </motion.div>
+                  )}
+                </AnimatePresence>
+
+                {expertMode && (
+                  <div className="mt-3">
+                    <div className="mb-1.5 text-left text-[10px] font-bold uppercase tracking-wider text-muted-foreground">Generation mode</div>
+                    <div className="grid grid-cols-3 gap-1 rounded-xl bg-secondary/70 p-1">
+                      {STRATEGIES.map(s => {
+                        const label = s.id === "v1-direct" ? "Direct" : s.id === "v2-pipeline" ? "Pipeline" : "Fast";
+                        const selected = selectedStrategy === s.id;
+                        return (
+                          <button
+                            key={s.id}
+                            type="button"
+                            aria-pressed={selected}
+                            onClick={() => { setSelectedStrategy(s.id); setDefaultStrategy(s.id); }}
+                            className={`rounded-lg px-3 py-2 text-xs font-bold transition ${
+                              selected
+                                ? "bg-background text-foreground shadow-sm"
+                                : "text-muted-foreground hover:bg-background/60 hover:text-foreground"
+                            }`}
+                            title={s.description}
+                          >
+                            {label}
+                          </button>
+                        );
+                      })}
+                    </div>
+                  </div>
+                )}
               </motion.div>
             </div>
           )}
