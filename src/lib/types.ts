@@ -37,6 +37,18 @@ export interface SupabaseBaseline {
   tables: TableNode[];
 }
 
+export interface DDLPatch {
+  id: string;
+  title: string;
+  description?: string;
+  sql: string;
+  source: "ai-chat" | "batch-edit" | "manual";
+  status: "pending" | "applied";
+  warnings: string[];
+  createdAt: string;
+  appliedAt?: string;
+}
+
 export interface SchemaEnum {
   name: string;
   values: string[];
@@ -52,6 +64,7 @@ export interface Project {
   name: string;
   definition: TableNode[];
   supabaseBaseline?: SupabaseBaseline;
+  ddlPatches?: DDLPatch[];
   updated_at: string;
 }
 

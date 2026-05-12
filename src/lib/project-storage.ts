@@ -1,4 +1,4 @@
-import type { TableNode, SchemaEnum, SchemaFunction, SupabaseBaseline } from "@/lib/types";
+import type { TableNode, SchemaEnum, SchemaFunction, SupabaseBaseline, DDLPatch } from "@/lib/types";
 
 export interface StoredProject {
   id: string;
@@ -7,6 +7,7 @@ export interface StoredProject {
   enums?: SchemaEnum[];
   functions?: SchemaFunction[];
   supabaseBaseline?: SupabaseBaseline;
+  ddlPatches?: DDLPatch[];
   updated_at: string;
   created_at: string;
 }

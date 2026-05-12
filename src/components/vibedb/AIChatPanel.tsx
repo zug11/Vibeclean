@@ -36,6 +36,7 @@ interface AIChatPanelProps {
   onAddEnum?: (e: { name: string; values: string[] }) => void;
   onAddFunction?: (f: { name: string; body: string }) => void;
   onApplySuggestion?: (suggestion: any, silent?: boolean) => void;
+  onCreateDdlPatch?: (patch: { title?: string; description?: string; sql: string }) => void;
 }
 
 // ─── Utilities ───────────────────────────────────────────
@@ -105,6 +106,7 @@ const ACTION_LABELS: Record<string, string> = {
   change_type: "Change Type",
   add_index: "Add Index",
   add_fk: "Add FK",
+  ddl_patch: "DDL Patch",
   remove_column: "Remove Column",
   remove_table: "Remove Table",
 };
@@ -117,6 +119,7 @@ const ACTION_COLORS: Record<string, string> = {
   change_type: "text-amber-400",
   add_index: "text-violet-400",
   add_fk: "text-violet-400",
+  ddl_patch: "text-amber-400",
   remove_column: "text-red-400",
   remove_table: "text-red-400",
 };
@@ -134,6 +137,7 @@ const AIChatPanel: React.FC<AIChatPanelProps> = ({
   onAddEnum,
   onAddFunction,
   onApplySuggestion,
+  onCreateDdlPatch,
 }) => {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [inputValue, setInputValue] = useState("");
@@ -229,12 +233,14 @@ const AIChatPanel: React.FC<AIChatPanelProps> = ({
           description = `Add index on ${payload.targetTable}(${(payload.columns || []).join(", ")})`;
         } else if (action === "add_fk" && payload.targetTable) {
           description = `Add FK ${payload.column} → ${payload.referencesTable}`;
+        } else if ((action === "ddl_patch" || action === "sql_patch") && (payload.title || payload.description)) {
+          description = payload.title || payload.description;
         } else {
           description = s.reason || s.message || "Apply change";
         }
       }
 
-      return { id: uuidv4(), type: action, description, applied: false, payload };
+      return { id: uuidv4(), type: action === "sql_patch" ? "ddl_patch" : action, description, applied: false, payload };
     });
   };
 
@@ -310,6 +316,22 @@ const AIChatPanel: React.FC<AIChatPanelProps> = ({
         if (onAddEnum && p.name && p.values?.length) onAddEnum({ name: p.name, values: p.values });
       } else if (p.action === "add_function") {
         if (onAddFunction && p.body) onAddFunction({ name: p.name || "", body: p.body });
+      } else if (p.action === "ddl_patch" || p.action === "sql_patch" || suggestion.type === "ddl_patch") {
+        const sql = p.sql || p.body || p.ddl || "";
+        if (!sql) {
+          if (!silent) addToast("Cannot apply DDL patch without SQL", "warning");
+          return;
+        }
+        if (onCreateDdlPatch) {
+          onCreateDdlPatch({
+            title: p.title || suggestion.description,
+            description: p.description || p.reason || suggestion.description,
+            sql,
+          });
+        } else {
+          if (!silent) addToast("Cannot apply DDL patch: no handler connected", "warning");
+          return;
+        }
       } else if (onApplySuggestion) {
         // Delegate table mutations to parent (compiler-aware pipeline)
         const mapped = {

@@ -39,7 +39,7 @@ import {
 } from "@/components/vibedb/ExportGenerators";
 
 // ─── Types ──────────────────────────────────────────────
-import type { Column, TableNode, SchemaEnum, SchemaFunction, Toast, Project, AuditReport, CompilerReport, SupabaseBaseline } from "@/lib/types";
+import type { Column, TableNode, SchemaEnum, SchemaFunction, Toast, Project, AuditReport, CompilerReport, SupabaseBaseline, DDLPatch } from "@/lib/types";
 
 // ─── Constants ──────────────────────────────────────────
 const COLUMN_TYPES = ["uuid", "varchar", "int", "timestamp", "boolean", "numeric", "text", "jsonb", "decimal", "float"];
@@ -125,6 +125,38 @@ function analyzeMigrationRisks(sql: string): string[] {
   if (/\bALTER\s+COLUMN\b[\s\S]*?\bTYPE\b/i.test(sql)) risks.push("Alters a column type and may require casts/backfills");
   if (/\bCASCADE\b/i.test(sql)) risks.push("Uses CASCADE and may affect dependent objects");
   return [...new Set(risks)];
+}
+
+function cleanSqlFence(sql: string): string {
+  return sql.replace(/```sql\n?/gi, "").replace(/```\n?/g, "").trim();
+}
+
+function buildDdlPatchSql(patches: DDLPatch[]): string {
+  const pending = patches.filter(p => p.status === "pending" && p.sql.trim());
+  if (pending.length === 0) return "";
+
+  return [
+    "-- Pending DDL patches",
+    ...pending.flatMap((patch) => [
+      "",
+      `-- ${patch.title}`,
+      ...(patch.description ? [`-- ${patch.description}`] : []),
+      cleanSqlFence(patch.sql),
+    ]),
+  ].join("\n").trim();
+}
+
+function appendDdlPatchSql(sql: string, patches: DDLPatch[]): string {
+  const patchSql = buildDdlPatchSql(patches);
+  if (!patchSql) return sql.trim();
+  if (!sql.trim()) return patchSql;
+  return `${sql.trim()}\n\n${patchSql}`;
+}
+
+function ddlPatchSourceLabel(source: DDLPatch["source"]): string {
+  if (source === "ai-chat") return "AI Chat";
+  if (source === "batch-edit") return "Batch Edit";
+  return "Manual";
 }
 
 function mergeImportedTablesWithLayout(importedTables: TableNode[], currentTables: TableNode[]): TableNode[] {
@@ -1367,6 +1399,7 @@ const VibeDBPage = () => {
   const [currentProjectId, setCurrentProjectId] = useState<string | null>(null);
   const [projectName, setProjectName] = useState("Untitled Schema");
   const [supabaseBaseline, setSupabaseBaseline] = useState<SupabaseBaseline | null>(null);
+  const [ddlPatches, setDdlPatches] = useState<DDLPatch[]>([]);
   const [showProjectsPanel, setShowProjectsPanel] = useState(false);
   const [isSaving, setIsSaving] = useState(false);
   const [editingProjectName, setEditingProjectName] = useState(false);
@@ -1423,6 +1456,7 @@ const VibeDBPage = () => {
           if (full) {
             setCanvasItems(full.definition);
             setSupabaseBaseline(full.supabaseBaseline || null);
+            setDdlPatches(full.ddlPatches || []);
           }
         });
       }
@@ -1431,7 +1465,7 @@ const VibeDBPage = () => {
 
   // Auto-save current project when canvas changes (debounced)
   useEffect(() => {
-    if (!currentProjectId || canvasItems.length === 0) return;
+    if (!currentProjectId || (canvasItems.length === 0 && ddlPatches.length === 0)) return;
     if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
     saveTimerRef.current = setTimeout(async () => {
       await ProjectStorage.saveProject({
@@ -1439,6 +1473,7 @@ const VibeDBPage = () => {
         name: projectName,
         definition: canvasItems,
         supabaseBaseline: supabaseBaseline || undefined,
+        ddlPatches,
         updated_at: new Date().toISOString(),
         created_at: new Date().toISOString(),
       });
@@ -1449,7 +1484,7 @@ const VibeDBPage = () => {
       ));
     }, 2000);
     return () => { if (saveTimerRef.current) clearTimeout(saveTimerRef.current); };
-  }, [canvasItems, currentProjectId, projectName, supabaseBaseline]);
+  }, [canvasItems, currentProjectId, projectName, supabaseBaseline, ddlPatches]);
 
   const saveProject = useCallback(async () => {
     if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
@@ -1461,6 +1496,7 @@ const VibeDBPage = () => {
           name: projectName,
           definition: canvasItems,
           supabaseBaseline: supabaseBaseline || undefined,
+          ddlPatches,
           updated_at: new Date().toISOString(),
           created_at: new Date().toISOString(),
         });
@@ -1478,6 +1514,7 @@ const VibeDBPage = () => {
           name: projectName,
           definition: canvasItems,
           supabaseBaseline: supabaseBaseline || undefined,
+          ddlPatches,
           updated_at: now,
           created_at: now,
         });
@@ -1496,7 +1533,7 @@ const VibeDBPage = () => {
     } finally {
       setIsSaving(false);
     }
-  }, [currentProjectId, canvasItems, projectName, supabaseBaseline]);
+  }, [currentProjectId, canvasItems, projectName, supabaseBaseline, ddlPatches]);
 
   const loadProject = useCallback(async (project: Project) => {
     setCurrentProjectId(project.id);
@@ -1506,6 +1543,7 @@ const VibeDBPage = () => {
     const full = await ProjectStorage.getProject(project.id);
     setCanvasItems(full ? full.definition : project.definition);
     setSupabaseBaseline(full?.supabaseBaseline || null);
+    setDdlPatches(full?.ddlPatches || []);
     setSidebarItems([]);
     setShowProjectsPanel(false);
     addToast(`Opened "${project.name}"`, "info");
@@ -1517,6 +1555,7 @@ const VibeDBPage = () => {
     setProjectName("Untitled Schema");
     setCanvasItems([]);
     setSupabaseBaseline(null);
+    setDdlPatches([]);
     setSidebarItems([]);
     setShowProjectsPanel(false);
     addToast("New project created", "info");
@@ -1531,6 +1570,7 @@ const VibeDBPage = () => {
       setProjectName("Untitled Schema");
       setCanvasItems([]);
       setSupabaseBaseline(null);
+      setDdlPatches([]);
     }
     addToast("Project deleted", "success");
   }, [currentProjectId]);
@@ -1573,6 +1613,7 @@ const VibeDBPage = () => {
   const [batchPrompt, setBatchPrompt] = useState("");
   const [isBatchProcessing, setIsBatchProcessing] = useState(false);
   const [batchError, setBatchError] = useState<string | null>(null);
+  const [showDdlPatchesModal, setShowDdlPatchesModal] = useState(false);
   const [showAddTableMenu, setShowAddTableMenu] = useState(false);
   const [aiTablePrompt, setAiTablePrompt] = useState("");
   const [isAddingAiTable, setIsAddingAiTable] = useState(false);
@@ -1611,6 +1652,7 @@ const VibeDBPage = () => {
   const [showSyncReview, setShowSyncReview] = useState(false);
   const [syncSql, setSyncSql] = useState("");
   const [syncDiff, setSyncDiff] = useState<SchemaDiff | null>(null);
+  const [syncPatchIds, setSyncPatchIds] = useState<string[]>([]);
   const [isSyncing, setIsSyncing] = useState(false);
 
   // Schema Diff
@@ -1634,25 +1676,80 @@ const VibeDBPage = () => {
     setTimeout(() => setToasts(prev => prev.filter(t => t.id !== id)), 2500);
   }, []);
 
+  const addDdlPatch = useCallback((patch: { title?: string; description?: string; sql: string; source: DDLPatch["source"] }) => {
+    const sql = cleanSqlFence(patch.sql || "");
+    if (!sql) {
+      addToast("DDL patch is empty", "warning");
+      return null;
+    }
+
+    const next: DDLPatch = {
+      id: uuidv4(),
+      title: patch.title?.trim() || "DDL patch",
+      description: patch.description?.trim() || undefined,
+      sql,
+      source: patch.source,
+      status: "pending",
+      warnings: analyzeMigrationRisks(sql),
+      createdAt: new Date().toISOString(),
+    };
+
+    setDdlPatches(prev => [next, ...prev]);
+    return next;
+  }, [addToast]);
+
+  const updateDdlPatch = useCallback((id: string, updates: Partial<Pick<DDLPatch, "title" | "description" | "sql">>) => {
+    setDdlPatches(prev => prev.map(patch => {
+      if (patch.id !== id) return patch;
+      const sql = updates.sql !== undefined ? cleanSqlFence(updates.sql) : patch.sql;
+      return {
+        ...patch,
+        ...updates,
+        sql,
+        warnings: analyzeMigrationRisks(sql),
+      };
+    }));
+  }, []);
+
+  const removeDdlPatch = useCallback((id: string) => {
+    setDdlPatches(prev => prev.filter(patch => patch.id !== id));
+  }, []);
+
+  const markDdlPatchesApplied = useCallback((ids: string[]) => {
+    const idSet = new Set(ids);
+    const appliedAt = new Date().toISOString();
+    setDdlPatches(prev => prev.map(patch => (
+      idSet.has(patch.id) ? { ...patch, status: "applied", appliedAt } : patch
+    )));
+  }, []);
+
   const supabaseSyncDiff = useMemo(
     () => supabaseBaseline ? computeSchemaDiff(supabaseBaseline.tables, canvasItems) : null,
     [supabaseBaseline, canvasItems]
   );
+  const pendingDdlPatches = useMemo(() => ddlPatches.filter(p => p.status === "pending"), [ddlPatches]);
+  const pendingDdlPatchCount = pendingDdlPatches.length;
+  const hasPendingDdlPatches = pendingDdlPatchCount > 0;
   const hasSupabaseBaseline = !!supabaseBaseline;
   const hasSupabaseSyncChanges = hasSchemaDiffChanges(supabaseSyncDiff);
+  const hasSupabaseSyncWork = hasSupabaseSyncChanges || hasPendingDdlPatches;
   const supabaseSyncChangeCount = countSchemaDiffChanges(supabaseSyncDiff);
   const syncReviewSummary = useMemo(() => summarizeSchemaDiff(syncDiff), [syncDiff]);
   const syncReviewRisks = useMemo(() => analyzeMigrationRisks(syncSql), [syncSql]);
+  const syncReviewPatches = useMemo(
+    () => ddlPatches.filter(patch => syncPatchIds.includes(patch.id)),
+    [ddlPatches, syncPatchIds]
+  );
   const deployNavLabel = hasSupabaseBaseline
     ? deployConnected
-      ? hasSupabaseSyncChanges ? "Sync" : "Synced"
+      ? hasSupabaseSyncWork ? "Sync" : "Synced"
       : "Connect & Sync"
     : deployConnected ? "Deploy" : "Connect & Deploy";
   const deployModalTitle = hasSupabaseBaseline ? "Sync to Supabase" : "Deploy to Supabase";
   const deployPrimaryLabel = hasSupabaseBaseline
     ? isSyncing
       ? "Syncing..."
-      : hasSupabaseSyncChanges ? "Review Sync" : "Synced"
+      : hasSupabaseSyncWork ? "Review Sync" : "Synced"
     : isDeploying ? "Deploying..." : deployFixResult ? "Re-deploy Fixed Schema" : "Deploy Schema";
 
   // Track whether we're in the middle of a normalization import
@@ -1672,6 +1769,7 @@ const VibeDBPage = () => {
       if (e.key === "Escape") {
         setShowSqlModal(false); setShowPlayground(false); setEditingTable(null);
         setShowImportModal(false); setShowAuditModal(false); setShowBatchModal(false);
+        setShowDdlPatchesModal(false);
         setShowAddTableMenu(false); setShowExportMenu(false); setShowMockDataModal(false);
         setConnectionMode(null); setEditingColumn(null); setShowDiff(false);
         setShowDeployModal(false); setShowChatPanel(false);
@@ -1950,13 +2048,15 @@ const VibeDBPage = () => {
   const handleCompileSQL = () => {
     if (canvasItems.length === 0) { addToast("Add tables first", "error"); return; }
     // If we have AI-generated normalized SQL, show that; otherwise generate from canvas
+    let sql: string;
     if (normalizedSQL) {
-      setGeneratedSql(normalizedSQL);
+      sql = normalizedSQL;
     } else {
       // Always run through the deterministic compiler before generating SQL
       const compiledAst = runCompilerPass(canvasItems).tables;
-      setGeneratedSql(generateSQL(compiledAst));
+      sql = generateSQL(compiledAst);
     }
+    setGeneratedSql(appendDdlPatchSql(sql, pendingDdlPatches));
     setShowSqlModal(true);
   };
 
@@ -2007,7 +2107,7 @@ const VibeDBPage = () => {
         case "csv": content = generateCSV(compiledAst); filename = "schema.csv"; break;
         case "zod": content = generateZodSchema(compiledAst); filename = "schema.zod.ts"; break;
         case "docs": content = generateDataDictionary(compiledAst); filename = "schema-docs.md"; break;
-        case "sql": default: content = generateSQL(compiledAst); filename = "schema.sql"; break;
+        case "sql": default: content = appendDdlPatchSql(generateSQL(compiledAst), pendingDdlPatches); filename = "schema.sql"; break;
       }
       const blob = new Blob([content], { type: "text/plain" });
       const url = URL.createObjectURL(blob);
@@ -2098,6 +2198,9 @@ const VibeDBPage = () => {
         if (lastResult.success) {
           const healMsg = attempts > 1 ? ` (auto-healed after ${attempts - 1} fix${attempts > 2 ? "es" : ""})` : "";
           addToast(`Schema deployed successfully${healMsg}!`, "success");
+          if (pendingDdlPatches.length > 0) {
+            markDdlPatchesApplied(pendingDdlPatches.map(patch => patch.id));
+          }
 
           // Self-Healing Telemetry
           if (deployFixResult && deployFixResult.initialErrors && deployFixResult.initialErrors.length > 0) {
@@ -2178,6 +2281,10 @@ const VibeDBPage = () => {
     }
     const insertCount = (sqlToRun.match(/INSERT INTO/gi) || []).length;
     console.log("[VibeDB Deploy] INSERT count:", insertCount, "| Tables with dataRows:", itemsToDeploy.filter(t => t.dataRows && t.dataRows.length > 0).map(t => `${t.name}(${t.dataRows!.length} rows)`).join(", ") || "none");
+    sqlToRun = appendDdlPatchSql(sqlToRun, pendingDdlPatches);
+    if (pendingDdlPatches.length > 0) {
+      console.log("[VibeDB Deploy] Appending pending DDL patches:", pendingDdlPatches.length);
+    }
 
     return executeDeploySql(sqlToRun);
   };
@@ -2185,14 +2292,16 @@ const VibeDBPage = () => {
   const handleOpenSyncReview = () => {
     if (!supabaseBaseline) return;
     const diff = computeSchemaDiff(supabaseBaseline.tables, canvasItems);
+    const patchIds = pendingDdlPatches.map(patch => patch.id);
 
-    if (!hasSchemaDiffChanges(diff)) {
+    if (!hasSchemaDiffChanges(diff) && patchIds.length === 0) {
       addToast("Supabase schema is already synced", "success");
       return;
     }
 
     setSyncDiff(diff);
-    setSyncSql(generateMigrationSQL(diff));
+    setSyncSql(appendDdlPatchSql(hasSchemaDiffChanges(diff) ? generateMigrationSQL(diff) : "", pendingDdlPatches));
+    setSyncPatchIds(patchIds);
     setDeployFixResult(null);
     setDeployResults(null);
     setShowSyncReview(true);
@@ -2227,6 +2336,10 @@ const VibeDBPage = () => {
         return;
       }
 
+      if (syncPatchIds.length > 0) {
+        markDdlPatchesApplied(syncPatchIds);
+      }
+
       try {
         const liveTables = await introspectSupabaseSchema({
           url: supabaseBaseline.url,
@@ -2251,6 +2364,7 @@ const VibeDBPage = () => {
       setShowSyncReview(false);
       setSyncSql("");
       setSyncDiff(null);
+      setSyncPatchIds([]);
       addToast("Supabase schema synced", "success");
     } catch (e: unknown) {
       addToast("Sync failed: " + (e instanceof Error ? e.message : "Unknown error"), "error");
@@ -2708,6 +2822,15 @@ const VibeDBPage = () => {
           return [...prev, { name: fnName, body: fnBody }];
         });
         if (!silent) addToast(`Added function ${fnName}`, "success");
+      } else if (suggestion.type === "ddl_patch" || suggestion.type === "sql_patch") {
+        const sql = payload.sql || payload.body || payload.ddl || "";
+        const created = addDdlPatch({
+          title: payload.title || suggestion.description || suggestion.reason || "DDL patch",
+          description: payload.description || suggestion.reason,
+          sql,
+          source: "ai-chat",
+        });
+        if (created && !silent) addToast(`Added DDL patch: ${created.title}`, "success");
       } else {
         // Table mutation — use the pure function, then handshake + compile
         let compilerFixCount = 0;
@@ -2738,7 +2861,7 @@ const VibeDBPage = () => {
     setCanvasItems(prev => {
       let tables = prev;
       for (const s of suggestions) {
-        if (s.type !== "add_enum" && s.type !== "add_function") {
+        if (s.type !== "add_enum" && s.type !== "add_function" && s.type !== "ddl_patch" && s.type !== "sql_patch") {
           tables = applySuggestionToTables(tables, s);
         }
       }
@@ -2753,6 +2876,7 @@ const VibeDBPage = () => {
     // Apply non-table mutations
     const enumSuggestions = suggestions.filter(s => s.type === "add_enum");
     const fnSuggestions = suggestions.filter(s => s.type === "add_function");
+    const ddlPatchSuggestions = suggestions.filter(s => s.type === "ddl_patch" || s.type === "sql_patch");
     if (enumSuggestions.length) {
       setSchemaEnums(prev => {
         let enums = [...prev];
@@ -2775,6 +2899,15 @@ const VibeDBPage = () => {
           }
         }
         return fns;
+      });
+    }
+    for (const s of ddlPatchSuggestions) {
+      const p = s.payload || {};
+      addDdlPatch({
+        title: p.title || s.description || s.reason || "DDL patch",
+        description: p.description || s.reason,
+        sql: p.sql || p.body || p.ddl || "",
+        source: "ai-chat",
       });
     }
 
@@ -2802,12 +2935,18 @@ const VibeDBPage = () => {
 
       const resultStr = await callAI("batch-command", batchPrompt, compactSchema);
       const result = robustJsonParse(resultStr);
-      const changes = result?.changes || [];
+      const ddlPatchResults = (result?.ddlPatches || result?.ddl_patches || result?.patches || []) as Array<Record<string, unknown>>;
+      const changes = [
+        ...(result?.changes || []),
+        ...ddlPatchResults.map((patch) => ({ ...patch, action: typeof patch.action === "string" ? patch.action : "ddl_patch" })),
+        ...(result?.sql ? [{ action: "ddl_patch", title: result.title, description: result.description, sql: result.sql }] : []),
+      ];
       if (!changes.length) { setBatchError("No changes returned. Try rephrasing your command."); return; }
 
       // Collect non-table mutations to apply after the single setCanvasItems call
       const pendingEnums: { name: string; values: string[] }[] = [];
       const pendingFunctions: { name: string; body: string }[] = [];
+      const pendingDdlPatchInputs: { title?: string; description?: string; sql: string }[] = [];
 
       // Single atomic state update — all table mutations happen against the moving `tables` variable
       let applied = 0;
@@ -2922,6 +3061,19 @@ const VibeDBPage = () => {
                 if (fnBody) { pendingFunctions.push({ name: fnName, body: fnBody }); applied++; }
                 break;
               }
+              case "ddl_patch":
+              case "sql_patch": {
+                const sql = c.sql || c.body || c.ddl || "";
+                if (sql) {
+                  pendingDdlPatchInputs.push({
+                    title: c.title || c.name || "DDL patch",
+                    description: c.description || c.reason || batchPrompt,
+                    sql,
+                  });
+                  applied++;
+                }
+                break;
+              }
             }
           } catch { /* skip failed individual change */ }
         }
@@ -2948,6 +3100,11 @@ const VibeDBPage = () => {
           }
           return fns;
         });
+      }
+      if (pendingDdlPatchInputs.length) {
+        for (const patch of pendingDdlPatchInputs) {
+          addDdlPatch({ ...patch, source: "batch-edit" });
+        }
       }
 
       addToast(`Batch edit: ${applied} change${applied !== 1 ? "s" : ""} applied`, "success");
@@ -3457,6 +3614,13 @@ const VibeDBPage = () => {
         {expertMode && <button onClick={handleAutoLayout} className="flex items-center gap-1.5 rounded-lg bg-secondary px-3 py-1.5 text-xs font-semibold text-secondary-foreground hover:bg-secondary/80 transition"><LayoutTemplate size={14} /> Auto Layout</button>}
         <button onClick={() => setShowImportModal(true)} className="flex items-center gap-1.5 rounded-lg bg-secondary px-3 py-1.5 text-xs font-semibold text-secondary-foreground hover:bg-secondary/80 transition"><Upload size={14} /> Import</button>
         {expertMode && <button onClick={() => setShowBatchModal(true)} className="flex items-center gap-1.5 rounded-lg bg-secondary px-3 py-1.5 text-xs font-semibold text-secondary-foreground hover:bg-secondary/80 transition"><Edit3 size={14} /> Batch Edit</button>}
+        {(expertMode || hasPendingDdlPatches) && (
+          <button onClick={() => setShowDdlPatchesModal(true)} className={`flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-xs font-semibold transition ${hasPendingDdlPatches ? "bg-amber-500/10 text-amber-600 dark:text-amber-400 hover:bg-amber-500/20" : "bg-secondary text-secondary-foreground hover:bg-secondary/80"}`}>
+            <FileText size={14} />
+            DDL
+            {hasPendingDdlPatches && <span className="rounded-full bg-amber-500 px-1.5 py-0.5 text-[9px] font-bold text-white">{pendingDdlPatchCount}</span>}
+          </button>
+        )}
         {expertMode && <button onClick={handleAudit} className="flex items-center gap-1.5 rounded-lg bg-secondary px-3 py-1.5 text-xs font-semibold text-secondary-foreground hover:bg-secondary/80 transition">
           {isAuditing ? <Loader2 size={14} className="animate-spin" /> : <ShieldCheck size={14} />} Audit
         </button>}
@@ -3996,6 +4160,81 @@ const VibeDBPage = () => {
         )}
       </AnimatePresence>
 
+      {/* DDL Patch Ledger Modal */}
+      <AnimatePresence>
+        {showDdlPatchesModal && (
+          <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} className="fixed inset-0 z-[70] flex items-center justify-center bg-foreground/20 backdrop-blur-sm" onClick={() => setShowDdlPatchesModal(false)}>
+            <motion.div initial={{ scale: 0.95, y: 12 }} animate={{ scale: 1, y: 0 }} exit={{ scale: 0.95, y: 12 }} className="mx-4 flex max-h-[86vh] w-full max-w-4xl flex-col overflow-hidden rounded-2xl bg-card shadow-xl border border-border" onClick={e => e.stopPropagation()}>
+              <div className="flex items-center justify-between border-b border-border px-5 py-4 shrink-0">
+                <div>
+                  <h2 className="text-lg font-bold flex items-center gap-2"><FileText size={18} /> DDL Patches</h2>
+                  <p className="text-[11px] text-muted-foreground">
+                    {pendingDdlPatchCount} pending · {ddlPatches.filter(p => p.status === "applied").length} applied
+                  </p>
+                </div>
+                <button onClick={() => setShowDdlPatchesModal(false)} className="flex h-8 w-8 items-center justify-center rounded-lg bg-secondary"><X size={16} /></button>
+              </div>
+
+              <div className="flex-1 overflow-y-auto p-4 space-y-3 custom-scrollbar">
+                {ddlPatches.length === 0 ? (
+                  <div className="rounded-xl border border-dashed border-border p-8 text-center">
+                    <FileText size={22} className="mx-auto mb-2 text-muted-foreground" />
+                    <p className="text-sm font-semibold">No DDL patches</p>
+                    <p className="mt-1 text-xs text-muted-foreground">AI Chat and Batch Edit will add raw SQL patches here when schema JSON is not expressive enough.</p>
+                  </div>
+                ) : (
+                  ddlPatches.map((patch) => (
+                    <div key={patch.id} className={`rounded-xl border p-3 ${patch.status === "pending" ? "border-border bg-background" : "border-border/60 bg-secondary/20 opacity-80"}`}>
+                      <div className="mb-3 flex items-start gap-3">
+                        <div className="flex-1 min-w-0">
+                          <input
+                            value={patch.title}
+                            onChange={e => updateDdlPatch(patch.id, { title: e.target.value })}
+                            disabled={patch.status === "applied"}
+                            className="w-full bg-transparent text-sm font-bold outline-none disabled:opacity-80"
+                          />
+                          <div className="mt-1 flex flex-wrap items-center gap-1.5">
+                            <span className="rounded-md bg-secondary px-2 py-0.5 text-[10px] font-semibold text-muted-foreground">{ddlPatchSourceLabel(patch.source)}</span>
+                            <span className={`rounded-md px-2 py-0.5 text-[10px] font-semibold ${patch.status === "pending" ? "bg-amber-500/10 text-amber-600 dark:text-amber-400" : "bg-accent/10 text-accent"}`}>
+                              {patch.status === "pending" ? "Pending" : "Applied"}
+                            </span>
+                            {patch.warnings.map(warning => (
+                              <span key={warning} className="rounded-md bg-destructive/10 px-2 py-0.5 text-[10px] font-semibold text-destructive">{warning}</span>
+                            ))}
+                          </div>
+                        </div>
+                        <div className="flex items-center gap-1">
+                          {patch.status === "pending" && (
+                            <button onClick={() => markDdlPatchesApplied([patch.id])} className="flex items-center gap-1 rounded-lg bg-accent/10 px-2 py-1 text-[10px] font-semibold text-accent hover:bg-accent/20">
+                              <CheckCircle2 size={11} /> Mark Applied
+                            </button>
+                          )}
+                          <button onClick={() => removeDdlPatch(patch.id)} className="flex h-7 w-7 items-center justify-center rounded-lg bg-secondary text-muted-foreground hover:text-destructive">
+                            <Trash2 size={12} />
+                          </button>
+                        </div>
+                      </div>
+                      <textarea
+                        value={patch.sql}
+                        onChange={e => updateDdlPatch(patch.id, { sql: e.target.value })}
+                        readOnly={patch.status === "applied"}
+                        spellCheck={false}
+                        className="min-h-[150px] w-full resize-y rounded-lg border border-border bg-card p-3 font-mono text-xs leading-relaxed outline-none focus:border-primary read-only:opacity-80"
+                      />
+                    </div>
+                  ))
+                )}
+              </div>
+
+              <div className="flex items-center justify-between border-t border-border px-5 py-3 shrink-0">
+                <p className="text-[11px] text-muted-foreground">Pending patches are appended to SQL export, deploy, and Supabase sync review.</p>
+                <button onClick={() => setShowDdlPatchesModal(false)} className="rounded-lg bg-secondary px-4 py-2 text-sm font-semibold hover:bg-secondary/80">Close</button>
+              </div>
+            </motion.div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
       {/* Mock Data Modal */}
       <MockDataModal
         open={showMockDataModal}
@@ -4084,10 +4323,23 @@ const VibeDBPage = () => {
                           <AlertCircle size={12} className="inline mr-1" />
                           {hasSupabaseSyncChanges
                             ? `${supabaseSyncChangeCount} pending schema change${supabaseSyncChangeCount !== 1 ? "s" : ""} will be reviewed as migration SQL before execution.`
-                            : "No pending schema changes. The imported Supabase baseline matches the canvas."}
+                            : hasPendingDdlPatches
+                              ? `${pendingDdlPatchCount} pending DDL patch${pendingDdlPatchCount !== 1 ? "es" : ""} will be included in the reviewed SQL.`
+                              : "No pending schema changes. The imported Supabase baseline matches the canvas."}
                         </p>
                       ) : (
                         <p className="text-xs text-muted-foreground"><AlertCircle size={12} className="inline mr-1" />This will run CREATE TABLE statements. Existing tables with the same name may cause errors.</p>
+                      )}
+                      {hasPendingDdlPatches && (
+                        <div className="flex items-center justify-between rounded-lg border border-amber-500/25 bg-amber-500/10 px-3 py-2">
+                          <div className="flex items-center gap-2 text-xs text-amber-700 dark:text-amber-300">
+                            <FileText size={13} />
+                            {pendingDdlPatchCount} pending DDL patch{pendingDdlPatchCount !== 1 ? "es" : ""} will run after schema SQL.
+                          </div>
+                          <button onClick={() => setShowDdlPatchesModal(true)} className="text-[10px] font-bold text-amber-700 underline underline-offset-2 dark:text-amber-300">
+                            Review
+                          </button>
+                        </div>
                       )}
                     </div>
                   )}
@@ -4132,11 +4384,11 @@ $$ LANGUAGE plpgsql SECURITY DEFINER;`}</pre>
                       <div className="flex items-center justify-center gap-2">
                         <button
                           onClick={handlePrimaryDeployAction}
-                          disabled={isDeploying || isSyncing || (hasSupabaseBaseline && !hasSupabaseSyncChanges)}
+                          disabled={isDeploying || isSyncing || (hasSupabaseBaseline && !hasSupabaseSyncWork)}
                           className="flex items-center gap-2 rounded-lg bg-secondary px-3 py-1.5 text-xs font-semibold hover:bg-secondary/80 transition"
                         >
                           {isDeploying || isSyncing ? <Loader2 size={12} className="animate-spin" /> : <RefreshCw size={12} />}
-                          {hasSupabaseBaseline ? hasSupabaseSyncChanges ? "Review Sync" : "Synced" : "Re-deploy"}
+                          {hasSupabaseBaseline ? hasSupabaseSyncWork ? "Review Sync" : "Synced" : "Re-deploy"}
                         </button>
                         <button
                           onClick={handleImportRows}
@@ -4221,7 +4473,7 @@ $$ LANGUAGE plpgsql SECURITY DEFINER;`}</pre>
                     </button>
                     <button
                       onClick={handlePrimaryDeployAction}
-                      disabled={isDeploying || isSyncing || canvasItems.length === 0 || (hasSupabaseBaseline && !hasSupabaseSyncChanges)}
+                      disabled={isDeploying || isSyncing || canvasItems.length === 0 || (hasSupabaseBaseline && !hasSupabaseSyncWork)}
                       className="flex items-center gap-2 rounded-lg bg-accent px-4 py-2 text-sm font-semibold text-accent-foreground disabled:opacity-50"
                     >
                       {isDeploying || isSyncing ? <Loader2 size={14} className="animate-spin" /> : <Rocket size={14} />}
@@ -4275,6 +4527,25 @@ $$ LANGUAGE plpgsql SECURITY DEFINER;`}</pre>
                         </div>
                       )}
                     </div>
+
+                    {syncReviewPatches.length > 0 && (
+                      <div>
+                        <div className="mb-2 text-[10px] font-bold uppercase tracking-wider text-muted-foreground">DDL Patches</div>
+                        <div className="space-y-1.5">
+                          {syncReviewPatches.map((patch) => (
+                            <div key={patch.id} className="rounded-lg border border-border bg-card px-3 py-2">
+                              <div className="flex items-center gap-2 text-xs font-semibold">
+                                <FileText size={12} className="text-amber-500" />
+                                <span>{patch.title}</span>
+                              </div>
+                              {patch.warnings.length > 0 && (
+                                <div className="mt-1 text-[10px] text-destructive">{patch.warnings.join(", ")}</div>
+                              )}
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    )}
 
                     {syncReviewRisks.length > 0 && (
                       <div className="rounded-lg border border-destructive/30 bg-destructive/10 p-3">
@@ -4427,6 +4698,10 @@ $$ LANGUAGE plpgsql SECURITY DEFINER;`}</pre>
         onAddEnum={(e) => setSchemaEnums(prev => prev.some(x => x.name === e.name) ? prev : [...prev, e])}
         onAddFunction={(f) => setSchemaFunctions(prev => prev.some(x => x.name === f.name) ? prev : [...prev, f])}
         onApplySuggestion={handleApplySuggestion}
+        onCreateDdlPatch={(patch) => {
+          const created = addDdlPatch({ ...patch, source: "ai-chat" });
+          if (created) addToast(`Added DDL patch: ${created.title}`, "success");
+        }}
       />
 
       {/* Toasts */}

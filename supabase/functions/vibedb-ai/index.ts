@@ -293,6 +293,7 @@ Each change must have an "action" field. Supported actions and their formats:
 - {"action":"add_constraint","targetTable":"orders","name":"chk_order_side","expression":"side IN ('buy', 'sell')"}
 - {"action":"add_enum","name":"order_side","values":["buy","sell","cancel"]}
 - {"action":"add_function","name":"update_updated_at","body":"CREATE OR REPLACE FUNCTION update_updated_at() RETURNS TRIGGER AS $$ BEGIN NEW.updated_at = NOW(); RETURN NEW; END; $$ LANGUAGE plpgsql;"}
+- {"action":"ddl_patch","title":"Add tenant RLS policies","description":"Raw SQL for database objects outside the visual schema model","sql":"ALTER TABLE projects ENABLE ROW LEVEL SECURITY; CREATE POLICY ...;"}
 
 Rules:
 - Apply the command to ALL relevant tables. If they say "add X to all tables", emit one add_column per table.
@@ -302,6 +303,8 @@ Rules:
 - For add_constraint: include CHECK expression without the CHECK keyword or outer parens.
 - For add_enum: name is the type name, values is a string array.
 - For add_function: body is the full CREATE OR REPLACE FUNCTION statement.
+- Use ddl_patch for edge cases that cannot be represented safely in schema JSON: RLS policies, triggers, views, grants, extensions, generated columns, expression indexes, data backfills, preserving table/column renames with ALTER ... RENAME, or complex ALTER COLUMN TYPE ... USING migrations.
+- Do NOT force raw SQL edge cases into add_column/remove_column/change_type if that would lose data or intent.
 - Return ONLY the changes needed. Do NOT return unchanged tables.
 - Keep it compact to avoid truncation.`;
       userPrompt = `Current Schema:\n${context}\n\nCommand: ${prompt}`;
@@ -345,12 +348,15 @@ Suggestion types and payload formats:
 - add_constraint: {"action":"add_constraint","targetTable":"...","name":"chk_...","expression":"quantity > 0"}
 - add_enum: {"action":"add_enum","name":"order_status","values":["pending","filled","cancelled"]}
 - add_function: {"action":"add_function","name":"fn_name","body":"CREATE OR REPLACE FUNCTION ..."}
+- ddl_patch: {"action":"ddl_patch","title":"Add tenant RLS policies","description":"Raw SQL for objects outside schema JSON","sql":"ALTER TABLE projects ENABLE ROW LEVEL SECURITY; CREATE POLICY ...;"}
 - remove_column: {"action":"remove_column","targetTable":"...","column":"..."}
 - remove_table: {"action":"remove_table","targetTable":"..."}
 
 Column types: uuid, varchar, int, timestamp, boolean, numeric, text, jsonb, decimal, float, or custom enum type names.
 Constraint types: primary, notNull, unique, default (with value).
 For add_table, always include id (uuid, primary), created_at, updated_at columns.
+Use ddl_patch for edge cases that cannot be represented safely in schema JSON: RLS policies, triggers, views, grants, extensions, generated columns, expression indexes, data backfills, preserving table/column renames with ALTER ... RENAME, or complex ALTER COLUMN TYPE ... USING migrations.
+Do NOT force raw SQL edge cases into add_column/remove_column/change_type if that would lose data or intent.
 Use double quotes for all JSON strings.`;
       userPrompt = context ? `Current Schema:\n${context}\n\nConversation:\n${prompt}` : prompt;
     } else if (type === "normalize-csv") {
