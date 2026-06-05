@@ -8,8 +8,30 @@ export interface StoredProject {
   functions?: SchemaFunction[];
   supabaseBaseline?: SupabaseBaseline;
   ddlPatches?: DDLPatch[];
+  schemaVersion: number;
   updated_at: string;
   created_at: string;
+}
+
+// Version of the persisted project envelope. Bump when the stored IR shape
+// changes and add a matching case to migrateStoredProject below. This is
+// independent of the IndexedDB DB_VERSION (which versions the object store,
+// not the record shape).
+export const CURRENT_SCHEMA_VERSION = 1;
+
+// Upgrade a raw persisted record to the current schema version before it is
+// handed to callers. v1 is a pass-through; future shape changes add cases.
+export function migrateStoredProject(raw: any): StoredProject {
+  const v = raw?.schemaVersion ?? 0;
+  const p = raw;
+  switch (v) {
+    case 0:
+      // v0 (unversioned) → v1: no IR shape change, only the version stamp.
+      // Future shape changes: switch `p` to `let`, transform it here
+      // (e.g. p = upgrade0to1(p)), then fall through to later cases.
+      break;
+  }
+  return { ...p, schemaVersion: CURRENT_SCHEMA_VERSION };
 }
 
 // Lightweight metadata stored in localStorage for fast sync listing
@@ -140,18 +162,18 @@ export const ProjectStorage = {
     await migrateFromLocalStorage();
     try {
       const project = await dbGet(id);
-      return project || null;
+      return project ? migrateStoredProject(project) : null;
     } catch {
       return null;
     }
   },
 
   // ASYNC — writes to both localStorage index + IndexedDB
-  async saveProject(project: StoredProject): Promise<void> {
+  async saveProject(project: Omit<StoredProject, "schemaVersion">): Promise<void> {
     await migrateFromLocalStorage();
 
     // Write full project (with dataRows) to IndexedDB
-    await dbPut({ ...project, updated_at: new Date().toISOString() });
+    await dbPut({ ...project, schemaVersion: CURRENT_SCHEMA_VERSION, updated_at: new Date().toISOString() });
 
     // Update lightweight index in localStorage
     const index = readIndex();
@@ -209,7 +231,7 @@ export const ProjectStorage = {
 
   // ASYNC
   async importProject(json: string): Promise<StoredProject> {
-    const project = JSON.parse(json) as StoredProject;
+    const project = migrateStoredProject(JSON.parse(json));
     if (!project.id || !project.name || !Array.isArray(project.definition)) {
       throw new Error("Invalid project format");
     }

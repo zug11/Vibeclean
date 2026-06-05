@@ -39,7 +39,7 @@ import {
 } from "@/components/vibedb/ExportGenerators";
 
 // ─── Types ──────────────────────────────────────────────
-import type { Column, TableNode, SchemaEnum, SchemaFunction, Toast, Project, AuditReport, CompilerReport, SupabaseBaseline, DDLPatch } from "@/lib/types";
+import type { Column, TableNode, SchemaEnum, SchemaFunction, Toast, Project, AuditReport, CompilerReport, SupabaseBaseline, DDLPatch, SuggestionPayload } from "@/lib/types";
 
 // ─── Constants ──────────────────────────────────────────
 const COLUMN_TYPES = ["uuid", "varchar", "int", "timestamp", "boolean", "numeric", "text", "jsonb", "decimal", "float"];
@@ -2901,7 +2901,7 @@ const VibeDBPage = () => {
       setSchemaEnums(prev => {
         let enums = [...prev];
         for (const s of enumSuggestions) {
-          const p = s.payload || {};
+          const p: SuggestionPayload = s.payload || {};
           if (p.name && p.values?.length && !enums.some(e => e.name.toLowerCase() === p.name.toLowerCase())) {
             enums = [...enums, { name: p.name, values: p.values }];
           }
@@ -2913,7 +2913,7 @@ const VibeDBPage = () => {
       setSchemaFunctions(prev => {
         let fns = [...prev];
         for (const s of fnSuggestions) {
-          const p = s.payload || {};
+          const p: SuggestionPayload = s.payload || {};
           if (p.body && !fns.some(f => f.name.toLowerCase() === (p.name || "").toLowerCase())) {
             fns = [...fns, { name: p.name || "", body: p.body }];
           }
@@ -2922,7 +2922,7 @@ const VibeDBPage = () => {
       });
     }
     for (const s of ddlPatchSuggestions) {
-      const p = s.payload || {};
+      const p: SuggestionPayload = s.payload || {};
       addDdlPatch({
         title: p.title || s.description || s.reason || "DDL patch",
         description: p.description || s.reason,

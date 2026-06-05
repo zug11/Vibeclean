@@ -68,10 +68,23 @@ export interface Project {
   updated_at: string;
 }
 
+// Payload carried by an AI audit suggestion. All fields optional — which ones
+// are present depends on the suggestion `type` (add_enum, add_function,
+// ddl_patch/sql_patch, …). Narrow before access.
+export interface SuggestionPayload {
+  name?: string;
+  values?: string[];
+  body?: string;
+  sql?: string;
+  ddl?: string;
+  title?: string;
+  description?: string;
+}
+
 export interface AuditReport {
   score?: number;
   issues?: { severity: string; message: string }[];
-  suggestions?: { type: string; target_table?: string; payload?: unknown; reason: string; description?: string }[];
+  suggestions?: { type: string; target_table?: string; payload?: SuggestionPayload; reason: string; description?: string }[];
   lintIssues?: { type: string; severity: string; message: string }[];
   fkIssues?: { type: string; severity: string; message: string }[];
   strengths?: string[];

@@ -32,6 +32,12 @@ interface OpenAPIProperty {
   $ref?: string;
 }
 
+// A single HTTP method entry under paths[route][method] in a PostgREST OpenAPI spec.
+interface OpenAPIPathMethod {
+  parameters?: unknown[];
+  responses?: Record<string, unknown>;
+}
+
 // Introspect a Supabase project's schema via the REST API
 export async function introspectSupabaseSchema(project: SupabaseProject): Promise<TableNode[]> {
   // Fetch the OpenAPI spec from PostgREST
