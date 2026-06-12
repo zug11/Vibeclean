@@ -2090,6 +2090,8 @@ const VibeDBPage = () => {
         setCanvasItems(prev => {
           return resolveCanvasFKsBidirectional(prev, compiled);
         });
+        // Auto layout once the new tables (with resolved FKs) are on the canvas
+        setTimeout(() => setCanvasItems(prev => runForceLayout(prev)), 100);
         tracker.complete();
         const fixCount = cReport.actions.length;
         const batchNote = continuationCount > 0 ? ` across ${continuationCount + 1} batches` : "";
