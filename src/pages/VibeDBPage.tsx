@@ -1561,8 +1561,17 @@ const VibeDBPage = () => {
       id: s.id,
       name: s.name || "Untitled Schema",
       definition: [], // lightweight list — full data loaded on demand from IndexedDB
+      tableCount: s.tableCount,
       updated_at: s.updated_at,
     })));
+    // Projects saved before tableCount existed in the index: read their real
+    // counts from IndexedDB once and persist them.
+    ProjectStorage.backfillTableCounts().then(updated => {
+      const counts = new Map(updated.map(m => [m.id, m.tableCount]));
+      setProjects(prev => prev.map(p =>
+        p.tableCount == null && counts.get(p.id) != null ? { ...p, tableCount: counts.get(p.id) } : p
+      ));
+    });
     const lastProjectId = ProjectStorage.getCurrentProjectId();
     if (lastProjectId) {
       const meta = metas.find(p => p.id === lastProjectId);
@@ -1597,7 +1606,7 @@ const VibeDBPage = () => {
       });
       setProjects(prev => prev.map(p =>
         p.id === currentProjectId
-          ? { ...p, definition: canvasItems, name: projectName, updated_at: new Date().toISOString() }
+          ? { ...p, definition: canvasItems, tableCount: canvasItems.length, name: projectName, updated_at: new Date().toISOString() }
           : p
       ));
     }, 2000);
@@ -1620,7 +1629,7 @@ const VibeDBPage = () => {
         });
         setProjects(prev => prev.map(p =>
           p.id === currentProjectId
-            ? { ...p, definition: canvasItems, name: projectName, updated_at: new Date().toISOString() }
+            ? { ...p, definition: canvasItems, tableCount: canvasItems.length, name: projectName, updated_at: new Date().toISOString() }
             : p
         ));
         addToast("Project saved", "success");
@@ -1642,6 +1651,7 @@ const VibeDBPage = () => {
           id: newId,
           name: projectName,
           definition: canvasItems,
+          tableCount: canvasItems.length,
           updated_at: now,
         }, ...prev]);
         addToast("Project created", "success");
@@ -3888,7 +3898,7 @@ const VibeDBPage = () => {
                     </button>
                   </div>
                   <div className="text-[10px] text-muted-foreground mt-1">
-                    {Array.isArray(project.definition) ? project.definition.length : 0} tables · {new Date(project.updated_at).toLocaleDateString()}
+                    {project.tableCount ?? (Array.isArray(project.definition) ? project.definition.length : 0)} tables · {new Date(project.updated_at).toLocaleDateString()}
                   </div>
                 </div>
               ))}

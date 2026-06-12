@@ -63,6 +63,9 @@ export interface Project {
   id: string;
   name: string;
   definition: TableNode[];
+  // Table count for list display — the list keeps definition empty until a
+  // project is opened, so the count is carried separately from the index.
+  tableCount?: number;
   supabaseBaseline?: SupabaseBaseline;
   ddlPatches?: DDLPatch[];
   updated_at: string;

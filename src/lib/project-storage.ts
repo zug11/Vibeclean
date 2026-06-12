@@ -13,11 +13,12 @@ export interface StoredProject {
 }
 
 // Lightweight metadata stored in localStorage for fast sync listing
-interface ProjectMeta {
+export interface ProjectMeta {
   id: string;
   name: string;
   updated_at: string;
   created_at: string;
+  tableCount?: number; // shown in the project list without loading IndexedDB
 }
 
 const INDEX_KEY = "vibedb_project_index";
@@ -114,7 +115,7 @@ async function migrateFromLocalStorage(): Promise<void> {
     // Build index
     const index: ProjectMeta[] = oldProjects
       .filter(p => p.id && Array.isArray(p.definition))
-      .map(p => ({ id: p.id, name: p.name, updated_at: p.updated_at, created_at: p.created_at }));
+      .map(p => ({ id: p.id, name: p.name, updated_at: p.updated_at, created_at: p.created_at, tableCount: p.definition.length }));
     writeIndex(index);
 
     // Remove old localStorage data
@@ -160,6 +161,7 @@ export const ProjectStorage = {
       name: project.name,
       updated_at: new Date().toISOString(),
       created_at: project.created_at || new Date().toISOString(),
+      tableCount: Array.isArray(project.definition) ? project.definition.length : 0,
     };
     const existingIdx = index.findIndex(p => p.id === project.id);
     if (existingIdx >= 0) {
@@ -218,6 +220,29 @@ export const ProjectStorage = {
     project.updated_at = new Date().toISOString();
     await ProjectStorage.saveProject(project);
     return project;
+  },
+
+  // ASYNC — one-time backfill: index entries saved before tableCount existed
+  // get their count read from IndexedDB and persisted. Returns the updated
+  // index (same order as listProjects).
+  async backfillTableCounts(): Promise<ProjectMeta[]> {
+    await migrateFromLocalStorage();
+    const index = readIndex();
+    let changed = false;
+    for (const meta of index) {
+      if (typeof meta.tableCount === "number") continue;
+      try {
+        const full = await dbGet(meta.id);
+        meta.tableCount = Array.isArray(full?.definition) ? full!.definition.length : 0;
+        changed = true;
+      } catch {
+        // unreadable project — leave count undefined
+      }
+    }
+    if (changed) writeIndex(index);
+    return index.sort(
+      (a, b) => new Date(b.updated_at).getTime() - new Date(a.updated_at).getTime()
+    );
   },
 
   // Ensure migration runs on first access
