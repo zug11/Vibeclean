@@ -1886,12 +1886,25 @@ const VibeDBPage = () => {
       if (strategy === "v2-pipeline") {
         // Pipeline: Step 1 — entity extraction
         const entityPrompt = `Extract the core entities (tables) and their relationships from this requirement. Return JSON: { "entities": [...], "relationships": [...] }.\n\nRequirement: "${prompt}"`;
-        const entityStr = await callAI("generate-schema", entityPrompt, undefined, strategy);
-        const entityResult = robustJsonParse(entityStr);
+        const entityResponse = await callAIRaw("generate-schema", entityPrompt, undefined, strategy);
+        const entityResult = robustJsonParse(entityResponse.result);
         tracker.advanceStep();
 
-        // Pipeline: Step 2 — full schema design from entities (always use tables format)
-        if (entityResult?.entities) {
+        if (entityResult?.tables && Array.isArray(entityResult.tables) && entityResult.tables.length > 0) {
+          // The generate-schema system prompt forces {"tables":[...]} output, so the
+          // model often answers step 1 with a complete schema despite the entities
+          // user prompt. Use it directly — discarding it (the old behavior) was the
+          // pipeline-mode empty-canvas bug, and re-asking in step 2 is redundant.
+          generatedTables = convertAITablesToNodes(entityResult.tables);
+          tracker.advanceStep();
+
+          if (entityResponse.truncated && generatedTables.length > 0) {
+            const chainResult = await runContinuationChain(prompt, generatedTables, strategy, tracker);
+            generatedTables = chainResult.tables;
+            continuationCount = chainResult.continuationCount;
+          }
+        } else if (entityResult?.entities) {
+          // Pipeline: Step 2 — full schema design from entities (always use tables format)
           const entityNames = entityResult.entities.map((e: any) => e.name || e).join(", ");
           const schemaPrompt = `Design a full production-quality PostgreSQL schema for these entities: [${entityNames}].\nOriginal requirement: "${prompt}"\n\nIMPORTANT: Return JSON with {"tables":[...]} format. Do NOT return entities format.`;
           const schemaResponse = await callAIRaw("generate-schema", schemaPrompt, undefined, strategy);
