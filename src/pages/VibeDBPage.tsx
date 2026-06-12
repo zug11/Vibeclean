@@ -1305,12 +1305,29 @@ function runForceLayout(nodes: TableNode[]): TableNode[] {
     occupied.add(key(slot.col, slot.row));
   });
 
-  // Write final pixel positions: card centred within its grid cell.
-  newNodes.forEach(n => {
-    const { col, row } = cellOf.get(n.id)!;
-    const c = cellWorld(col, row);
-    n.x = c.x - TABLE_WIDTH / 2;
-    n.y = c.y - nodeH(n) / 2;
+  // Write final pixel positions. Horizontal: card centred in its column.
+  // Vertical: tables in a column are STACKED — each sits exactly V_GAP below
+  // the bottom of the one above, so spacing tracks each table's real height
+  // instead of the tallest card on the canvas (no huge gaps for short tables).
+  const byCol = new Map<number, { id: string; row: number }[]>();
+  cellOf.forEach((cell, id) => {
+    const list = byCol.get(cell.col) || [];
+    list.push({ id, row: cell.row });
+    byCol.set(cell.col, list);
+  });
+  byCol.forEach((list, col) => {
+    list.sort((a, b) => a.row - b.row);
+    const totalH = list.reduce((s, e) => s + nodeH(idToNode.get(e.id)!), 0) + V_GAP * (list.length - 1);
+    // Centre the stack on the column's average cell position so the overall
+    // cluster shape from the grid assignment is preserved.
+    const avgCellY = anchorY + (list.reduce((s, e) => s + e.row, 0) / list.length) * stepY;
+    let y = avgCellY - totalH / 2;
+    for (const e of list) {
+      const n = idToNode.get(e.id)!;
+      n.x = anchorX + col * stepX - TABLE_WIDTH / 2;
+      n.y = y;
+      y += nodeH(n) + V_GAP;
+    }
   });
 
   return newNodes;
