@@ -734,10 +734,13 @@ function fixSemanticConstraints(tables: TableNode[]): { tables: TableNode[]; act
 
     const fixedCols = t.columns.map(col => {
       if (!col.isForeignKey || !col.linkedTable || col.onDelete) return col;
+      // SET NULL is only valid on nullable columns — a NOT NULL FK with ON DELETE
+      // SET NULL fails at runtime the first time the parent row is deleted.
+      const isNotNull = col.constraints?.some(c => c.type === "notNull");
       let onDelete: "CASCADE" | "SET NULL" | "RESTRICT";
       if (isJunction) {
         onDelete = "CASCADE";
-      } else if (hasSoftDelete) {
+      } else if (hasSoftDelete && !isNotNull) {
         onDelete = "SET NULL";
       } else {
         onDelete = "RESTRICT";
@@ -745,7 +748,7 @@ function fixSemanticConstraints(tables: TableNode[]): { tables: TableNode[]; act
       actions.push({
         pass: "semantic-constraint",
         table: t.name,
-        description: `Set ${col.name} ON DELETE ${onDelete}${isJunction ? " (junction table)" : hasSoftDelete ? " (soft-delete table)" : ""}`,
+        description: `Set ${col.name} ON DELETE ${onDelete}${isJunction ? " (junction table)" : hasSoftDelete && !isNotNull ? " (soft-delete table)" : hasSoftDelete && isNotNull ? " (soft-delete table, but FK is NOT NULL)" : ""}`,
       });
       return { ...col, onDelete };
     });
