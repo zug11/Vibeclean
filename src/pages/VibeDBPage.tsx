@@ -1194,42 +1194,114 @@ async function callAI(type: string, prompt: string, context?: string, strategy?:
 }
 
 // ─── Force Layout ───────────────────────────────────────
+// Deterministic greedy grid layout.
+//   1. Sort tables by connection count (desc), ties broken by column count
+//      (desc) then id (asc) so the result is fully deterministic.
+//   2. Place them one at a time onto a uniform grid whose cell size is the
+//      widest card + gap by the tallest card + gap — so two cells can never
+//      overlap, regardless of card height.
+//   3. Each table goes into the nearest free cell to the centroid of its
+//      already-placed connected tables (spiral search outward), so connected
+//      tables cluster together. Disconnected tables pack near the centre of
+//      whatever is already on the canvas.
 function runForceLayout(nodes: TableNode[]): TableNode[] {
+  if (nodes.length === 0) return [];
   const newNodes: TableNode[] = JSON.parse(JSON.stringify(nodes));
-  const iterations = 150;
-  const repulsion = 2500;
-  const springLength = 140;
-  for (let i = 0; i < iterations; i++) {
-    newNodes.forEach(nodeA => {
-      let fx = 0, fy = 0;
-      newNodes.forEach(nodeB => {
-        if (nodeA.id === nodeB.id) return;
-        const dx = nodeA.x - nodeB.x;
-        const dy = nodeA.y - nodeB.y;
-        const distSq = dx * dx + dy * dy || 1;
-        const force = repulsion / Math.sqrt(distSq);
-        fx += (dx / Math.sqrt(distSq)) * force;
-        fy += (dy / Math.sqrt(distSq)) * force;
-      });
-      nodeA.columns.forEach(col => {
-        if (col.isForeignKey && col.linkedTableId) {
-          const target = newNodes.find(n => n.id === col.linkedTableId);
-          if (target) {
-            const dx = target.x - nodeA.x;
-            const dy = target.y - nodeA.y;
-            const dist = Math.sqrt(dx * dx + dy * dy) || 1;
-            const force = (dist - springLength) * 0.05;
-            fx += (dx / dist) * force;
-            fy += (dy / dist) * force;
-          }
-        }
-      });
-      fx += (0 - nodeA.x) * 0.02;
-      fy += (0 - nodeA.y) * 0.02;
-      nodeA.x += Math.max(Math.min(fx, 20), -20);
-      nodeA.y += Math.max(Math.min(fy, 20), -20);
+
+  const H_GAP = 100; // set horizontal gap between cards
+  const V_GAP = 48; // set vertical gap between cards
+  const nodeH = (n: TableNode) => HEADER_HEIGHT + n.columns.length * ROW_HEIGHT;
+
+  // Uniform cell: widest card + gap × tallest card + gap → cells never overlap.
+  const stepX = TABLE_WIDTH + H_GAP;
+  const stepY = Math.max(...newNodes.map(nodeH)) + V_GAP;
+
+  // Build the connection (neighbour) graph from FK columns, both directions.
+  const idToNode = new Map(newNodes.map(n => [n.id, n]));
+  const neighbours = new Map<string, Set<string>>(newNodes.map(n => [n.id, new Set<string>()]));
+  newNodes.forEach(n => {
+    n.columns.forEach(col => {
+      if (col.isForeignKey && col.linkedTableId && idToNode.has(col.linkedTableId)) {
+        neighbours.get(n.id)!.add(col.linkedTableId);
+        neighbours.get(col.linkedTableId)!.add(n.id);
+      }
     });
-  }
+  });
+
+  // Most-connected first; ties → more columns first; then id for stability.
+  const ordered = [...newNodes].sort((a, b) => {
+    const d = neighbours.get(b.id)!.size - neighbours.get(a.id)!.size;
+    if (d !== 0) return d;
+    const c = b.columns.length - a.columns.length;
+    if (c !== 0) return c;
+    return a.id.localeCompare(b.id);
+  });
+
+  const cellOf = new Map<string, { col: number; row: number }>();
+  const occupied = new Set<string>();
+  const key = (c: number, r: number) => `${c},${r}`;
+  const cellWorld = (c: number, r: number) => ({ x: c * stepX, y: r * stepY });
+
+  ordered.forEach((n, i) => {
+    if (i === 0) {
+      cellOf.set(n.id, { col: 0, row: 0 });
+      occupied.add(key(0, 0));
+      return;
+    }
+
+    // Anchor = centroid of placed connected neighbours, else of everything placed.
+    const placedNeighbours = [...neighbours.get(n.id)!].filter(id => cellOf.has(id));
+    const anchorSet = placedNeighbours.length
+      ? placedNeighbours.map(id => cellOf.get(id)!)
+      : [...cellOf.values()];
+    const aCol = Math.round(anchorSet.reduce((s, c) => s + c.col, 0) / anchorSet.length);
+    const aRow = Math.round(anchorSet.reduce((s, c) => s + c.row, 0) / anchorSet.length);
+
+    // Cost of a candidate cell = total distance to placed connected neighbours
+    // (or to the anchor itself when this table has none placed yet).
+    const targets = placedNeighbours.length
+      ? placedNeighbours.map(id => cellWorld(cellOf.get(id)!.col, cellOf.get(id)!.row))
+      : [cellWorld(aCol, aRow)];
+    const cost = (c: number, r: number) => {
+      const w = cellWorld(c, r);
+      return targets.reduce((s, t) => s + Math.hypot(w.x - t.x, w.y - t.y), 0);
+    };
+
+    // Spiral outward in square rings. Once a free cell is found, scan one extra
+    // ring too and keep the lowest Euclidean-cost cell — this rounds off the
+    // diamond corners so the whole layout fills a disk rather than a square.
+    let best: { col: number; row: number } | null = null;
+    let bestCost = Infinity;
+    let foundRing = -1;
+    for (let ring = 0; ring <= 256; ring++) {
+      for (let dc = -ring; dc <= ring; dc++) {
+        for (let dr = -ring; dr <= ring; dr++) {
+          if (Math.max(Math.abs(dc), Math.abs(dr)) !== ring) continue; // perimeter only
+          const c = aCol + dc, r = aRow + dr;
+          if (occupied.has(key(c, r))) continue;
+          const k = cost(c, r);
+          if (k < bestCost) { bestCost = k; best = { col: c, row: r }; }
+        }
+      }
+      if (best) {
+        if (foundRing === -1) foundRing = ring;
+        if (ring >= foundRing + 1) break; // one extra ring rounds the corners
+      }
+    }
+
+    const slot = best ?? { col: aCol, row: aRow };
+    cellOf.set(n.id, slot);
+    occupied.add(key(slot.col, slot.row));
+  });
+
+  // Write final pixel positions: card centred within its grid cell.
+  newNodes.forEach(n => {
+    const { col, row } = cellOf.get(n.id)!;
+    const c = cellWorld(col, row);
+    n.x = c.x - TABLE_WIDTH / 2;
+    n.y = c.y - nodeH(n) / 2;
+  });
+
   return newNodes;
 }
 
@@ -3396,6 +3468,10 @@ const VibeDBPage = () => {
 
   // ─── Render FK lines ──────────────────────────────────
   const connectionPaths = useMemo(() => {
+    // Centre of the whole layout — used to bulge stacked-table arcs outward.
+    const layoutCenterX = canvasItems.length
+      ? canvasItems.reduce((s, t) => s + t.x + TABLE_WIDTH / 2, 0) / canvasItems.length
+      : 0;
     return canvasItems.flatMap((sourceTable) =>
       sourceTable.columns.map((col, idx) => {
         if (!col.isForeignKey || (!col.linkedTableId && !col.linkedTable)) return null;
@@ -3417,17 +3493,32 @@ const VibeDBPage = () => {
         if (targetRowIndex === -1) targetRowIndex = 0;
         const targetRowY = targetTable.y + HEADER_HEIGHT + (targetRowIndex * ROW_HEIGHT) + (ROW_HEIGHT / 2);
 
-        const sourceCenter = sourceTable.x + TABLE_WIDTH / 2;
-        const targetCenter = targetTable.x + TABLE_WIDTH / 2;
-        const dx = Math.abs(targetCenter - sourceCenter);
-        const curvature = Math.max(80, dx * 0.4);
-        let startX: number, endX: number, cp1X: number, cp2X: number;
-        if (targetCenter > sourceCenter) {
-          startX = sourceTable.x + TABLE_WIDTH; endX = targetTable.x;
-          cp1X = startX + curvature; cp2X = endX - curvature;
+        const sourceLeft = sourceTable.x, sourceRight = sourceTable.x + TABLE_WIDTH;
+        const targetLeft = targetTable.x, targetRight = targetTable.x + TABLE_WIDTH;
+        const sourceCenter = sourceLeft + TABLE_WIDTH / 2;
+        const targetCenter = targetLeft + TABLE_WIDTH / 2;
+
+        // Anchor on the sides that face each other; the control-handle length is
+        // proportional to the real anchor distance (clamped), so closely-connected
+        // tables get a small, smooth curve and only distant ones arc more.
+        // startSide/endSide: +1 = right edge, -1 = left edge.
+        let startSide: number, endSide: number, startX: number, endX: number, cp1X: number, cp2X: number;
+        if (sourceTable.id === targetTable.id) {
+          // Self-reference: the only case that loops — a small arc off the right side.
+          startSide = 1; endSide = 1;
+          startX = sourceRight; endX = sourceRight;
+          const loop = 60;
+          cp1X = startX + loop; cp2X = endX + loop;
         } else {
-          startX = sourceTable.x; endX = targetTable.x + TABLE_WIDTH;
-          cp1X = startX - curvature; cp2X = endX + curvature;
+          const goesRight = targetCenter >= sourceCenter;
+          startSide = goesRight ? 1 : -1;
+          endSide = goesRight ? -1 : 1;
+          startX = goesRight ? sourceRight : sourceLeft;
+          endX = goesRight ? targetLeft : targetRight;
+          const dist = Math.hypot(targetCenter - sourceCenter, targetRowY - sourceRowY);
+          const h = Math.min(Math.max(dist * 0.35, 24), 160);
+          cp1X = startX + startSide * h;
+          cp2X = endX + endSide * h;
         }
         const pathD = `M ${startX} ${sourceRowY} C ${cp1X} ${sourceRowY}, ${cp2X} ${targetRowY}, ${endX} ${targetRowY}`;
 
@@ -3442,8 +3533,9 @@ const VibeDBPage = () => {
         );
         const srcLabel = isUnique ? "1" : "N";
         const tgtLabel = isJunction ? "N" : "1";
-        const goesRight = targetCenter > sourceCenter;
-        const labelDx = goesRight ? 16 : -16;
+        const srcLabelX = startX + startSide * 16;
+        const tgtLabelX = endX + endSide * 16;
+        const arrowApexDx = endSide * 10;
 
         return (
           <g key={`${sourceTable.id}-${col.name}-${idx}`}>
@@ -3452,12 +3544,12 @@ const VibeDBPage = () => {
             <circle cx={startX} cy={sourceRowY} r={width + 1.5} fill={stroke} fillOpacity={opacity} />
             <circle cx={endX} cy={targetRowY} r={width + 1.5} fill={stroke} fillOpacity={opacity} />
             <polygon
-              points={`${endX},${targetRowY - 5} ${endX + (goesRight ? -10 : 10)},${targetRowY} ${endX},${targetRowY + 5}`}
+              points={`${endX},${targetRowY - 5} ${endX + arrowApexDx},${targetRowY} ${endX},${targetRowY + 5}`}
               fill={stroke}
               fillOpacity={opacity}
             />
-            <text x={startX + labelDx} y={sourceRowY - 6} fontSize={9} fontFamily="monospace" fill={stroke} fillOpacity={opacity * 0.8} textAnchor="middle">{srcLabel}</text>
-            <text x={endX - labelDx} y={targetRowY - 6} fontSize={9} fontFamily="monospace" fill={stroke} fillOpacity={opacity * 0.8} textAnchor="middle">{tgtLabel}</text>
+            <text x={srcLabelX} y={sourceRowY - 6} fontSize={9} fontFamily="monospace" fill={stroke} fillOpacity={opacity * 0.8} textAnchor="middle">{srcLabel}</text>
+            <text x={tgtLabelX} y={targetRowY - 6} fontSize={9} fontFamily="monospace" fill={stroke} fillOpacity={opacity * 0.8} textAnchor="middle">{tgtLabel}</text>
           </g>
         );
       })
