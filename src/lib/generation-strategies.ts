@@ -1,9 +1,5 @@
 // Feature 3 + 5: Generation Strategies & Sequential AI Pipeline
 
-import type { TableNode } from "@/lib/types";
-import type { GenerationProgress } from "@/lib/generation-tracker";
-import { createGenerationTracker } from "@/lib/generation-tracker";
-
 export interface GenerationStrategy {
   id: string;
   name: string;
@@ -12,24 +8,28 @@ export interface GenerationStrategy {
 
 export const STRATEGIES: GenerationStrategy[] = [
   {
+    id: "v4-parallel",
+    name: "Parallel (Recommended)",
+    description: "Blueprint first, then every table generated simultaneously — fastest, no timeout risk",
+  },
+  {
     id: "v1-direct",
-    name: "Direct (Recommended)",
-    description: "Single AI call — full schema with indexes and constraints",
+    name: "Sequential",
+    description: "Single AI call generates the whole schema at once",
   },
   {
-    id: "v2-pipeline",
-    name: "Pipeline",
-    description: "Multi-step: extract entities, then design full schema",
-  },
-  {
-    id: "v3-fast",
-    name: "Fast",
-    description: "Quick generation with smaller model — lower cost, less detail",
+    id: "v4-slow",
+    name: "Slow (Thorough)",
+    description: "Parallel generation plus a cross-table consistency review at the end",
   },
 ];
 
 export function getDefaultStrategy(): string {
-  return localStorage.getItem("vibedb_generation_strategy") || "v1-direct";
+  const stored = localStorage.getItem("vibedb_generation_strategy");
+  // Older builds stored ids (v2-pipeline, v3-fast) that no longer exist —
+  // fall back to the parallel default rather than silently misbehaving.
+  if (stored && STRATEGIES.some(s => s.id === stored)) return stored;
+  return "v4-parallel";
 }
 
 export function setDefaultStrategy(id: string): void {

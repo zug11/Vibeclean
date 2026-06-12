@@ -8,6 +8,9 @@ const corsHeaders = {
 // Credit costs per action type
 const CREDIT_COSTS: Record<string, number> = {
   "generate-schema": 3,
+  "design-schema": 1,
+  "generate-table": 1,
+  "consistency-check": 1,
   "batch-command": 3,
   "inspect-schema": 2,
   "normalize-csv": 2,
@@ -23,12 +26,67 @@ const CREDIT_COSTS: Record<string, number> = {
 const RETRYABLE = new Set([429, 500, 502, 503, 529]);
 const MAX_RETRIES = 4; // up to 4 attempts (initial + 3 retries)
 
+// ─── Shared schema-authoring rules ──────────────────────
+// Used by generate-schema (whole schema in one call) and generate-table
+// (one table per call, parallel fan-out). Keep in one place so the two
+// paths can never drift apart on schema quality rules.
+const SCHEMA_RULES = `COLUMN TYPE RULES — use the CORRECT type for each column's semantic meaning:
+- uuid: ONLY for primary key "id" columns and foreign key "_id" columns. NEVER for any other column.
+- varchar: names, titles, slugs, short strings (email, username, phone, status, role, country_code, currency, version, license_key, coupon_code)
+- text: long text (description, bio, content, notes, body, readme, changelog, url, github_url, website_url, avatar_url, image_url)
+- int: counts, quantities, whole numbers (stock_count, download_count, max_retries, sort_order, port)
+- boolean: true/false flags (is_active, is_verified, is_public, is_featured, has_free_tier, enabled)
+- numeric OR decimal: money, prices, percentages, ratings (price, amount, total, discount, commission_rate, rating, latitude, longitude)
+- timestamptz: dates and times (created_at, updated_at, published_at, expires_at, last_login_at, deleted_at)
+- jsonb: structured data, metadata, settings, configuration blobs
+
+NEVER use uuid for: names, emails, URLs, descriptions, statuses, versions, codes, slugs, titles, or any non-ID column.
+NEVER use timestamp for: codes, names, identifiers, or any non-date column.
+
+Constraint types: [{"type":"primary"},{"type":"notNull"},{"type":"unique"},{"type":"default","value":"now()"}]
+
+MANDATORY RULES — violating these makes the schema invalid:
+1. EVERY table MUST have exactly ONE "id" column as its FIRST column: {"name":"id","type":"uuid","constraints":[{"type":"primary"},{"type":"notNull"},{"type":"default","value":"gen_random_uuid()"}]}
+2. EVERY table MUST have created_at and updated_at timestamptz columns with default now().
+3. NEVER duplicate column names within a table. Each column name must be unique.
+4. NEVER have more than one primary key per table (only the id column).
+5. Foreign key columns must reference a column that EXISTS. Always reference "id" on the target table.
+6. Use snake_case for all table and column names. Pluralize table names (users, orders, products).
+7. Foreign key columns MUST be named: <singular_target_table>_id (e.g. user_id, project_id, category_id).
+8. NOT NULL CONSTRAINT: Add {"type":"notNull"} to EVERY column that is logically required. In a well-designed schema, 80%+ of columns should be NOT NULL. MUST be nullable (NO notNull constraint): deleted_at, self-referential FKs (parent_id — root records have no parent), optional association FKs (coupon_id, referral_id — not every row has one), future-event timestamps (shipped_at, delivered_at, paid_at, refunded_at, completed_at — events that haven't happened yet), optional address fields (address_line2), optional descriptions, secondary contact info, metadata fields.
+9. Generate INDEXES for: every FK column, columns commonly used in WHERE/ORDER BY, email/username (unique), composite indexes for multi-column queries, partial indexes with WHERE clauses for filtered queries (e.g. active records only), GIN indexes on JSONB columns.
+10. Generate CHECK CONSTRAINTS for ALL bounded columns: status/role/type enums (IN list), positive amounts (> 0), percentage/rating ranges (BETWEEN 0 AND 100 or BETWEEN 1 AND 5), non-negative counts (>= 0), priority levels, currency codes (IN ('USD','EUR','GBP','JPY','CAD','AUD') or similar). Name format: chk_<table>_<column>.
+11. For junction/mapping tables (many-to-many), add a COMPOSITE UNIQUE index on the two FK columns to prevent duplicate associations.
+12. For tables involving financial records, legal data, or user-generated content, add a "deleted_at" TIMESTAMPTZ column (nullable, default null) for soft deletes.
+13. For columns storing secrets, tokens, or API keys, add companion columns: "expires_at" (timestamptz), "last_rotated_at" (timestamptz).
+14. For self-referential FK columns (e.g. parent_id referencing same table): make them NULLABLE (root records have no parent) and add a CHECK constraint: parent_id != id.
+15. Prefer timestamptz over plain timestamp for all date/time columns — ensures timezone-aware storage.
+16. Prefer text over varchar when no max-length constraint exists — avoids silent truncation.
+17. Use numeric (not float/real/double) for money and financial amounts — prevents floating-point rounding.
+18. Add a GIN index on every JSONB column for efficient containment/key-exists queries.
+19. For tables with a soft-delete deleted_at column, add a partial index WHERE deleted_at IS NULL on commonly queried columns.
+20. For composite indexes, place high-selectivity columns first, then range/sort columns (e.g. user_id, created_at DESC).
+21. Never duplicate quantity/count/balance columns across parent-child tables (e.g. stock_count on both products AND product_variants). Store the value in ONE place — the most granular table — and derive the parent total via query or trigger.
+
+CRITICAL MISTAKES TO AVOID — your schema is INVALID if any of these occur:
+- id columns WITHOUT {"type":"default","value":"gen_random_uuid()"} → WRONG. Every id MUST have this default.
+- parent_id with {"type":"notNull"} → WRONG. Self-referential FKs MUST be nullable so root records can exist.
+- coupon_id / referral_id / discount_id with {"type":"notNull"} → WRONG. Optional association FKs MUST be nullable.
+- shipped_at / delivered_at / paid_at / refunded_at / completed_at with {"type":"notNull"} → WRONG. Future-event timestamps MUST be nullable — these events haven't happened at creation time.
+- address_line2 with {"type":"notNull"} → WRONG. Optional address fields MUST be nullable.
+- Tables with deleted_at but NO partial index WHERE deleted_at IS NULL → WRONG. Always add partial indexes on soft-delete tables.
+- JSONB columns without a GIN index → WRONG. Every JSONB column needs a GIN index.
+- currency/country columns without a CHECK constraint → WRONG. Constrain to valid ISO codes.
+Before emitting JSON, review every column: can this column realistically be empty at INSERT time? If yes, it MUST be nullable.`;
+
 // ─── Resilient Claude API caller ────────────────────────
 // Retries the SAME model with exponential backoff on transient failures.
 // No fallback to weaker models — the user pays for Sonnet, they get Sonnet.
+// systemPrompt may be a plain string or an array of content blocks (used by
+// generate-table to attach cache_control for prompt caching).
 async function callClaudeWithRetry(
   apiKey: string,
-  systemPrompt: string,
+  systemPrompt: string | Array<Record<string, unknown>>,
   userPrompt: string,
   model: string,
   maxTokens: number,
@@ -97,6 +155,9 @@ serve(async (req) => {
 
     // ─── Build prompts ──────────────────────────────────
     let systemPrompt = "";
+    // When set, takes precedence over systemPrompt and is sent as content
+    // blocks (enables cache_control for the parallel fan-out path).
+    let systemBlocks: Array<Record<string, unknown>> | null = null;
     let userPrompt = prompt;
 
     if (type === "generate-schema") {
@@ -107,58 +168,74 @@ CRITICAL: Your entire response must be a single valid JSON object. No text befor
 The JSON must have this exact structure:
 {"tables":[{"name":"string","columns":[{"name":"string","type":"string","isForeignKey":false,"linkedTable":"","linkedColumn":"","constraints":[]}],"indexes":[{"name":"string","columns":["string"],"type":"btree","unique":false,"where":"optional filter"}],"checkConstraints":[{"name":"string","expression":"column_name > 0"}]}]}
 
-COLUMN TYPE RULES — use the CORRECT type for each column's semantic meaning:
-- uuid: ONLY for primary key "id" columns and foreign key "_id" columns. NEVER for any other column.
-- varchar: names, titles, slugs, short strings (email, username, phone, status, role, country_code, currency, version, license_key, coupon_code)
-- text: long text (description, bio, content, notes, body, readme, changelog, url, github_url, website_url, avatar_url, image_url)
-- int: counts, quantities, whole numbers (stock_count, download_count, max_retries, sort_order, port)
-- boolean: true/false flags (is_active, is_verified, is_public, is_featured, has_free_tier, enabled)
-- numeric OR decimal: money, prices, percentages, ratings (price, amount, total, discount, commission_rate, rating, latitude, longitude)
-- timestamptz: dates and times (created_at, updated_at, published_at, expires_at, last_login_at, deleted_at)
-- jsonb: structured data, metadata, settings, configuration blobs
-
-NEVER use uuid for: names, emails, URLs, descriptions, statuses, versions, codes, slugs, titles, or any non-ID column.
-NEVER use timestamp for: codes, names, identifiers, or any non-date column.
-
-Constraint types: [{"type":"primary"},{"type":"notNull"},{"type":"unique"},{"type":"default","value":"now()"}]
-
-MANDATORY RULES — violating these makes the schema invalid:
-1. EVERY table MUST have exactly ONE "id" column as its FIRST column: {"name":"id","type":"uuid","constraints":[{"type":"primary"},{"type":"notNull"},{"type":"default","value":"gen_random_uuid()"}]}
-2. EVERY table MUST have created_at and updated_at timestamptz columns with default now().
-3. NEVER duplicate column names within a table. Each column name must be unique.
-4. NEVER have more than one primary key per table (only the id column).
-5. Foreign key columns must reference a column that EXISTS. Always reference "id" on the target table.
-6. Use snake_case for all table and column names. Pluralize table names (users, orders, products).
-7. Foreign key columns MUST be named: <singular_target_table>_id (e.g. user_id, project_id, category_id).
-8. NOT NULL CONSTRAINT: Add {"type":"notNull"} to EVERY column that is logically required. In a well-designed schema, 80%+ of columns should be NOT NULL. MUST be nullable (NO notNull constraint): deleted_at, self-referential FKs (parent_id — root records have no parent), optional association FKs (coupon_id, referral_id — not every row has one), future-event timestamps (shipped_at, delivered_at, paid_at, refunded_at, completed_at — events that haven't happened yet), optional address fields (address_line2), optional descriptions, secondary contact info, metadata fields.
-9. Generate INDEXES for: every FK column, columns commonly used in WHERE/ORDER BY, email/username (unique), composite indexes for multi-column queries, partial indexes with WHERE clauses for filtered queries (e.g. active records only), GIN indexes on JSONB columns.
-10. Generate CHECK CONSTRAINTS for ALL bounded columns: status/role/type enums (IN list), positive amounts (> 0), percentage/rating ranges (BETWEEN 0 AND 100 or BETWEEN 1 AND 5), non-negative counts (>= 0), priority levels, currency codes (IN ('USD','EUR','GBP','JPY','CAD','AUD') or similar). Name format: chk_<table>_<column>.
-11. For junction/mapping tables (many-to-many), add a COMPOSITE UNIQUE index on the two FK columns to prevent duplicate associations.
-12. For tables involving financial records, legal data, or user-generated content, add a "deleted_at" TIMESTAMPTZ column (nullable, default null) for soft deletes.
-13. For columns storing secrets, tokens, or API keys, add companion columns: "expires_at" (timestamptz), "last_rotated_at" (timestamptz).
-14. For self-referential FK columns (e.g. parent_id referencing same table): make them NULLABLE (root records have no parent) and add a CHECK constraint: parent_id != id.
-15. Prefer timestamptz over plain timestamp for all date/time columns — ensures timezone-aware storage.
-16. Prefer text over varchar when no max-length constraint exists — avoids silent truncation.
-17. Use numeric (not float/real/double) for money and financial amounts — prevents floating-point rounding.
-18. Add a GIN index on every JSONB column for efficient containment/key-exists queries.
-19. For tables with a soft-delete deleted_at column, add a partial index WHERE deleted_at IS NULL on commonly queried columns.
-20. For composite indexes, place high-selectivity columns first, then range/sort columns (e.g. user_id, created_at DESC).
-21. Never duplicate quantity/count/balance columns across parent-child tables (e.g. stock_count on both products AND product_variants). Store the value in ONE place — the most granular table — and derive the parent total via query or trigger.
-
-CRITICAL MISTAKES TO AVOID — your schema is INVALID if any of these occur:
-- id columns WITHOUT {"type":"default","value":"gen_random_uuid()"} → WRONG. Every id MUST have this default.
-- parent_id with {"type":"notNull"} → WRONG. Self-referential FKs MUST be nullable so root records can exist.
-- coupon_id / referral_id / discount_id with {"type":"notNull"} → WRONG. Optional association FKs MUST be nullable.
-- shipped_at / delivered_at / paid_at / refunded_at / completed_at with {"type":"notNull"} → WRONG. Future-event timestamps MUST be nullable — these events haven't happened at creation time.
-- address_line2 with {"type":"notNull"} → WRONG. Optional address fields MUST be nullable.
-- Tables with deleted_at but NO partial index WHERE deleted_at IS NULL → WRONG. Always add partial indexes on soft-delete tables.
-- JSONB columns without a GIN index → WRONG. Every JSONB column needs a GIN index.
-- currency/country columns without a CHECK constraint → WRONG. Constrain to valid ISO codes.
-Before emitting JSON, review every column: can this column realistically be empty at INSERT time? If yes, it MUST be nullable.
+${SCHEMA_RULES}
 
 Generate as many tables as the idea genuinely requires — don't artificially limit. A simple blog might need 3-5 tables, but a full e-commerce platform or marketplace might need 15-25+. Be thorough and include all tables needed for a production-ready schema.
 Use double quotes for all JSON strings. Emit compact JSON (no pretty-printing, no unnecessary whitespace).`;
       userPrompt = `Requirement: ${prompt}`;
+    } else if (type === "design-schema") {
+      // Parallel fan-out phase 1: the blueprint. Table names, purposes, and
+      // relationships ONLY — small output, arrives in seconds, and pins the
+      // contract that the parallel generate-table calls must follow.
+      systemPrompt = `You are an expert database architect. Design the STRUCTURE of a complete production-quality PostgreSQL schema for the user's requirement — table names, purposes, and foreign-key relationships ONLY. Do NOT write column definitions.
+
+CRITICAL: Your entire response must be a single valid JSON object. No text before or after. No markdown. No comments. No explanation.
+
+Return exactly this structure:
+{"tables":[{"name":"users","purpose":"one short sentence","fks":[{"column":"team_id","references":"teams"}]}]}
+
+Rules:
+- Use snake_case, pluralized table names (users, orders, product_variants).
+- FK columns are named <singular_target_table>_id; "references" is the exact target table name from this same design.
+- List an fk entry ONLY on the table that physically holds the FK column.
+- Include a junction table for every many-to-many relationship.
+- Self-referential relationships are allowed (e.g. parent_id referencing the same table).
+- Cover everything a production system needs — a simple blog might need 3-5 tables, a full marketplace 15-25+. Do not artificially limit.
+- "purpose" is one short sentence; it guides a later per-table generation step.
+Use double quotes for all JSON strings. Emit compact JSON.`;
+      userPrompt = `Requirement: ${prompt}`;
+    } else if (type === "generate-table") {
+      // Parallel fan-out phase 2: one complete table per call. The system
+      // rules + blueprint are sent as cached blocks so the N parallel calls
+      // share one cache entry (cached tokens don't count toward rate limits).
+      const singleTableSystem = `You are an expert database architect. You are given a schema blueprint (every table name, its purpose, and all foreign-key relationships). Generate the complete production-quality definition for EXACTLY ONE table from that blueprint — the one named in the request.
+
+CRITICAL: Your entire response must be a single valid JSON object. No text before or after. No markdown. No comments. No explanation.
+
+The JSON must have this exact structure, where the tables array contains exactly the one requested table:
+{"tables":[{"name":"string","columns":[{"name":"string","type":"string","isForeignKey":false,"linkedTable":"","linkedColumn":"","constraints":[]}],"indexes":[{"name":"string","columns":["string"],"type":"btree","unique":false,"where":"optional filter"}],"checkConstraints":[{"name":"string","expression":"column_name > 0"}]}]}
+
+${SCHEMA_RULES}
+
+SINGLE-TABLE RULES:
+- Generate ONLY the requested table. Never emit any other table.
+- Use the blueprint's table names VERBATIM for every linkedTable value.
+- Include every FK column the blueprint assigns to this table. Only FK columns that physically live on THIS table belong in its definition.
+- Stay consistent with the blueprint: if it implies an enum or status column shared with other tables, use conventional values.
+Use double quotes for all JSON strings. Emit compact JSON.`;
+      systemBlocks = [
+        { type: "text", text: singleTableSystem, cache_control: { type: "ephemeral" } },
+        { type: "text", text: `Schema blueprint:\n${context || ""}`, cache_control: { type: "ephemeral" } },
+      ];
+      userPrompt = `Generate the complete definition for the table named: ${prompt}`;
+    } else if (type === "consistency-check") {
+      // Parallel fan-out phase 3 (Slow strategy only): cross-table review of
+      // the assembled schema. Returns ONLY tables needing correction, so the
+      // output stays small and the client can merge by name.
+      systemPrompt = `You are a database schema consistency reviewer. You are given a complete schema where each table was generated independently from a shared blueprint. Find and fix CROSS-TABLE inconsistencies only — do not redesign tables that are internally fine.
+
+Check for:
+- FK columns whose linkedTable does not exactly match an existing table name in this schema.
+- Columns that clearly reference another table (e.g. user_id) but are missing isForeignKey/linkedTable wiring.
+- The same conceptual column (e.g. status, currency, role) using conflicting CHECK constraint value lists across tables — align them to one canonical list.
+- The same data stored redundantly in multiple tables (rule: store a value in ONE place, the most granular table).
+- Junction tables missing a composite unique index on their FK pair.
+- FK column types that don't match the referenced id column type (FKs must be uuid).
+
+CRITICAL: Your entire response must be a single valid JSON object. No text before or after. No markdown.
+Return {"tables":[...]} containing ONLY the tables that need corrections, each as its COMPLETE corrected definition in exactly the same format as the input. If nothing needs fixing, return {"tables":[]}.
+Use double quotes for all JSON strings. Emit compact JSON.`;
+      userPrompt = `Schema:\n${context || prompt}`;
     } else if (type === "generate-sql") {
       systemPrompt = `You are a SQL expert. Given a database schema context, generate valid PostgreSQL DDL statements.
 Rules:
@@ -445,13 +522,15 @@ Use realistic commands (systemctl, kubectl, docker, curl, psql, etc.) appropriat
     // Supabase edge functions have a 150s wall-clock timeout.
     // Sonnet 4.6 at ~130 tok/s: 16384 tokens ≈ 126s → fits within timeout.
     // Reactive chaining handles overflow for complex schemas (20+ tables).
+    // The parallel path (design-schema + generate-table) never approaches the
+    // wall: each call produces well under 8K tokens.
     const maxTokens = longOutputTypes.includes(type) ? 16384 : 8192;
 
     console.log(`[vibedb-ai] type=${type} model=${model} max_tokens=${maxTokens}`);
 
     // ─── Call Claude with automatic retry ────────────────
     const { content: rawContent, stopReason, modelUsed } = await callClaudeWithRetry(
-      ANTHROPIC_API_KEY, systemPrompt, userPrompt, model, maxTokens
+      ANTHROPIC_API_KEY, systemBlocks ?? systemPrompt, userPrompt, model, maxTokens
     );
 
     let content = rawContent;
@@ -507,7 +586,7 @@ Use realistic commands (systemctl, kubectl, docker, curl, psql, etc.) appropriat
     }
 
     // JSON truncation: generic close open brackets/braces (for non-schema types)
-    if (stopReason === "max_tokens" && type !== "generate-schema" && (type === "schema-chat" || type === "batch-command" || type === "inspect-schema" || type === "smart-add-column")) {
+    if (stopReason === "max_tokens" && type !== "generate-schema" && (type === "schema-chat" || type === "batch-command" || type === "inspect-schema" || type === "smart-add-column" || type === "design-schema" || type === "generate-table" || type === "consistency-check")) {
       console.log("[vibedb-ai] JSON truncated, attempting auto-close...");
       content = content.replace(/,\s*"[^"]*$/, "");
       content = content.replace(/,\s*$/, "");

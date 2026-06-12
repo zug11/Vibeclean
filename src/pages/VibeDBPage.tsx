@@ -1881,7 +1881,16 @@ const VibeDBPage = () => {
     let errorMsg = "";
     let continuationCount = 0;
 
-    if (strategy === "v2-pipeline") {
+    if (strategy === "v4-parallel" || strategy === "v4-slow") {
+      tracker.start([
+        "Designing schema blueprint",
+        "Generating all tables in parallel",
+        ...(strategy === "v4-slow" ? ["Reviewing cross-table consistency"] : []),
+        "Compiling schema (deterministic passes)",
+        "Resolving foreign keys",
+        "Finalizing schema",
+      ]);
+    } else if (strategy === "v2-pipeline") {
       tracker.start([
         "Extracting entities from prompt",
         "Designing full schema with constraints",
@@ -1900,7 +1909,95 @@ const VibeDBPage = () => {
     }
 
     try {
-      if (strategy === "v2-pipeline") {
+      if (strategy === "v4-parallel" || strategy === "v4-slow") {
+        // ─── Parallel fan-out generation ─────────────────
+        // Phase 1: one small, fast call designs the blueprint — table names,
+        // purposes, and FK relationships. This pins the contract every
+        // parallel worker must follow, so table names can't drift.
+        const bpResponse = await callAIRaw("design-schema", prompt, undefined, strategy);
+        const bpResult = robustJsonParse(bpResponse.result);
+        const designTables: any[] = Array.isArray(bpResult?.tables) ? bpResult.tables : [];
+        const tableNames: string[] = designTables
+          .map((t: any) => (typeof t === "string" ? t : t?.name))
+          .filter(Boolean);
+        if (tableNames.length === 0) throw new Error("Blueprint returned no tables — try rephrasing the prompt");
+        const blueprintJson = JSON.stringify({ tables: designTables });
+        tracker.advanceStep(`${tableNames.length} tables planned`);
+
+        // Phase 2: generate every table simultaneously. Each call produces
+        // ~one table of JSON (seconds, not minutes) so the edge function's
+        // 150s wall-clock limit is never a factor.
+        const generateOne = async (name: string): Promise<any> => {
+          const resp = await callAIRaw("generate-table", name, blueprintJson, strategy);
+          const parsed = robustJsonParse(resp.result);
+          const table = parsed?.tables?.[0] ?? parsed?.table ?? (parsed?.name && parsed?.columns ? parsed : null);
+          if (!table?.name || !Array.isArray(table.columns)) throw new Error(`Invalid table response for ${name}`);
+          return table;
+        };
+
+        const rawTables: any[] = [];
+        let failedNames: string[] = [];
+
+        // The first call runs alone: it writes the shared prompt cache that
+        // the remaining parallel calls read (cached input is ~10% cost and
+        // doesn't count toward rate limits).
+        try {
+          rawTables.push(await generateOne(tableNames[0]));
+        } catch {
+          failedNames.push(tableNames[0]);
+        }
+
+        const WAVE_SIZE = 8; // concurrency cap — keeps bursts polite
+        const remaining = tableNames.slice(1);
+        for (let i = 0; i < remaining.length; i += WAVE_SIZE) {
+          const wave = remaining.slice(i, i + WAVE_SIZE);
+          const settled = await Promise.allSettled(wave.map(generateOne));
+          settled.forEach((res, j) => {
+            if (res.status === "fulfilled") rawTables.push(res.value);
+            else failedNames.push(wave[j]);
+          });
+        }
+
+        // One sequential retry pass for any failures
+        for (const name of [...failedNames]) {
+          try {
+            rawTables.push(await generateOne(name));
+            failedNames = failedNames.filter(n => n !== name);
+          } catch {
+            // still failed — reported below, generation continues
+          }
+        }
+        if (failedNames.length > 0) {
+          addToast(`Could not generate: ${failedNames.join(", ")} — retry or add manually`, "warning");
+        }
+        if (rawTables.length === 0) throw new Error("All table generations failed — try again");
+        tracker.advanceStep(`${rawTables.length}/${tableNames.length} tables generated`);
+
+        // Phase 3 (Slow only): one review call checks the assembled schema
+        // for cross-table inconsistencies and returns corrected tables.
+        if (strategy === "v4-slow") {
+          try {
+            const reviewResp = await callAIRaw("consistency-check", "", JSON.stringify({ tables: rawTables }), strategy);
+            const review = robustJsonParse(reviewResp.result);
+            if (Array.isArray(review?.tables) && review.tables.length > 0) {
+              const corrected = new Map(
+                review.tables.filter((t: any) => t?.name && Array.isArray(t?.columns)).map((t: any) => [t.name.toLowerCase(), t]),
+              );
+              for (let i = 0; i < rawTables.length; i++) {
+                const fix = corrected.get(rawTables[i].name.toLowerCase());
+                if (fix) rawTables[i] = fix;
+              }
+              addToast(`Consistency review: ${corrected.size} table${corrected.size !== 1 ? "s" : ""} corrected`, "info");
+            }
+          } catch (err) {
+            // Review is best-effort — the generated tables are still valid
+            console.warn("[VibeDB] Consistency review failed, keeping generated tables:", err);
+          }
+          tracker.advanceStep();
+        }
+
+        generatedTables = convertAITablesToNodes(rawTables);
+      } else if (strategy === "v2-pipeline") {
         // Pipeline: Step 1 — entity extraction
         const entityPrompt = `Extract the core entities (tables) and their relationships from this requirement. Return JSON: { "entities": [...], "relationships": [...] }.\n\nRequirement: "${prompt}"`;
         const entityStr = await callAI("generate-schema", entityPrompt, undefined, strategy);
@@ -4033,7 +4130,7 @@ const VibeDBPage = () => {
                     <div className="mb-1.5 text-left text-[10px] font-bold uppercase tracking-wider text-muted-foreground">Generation mode</div>
                     <div className="grid grid-cols-3 gap-1 rounded-xl bg-secondary/70 p-1">
                       {STRATEGIES.map(s => {
-                        const label = s.id === "v1-direct" ? "Direct" : s.id === "v2-pipeline" ? "Pipeline" : "Fast";
+                        const label = s.id === "v4-parallel" ? "Parallel" : s.id === "v1-direct" ? "Sequential" : "Slow";
                         const selected = selectedStrategy === s.id;
                         return (
                           <button
