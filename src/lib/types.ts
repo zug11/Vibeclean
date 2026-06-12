@@ -68,10 +68,22 @@ export interface Project {
   updated_at: string;
 }
 
+// Loosely-shaped payload attached to AI audit suggestions. The AI emits free-form
+// JSON, so every field is optional and consumers must narrow before access.
+export interface SuggestionPayload {
+  name?: string;
+  values?: string[];
+  body?: string;
+  sql?: string;
+  ddl?: string;
+  title?: string;
+  description?: string;
+}
+
 export interface AuditReport {
   score?: number;
   issues?: { severity: string; message: string }[];
-  suggestions?: { type: string; target_table?: string; payload?: unknown; reason: string; description?: string }[];
+  suggestions?: { type: string; target_table?: string; payload?: SuggestionPayload; reason: string; description?: string }[];
   lintIssues?: { type: string; severity: string; message: string }[];
   fkIssues?: { type: string; severity: string; message: string }[];
   strengths?: string[];

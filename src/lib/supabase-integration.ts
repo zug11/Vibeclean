@@ -8,6 +8,11 @@ export interface SupabaseProject {
 }
 
 // OpenAPI spec types (subset of what PostgREST returns)
+interface OpenAPIPathMethod {
+  parameters?: unknown[];
+  responses?: Record<string, unknown>;
+}
+
 interface OpenAPISpec {
   definitions?: Record<string, OpenAPIDefinition>;
   paths?: Record<string, Record<string, OpenAPIPathMethod>>;

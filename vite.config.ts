@@ -1,3 +1,4 @@
+/// <reference types="vitest/config" />
 import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react-swc";
 import path from "path";
@@ -17,5 +18,10 @@ export default defineConfig(({ mode }) => ({
     alias: {
       "@": path.resolve(__dirname, "./src"),
     },
+  },
+  // Scope vitest to our own source — vendored reference trees (zod-main-2,
+  // kysely-master) must never run under `npm test`.
+  test: {
+    include: ["src/**/*.{test,spec}.{ts,tsx}"],
   },
 }));
