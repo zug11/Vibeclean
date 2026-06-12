@@ -6,6 +6,7 @@ import { v4 as uuidv4 } from "uuid";
 // ─── Types ───────────────────────────────────────────────
 
 import type { Column, TableNode } from "@/lib/types";
+import { CHAT_MODELS, getChatModelApiId, getDefaultChatModel, setDefaultChatModel } from "@/lib/chat-models";
 
 interface ChatSuggestion {
   id: string;
@@ -41,7 +42,7 @@ interface AIChatPanelProps {
 
 // ─── Utilities ───────────────────────────────────────────
 
-async function callAI(type: string, prompt: string, context?: string) {
+async function callAI(type: string, prompt: string, context?: string, model?: string) {
   const supabaseUrl = import.meta.env.VITE_SUPABASE_URL;
   const supabaseKey = import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY;
 
@@ -51,7 +52,7 @@ async function callAI(type: string, prompt: string, context?: string) {
       "Content-Type": "application/json",
       "Authorization": `Bearer ${supabaseKey}`,
     },
-    body: JSON.stringify({ type, prompt, context }),
+    body: JSON.stringify({ type, prompt, context, model }),
   });
 
   const data = await res.json();
@@ -142,6 +143,7 @@ const AIChatPanel: React.FC<AIChatPanelProps> = ({
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [inputValue, setInputValue] = useState("");
   const [isLoading, setIsLoading] = useState(false);
+  const [selectedModel, setSelectedModel] = useState(getDefaultChatModel);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const prevProjectIdRef = useRef<string | null | undefined>(projectId);
@@ -262,7 +264,7 @@ const AIChatPanel: React.FC<AIChatPanelProps> = ({
     try {
       const transcript = buildTranscript(text);
       const schemaContext = buildSchemaContext();
-      const result = await callAI("schema-chat", transcript, schemaContext || undefined);
+      const result = await callAI("schema-chat", transcript, schemaContext || undefined, getChatModelApiId(selectedModel));
 
       let parsed: any;
       try {
@@ -406,7 +408,7 @@ const AIChatPanel: React.FC<AIChatPanelProps> = ({
 
       const transcript = buildTranscript(text);
       const schemaContext = buildSchemaContext();
-      callAI("schema-chat", transcript, schemaContext || undefined)
+      callAI("schema-chat", transcript, schemaContext || undefined, getChatModelApiId(selectedModel))
         .then(result => {
           let parsed: any;
           try {
@@ -660,6 +662,25 @@ const AIChatPanel: React.FC<AIChatPanelProps> = ({
 
           {/* Input */}
           <div className="border-t border-border p-3 shrink-0">
+            <div className="mb-2 flex items-center gap-2">
+              <label htmlFor="ai-chat-model" className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground shrink-0">
+                Model
+              </label>
+              <select
+                id="ai-chat-model"
+                value={selectedModel}
+                disabled={isLoading}
+                onChange={e => {
+                  setSelectedModel(e.target.value);
+                  setDefaultChatModel(e.target.value);
+                }}
+                className="flex-1 rounded-lg border border-border bg-background px-2.5 py-1.5 text-[11px] font-medium outline-none focus:border-accent transition disabled:opacity-40"
+              >
+                {CHAT_MODELS.map(m => (
+                  <option key={m.id} value={m.id}>{m.name}</option>
+                ))}
+              </select>
+            </div>
             <div className="flex gap-2 items-end">
               <textarea
                 ref={inputRef}

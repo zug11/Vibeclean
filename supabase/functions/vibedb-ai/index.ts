@@ -91,7 +91,7 @@ serve(async (req) => {
   if (req.method === "OPTIONS") return new Response(null, { headers: corsHeaders });
 
   try {
-    const { prompt, type, context, strategy } = await req.json();
+    const { prompt, type, context, strategy, model: requestedModel } = await req.json();
     const ANTHROPIC_API_KEY = Deno.env.get("ANTHROPIC_API_KEY");
     if (!ANTHROPIC_API_KEY) throw new Error("ANTHROPIC_API_KEY is not configured");
 
@@ -427,11 +427,21 @@ Use realistic commands (systemctl, kubectl, docker, curl, psql, etc.) appropriat
     }
 
     // ─── Model selection + token limits ──────────────────
+    const chatModels = new Set([
+      "claude-fable-5",
+      "claude-opus-4-8",
+      "claude-sonnet-4-6",
+      "claude-haiku-4-5-20251001",
+      "claude-haiku-4-5",
+    ]);
     const fastTypes = ["generate-mock-data", "generate-sql", "generate-query", "smart-add-column"];
     // Use Haiku for explicitly fast types OR when "v3-fast" strategy is requested
     const useFastModel = fastTypes.includes(type) ||
       (strategy === "v3-fast" && (type === "generate-schema" || type === "batch-command"));
-    const model = useFastModel ? "claude-haiku-4-5-20251001" : "claude-sonnet-4-6";
+    let model = useFastModel ? "claude-haiku-4-5-20251001" : "claude-sonnet-4-6";
+    if (type === "schema-chat" && typeof requestedModel === "string" && chatModels.has(requestedModel)) {
+      model = requestedModel;
+    }
     // batch-command gets the long budget too: multi-table commands were silently
     // truncating at 8192 tokens.
     const longOutputTypes = ["generate-mock-data", "generate-sql", "generate-schema", "normalize-csv", "batch-command"];
