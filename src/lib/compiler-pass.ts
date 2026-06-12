@@ -430,7 +430,17 @@ function injectCheckConstraints(tables: TableNode[], rules: CheckRule[] = CHECK_
         if (appliedCategories.has(rule.category)) continue;
 
         if (rule.pattern(colName, (col.type || "").toLowerCase())) {
-          const expression = rule.expression(col.name);
+          const rawExpression = rule.expression(col.name);
+          // A nullable column's CHECK must not constrain the NULL case. Guard it with
+          // "col IS NULL OR (...)" so inserting NULL never trips a format/range rule.
+          // This is the inverse of Pass 6 Rule 4, which strips this exact prefix back
+          // out when the column is (or later becomes) NOT NULL — keeping injection and
+          // normalization symmetric. NOT NULL columns get the bare expression (their
+          // IS NULL branch would be unreachable).
+          const isNullable = !col.constraints?.some(c => c.type === "notNull");
+          const expression = isNullable
+            ? `${col.name} IS NULL OR (${rawExpression})`
+            : rawExpression;
           const constraintName = `chk_${t.name}_${col.name}_${rule.category}`;
           newChecks.push({ name: constraintName, expression });
           actions.push({

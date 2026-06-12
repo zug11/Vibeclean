@@ -310,13 +310,17 @@ const AIChatPanel: React.FC<AIChatPanelProps> = ({
   // This routes all table mutations through the compiler pipeline (naming, CHECK, FK resolution).
   const handleApplySuggestion = (suggestion: ChatSuggestion, silent = false) => {
     const p = suggestion.payload;
+    // Use the action normalized by parseSuggestions (handles both flat {action} and nested
+    // {type,payload} formats, and maps sql_patch -> ddl_patch). p.action is undefined for
+    // nested-format payloads, which previously made table mutations silently no-op.
+    const action = suggestion.type;
     try {
       // Non-table mutations: handle locally (enums/functions don't go through compiler)
-      if (p.action === "add_enum") {
+      if (action === "add_enum") {
         if (onAddEnum && p.name && p.values?.length) onAddEnum({ name: p.name, values: p.values });
-      } else if (p.action === "add_function") {
+      } else if (action === "add_function") {
         if (onAddFunction && p.body) onAddFunction({ name: p.name || "", body: p.body });
-      } else if (p.action === "ddl_patch" || p.action === "sql_patch" || suggestion.type === "ddl_patch") {
+      } else if (action === "ddl_patch") {
         const sql = p.sql || p.body || p.ddl || "";
         if (!sql) {
           if (!silent) addToast("Cannot apply DDL patch without SQL", "warning");
@@ -333,9 +337,13 @@ const AIChatPanel: React.FC<AIChatPanelProps> = ({
           return;
         }
       } else if (onApplySuggestion) {
+        if (!action || action === "unknown") {
+          if (!silent) addToast("Couldn't apply: unknown suggestion type", "error");
+          return;
+        }
         // Delegate table mutations to parent (compiler-aware pipeline)
         const mapped = {
-          type: p.action,
+          type: action,
           target_table: p.targetTable,
           targetTable: p.targetTable,
           payload: {

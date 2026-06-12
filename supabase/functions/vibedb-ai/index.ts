@@ -326,7 +326,7 @@ CONVERSATION BEHAVIOR:
 - Only include actual suggestion objects in the "suggestions" array when:
   1. The user explicitly asks for suggestions/improvements/changes (e.g. "what should I improve?", "suggest changes", "yes apply them", "go ahead")
   2. The user says "yes" or agrees after you asked via ask_to_apply
-  3. The user gives a direct command like "add a users table" or "remove the posts table"
+  3. The user gives a direct command like "add a users table", "remove the posts table", or "change avatar_url to timestamptz" — ANY request to change a column's type MUST be returned as a change_type suggestion, never just described in your message
 
 WHEN YOU DO INCLUDE SUGGESTIONS:
 Every improvement you mention MUST have a corresponding suggestion card. Never tell the user to do something manually.
@@ -349,14 +349,14 @@ Suggestion types and payload formats:
 - add_enum: {"action":"add_enum","name":"order_status","values":["pending","filled","cancelled"]}
 - add_function: {"action":"add_function","name":"fn_name","body":"CREATE OR REPLACE FUNCTION ..."}
 - ddl_patch: {"action":"ddl_patch","title":"Add tenant RLS policies","description":"Raw SQL for objects outside schema JSON","sql":"ALTER TABLE projects ENABLE ROW LEVEL SECURITY; CREATE POLICY ...;"}
+- ddl_patch (any raw SQL the user asks you to write): {"action":"ddl_patch","title":"updated_at trigger","description":"Auto-update updated_at on row change","sql":"CREATE OR REPLACE FUNCTION set_updated_at() RETURNS trigger AS $$ BEGIN NEW.updated_at = now(); RETURN NEW; END; $$ LANGUAGE plpgsql; CREATE TRIGGER trg_users_updated_at BEFORE UPDATE ON users FOR EACH ROW EXECUTE FUNCTION set_updated_at();"}
 - remove_column: {"action":"remove_column","targetTable":"...","column":"..."}
 - remove_table: {"action":"remove_table","targetTable":"..."}
 
 Column types: uuid, varchar, int, timestamptz, timestamp, boolean, numeric, text, jsonb, decimal, float, or custom enum type names.
 Constraint types: primary, notNull, unique, default (with value).
 For add_table, always include id (uuid, primary), created_at, updated_at columns.
-Use ddl_patch for edge cases that cannot be represented safely in schema JSON: RLS policies, triggers, views, grants, extensions, generated columns, expression indexes, data backfills, preserving table/column renames with ALTER ... RENAME, or complex ALTER COLUMN TYPE ... USING migrations.
-Do NOT force raw SQL edge cases into add_column/remove_column/change_type if that would lose data or intent.
+RAW SQL: When the user asks you to write SQL, or requests anything best expressed as raw SQL — RLS policies, triggers, views, grants, functions, extensions, generated/expression-index columns, data backfills/migrations, preserving table/column renames with ALTER ... RENAME, or complex ALTER COLUMN TYPE ... USING migrations — or explicitly says "write the SQL" / "give me the SQL" / "as SQL", you MUST return it as a ddl_patch suggestion with the SQL in the "sql" field. Never leave the SQL only inside "message", and never force it into add_column/remove_column/change_type if that would lose data or intent.
 Use double quotes for all JSON strings.`;
       userPrompt = context ? `Current Schema:\n${context}\n\nConversation:\n${prompt}` : prompt;
     } else if (type === "normalize-csv") {

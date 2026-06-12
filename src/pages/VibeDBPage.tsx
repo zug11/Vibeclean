@@ -160,12 +160,6 @@ function appendDdlPatchSql(sql: string, patches: DDLPatch[]): string {
   return `${sql.trim()}\n\n${patchSql}`;
 }
 
-function ddlPatchSourceLabel(source: DDLPatch["source"]): string {
-  if (source === "ai-chat") return "AI Chat";
-  if (source === "batch-edit") return "Batch Edit";
-  return "Manual";
-}
-
 function mergeImportedTablesWithLayout(importedTables: TableNode[], currentTables: TableNode[]): TableNode[] {
   const currentByName = new Map(currentTables.map(t => [t.name.toLowerCase(), t]));
 
@@ -1050,8 +1044,18 @@ function inferCorrectType(colName: string, aiType: string, isForeignKey: boolean
     return "varchar";
   }
 
-  // Fix timestamp used for non-date columns
-  if ((aiType === "timestamp" || aiType === "timestamptz") && !name.includes("_at") && !name.includes("date") && !name.includes("time") && !name.includes("expires") && !name.includes("started") && !name.includes("ended") && !name.includes("created") && !name.includes("updated") && !name.includes("deleted") && !name.includes("published") && !name.includes("scheduled") && !name.includes("last_") && !name.includes("next_")) {
+  // timestamptz is a first-class type the AI is told to emit — never silently change it.
+  if (aiType === "timestamptz") return "timestamptz";
+
+  // Plain timestamp: upgrade to timestamptz for genuine date/time columns (so all generated
+  // timestamps are timezone-aware), and downcast to varchar only for clearly-misnamed columns.
+  if (aiType === "timestamp") {
+    const isDateNamed = name.includes("_at") || name.includes("date") || name.includes("time") ||
+      name.includes("expires") || name.includes("started") || name.includes("ended") ||
+      name.includes("created") || name.includes("updated") || name.includes("deleted") ||
+      name.includes("published") || name.includes("scheduled") || name.includes("last_") ||
+      name.includes("next_");
+    if (isDateNamed) return "timestamptz";
     if (name.includes("code") || name.includes("coupon") || name.includes("token") || name.includes("name") || name.includes("key") || name.includes("status") || name.includes("version")) return "varchar";
   }
 
@@ -1704,7 +1708,6 @@ const VibeDBPage = () => {
   const [batchPrompt, setBatchPrompt] = useState("");
   const [isBatchProcessing, setIsBatchProcessing] = useState(false);
   const [batchError, setBatchError] = useState<string | null>(null);
-  const [showDdlPatchesModal, setShowDdlPatchesModal] = useState(false);
   const [showAddTableMenu, setShowAddTableMenu] = useState(false);
   const [aiTablePrompt, setAiTablePrompt] = useState("");
   const [isAddingAiTable, setIsAddingAiTable] = useState(false);
@@ -1774,6 +1777,12 @@ const VibeDBPage = () => {
       return null;
     }
 
+    // Dedup by normalized SQL: patches flow straight into the exported SQL with no UI to remove
+    // them, so identical AI/batch suggestions must not stack duplicate blocks.
+    const normalize = (s: string) => s.replace(/\s+/g, " ").trim().toLowerCase();
+    const dupe = ddlPatches.find(p => normalize(p.sql) === normalize(sql));
+    if (dupe) return dupe;
+
     const next: DDLPatch = {
       id: uuidv4(),
       title: patch.title?.trim() || "DDL patch",
@@ -1787,24 +1796,7 @@ const VibeDBPage = () => {
 
     setDdlPatches(prev => [next, ...prev]);
     return next;
-  }, [addToast]);
-
-  const updateDdlPatch = useCallback((id: string, updates: Partial<Pick<DDLPatch, "title" | "description" | "sql">>) => {
-    setDdlPatches(prev => prev.map(patch => {
-      if (patch.id !== id) return patch;
-      const sql = updates.sql !== undefined ? cleanSqlFence(updates.sql) : patch.sql;
-      return {
-        ...patch,
-        ...updates,
-        sql,
-        warnings: analyzeMigrationRisks(sql),
-      };
-    }));
-  }, []);
-
-  const removeDdlPatch = useCallback((id: string) => {
-    setDdlPatches(prev => prev.filter(patch => patch.id !== id));
-  }, []);
+  }, [addToast, ddlPatches]);
 
   const markDdlPatchesApplied = useCallback((ids: string[]) => {
     const idSet = new Set(ids);
@@ -1860,7 +1852,6 @@ const VibeDBPage = () => {
       if (e.key === "Escape") {
         setShowSqlModal(false); setShowPlayground(false); setEditingTable(null);
         setShowImportModal(false); setShowAuditModal(false); setShowBatchModal(false);
-        setShowDdlPatchesModal(false);
         setShowAddTableMenu(false); setShowExportMenu(false); setShowMockDataModal(false);
         setConnectionMode(null); setEditingColumn(null); setShowDiff(false);
         setShowDeployModal(false); setShowChatPanel(false);
@@ -2888,6 +2879,7 @@ const VibeDBPage = () => {
         });
       }
       default:
+        console.warn("[VibeDB] unhandled suggestion type:", suggestion.type);
         return tables;
     }
   };
@@ -2923,7 +2915,7 @@ const VibeDBPage = () => {
           sql,
           source: "ai-chat",
         });
-        if (created && !silent) addToast(`Added DDL patch: ${created.title}`, "success");
+        if (created && !silent) addToast(`Added "${created.title}" — included in exported SQL`, "success");
       } else {
         // Table mutation — use the pure function, then handshake + compile
         let compilerFixCount = 0;
@@ -3675,13 +3667,6 @@ const VibeDBPage = () => {
         {expertMode && <button onClick={handleAutoLayout} className="flex items-center gap-1.5 rounded-lg bg-secondary px-3 py-1.5 text-xs font-semibold text-secondary-foreground hover:bg-secondary/80 transition"><LayoutTemplate size={14} /> Auto Layout</button>}
         <button onClick={() => setShowImportModal(true)} className="flex items-center gap-1.5 rounded-lg bg-secondary px-3 py-1.5 text-xs font-semibold text-secondary-foreground hover:bg-secondary/80 transition"><Upload size={14} /> Import</button>
         {expertMode && <button onClick={() => setShowBatchModal(true)} className="flex items-center gap-1.5 rounded-lg bg-secondary px-3 py-1.5 text-xs font-semibold text-secondary-foreground hover:bg-secondary/80 transition"><Edit3 size={14} /> Batch Edit</button>}
-        {(expertMode || hasPendingDdlPatches) && (
-          <button onClick={() => setShowDdlPatchesModal(true)} className={`flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-xs font-semibold transition ${hasPendingDdlPatches ? "bg-amber-500/10 text-amber-600 dark:text-amber-400 hover:bg-amber-500/20" : "bg-secondary text-secondary-foreground hover:bg-secondary/80"}`}>
-            <FileText size={14} />
-            DDL
-            {hasPendingDdlPatches && <span className="rounded-full bg-amber-500 px-1.5 py-0.5 text-[9px] font-bold text-white">{pendingDdlPatchCount}</span>}
-          </button>
-        )}
         {expertMode && <button onClick={handleAudit} className="flex items-center gap-1.5 rounded-lg bg-secondary px-3 py-1.5 text-xs font-semibold text-secondary-foreground hover:bg-secondary/80 transition">
           {isAuditing ? <Loader2 size={14} className="animate-spin" /> : <ShieldCheck size={14} />} Audit
         </button>}
@@ -4346,80 +4331,6 @@ const VibeDBPage = () => {
         )}
       </AnimatePresence>
 
-      {/* DDL Patch Ledger Modal */}
-      <AnimatePresence>
-        {showDdlPatchesModal && (
-          <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} className="fixed inset-0 z-[70] flex items-center justify-center bg-foreground/20 backdrop-blur-sm" onClick={() => setShowDdlPatchesModal(false)}>
-            <motion.div initial={{ scale: 0.95, y: 12 }} animate={{ scale: 1, y: 0 }} exit={{ scale: 0.95, y: 12 }} className="mx-4 flex max-h-[86vh] w-full max-w-4xl flex-col overflow-hidden rounded-2xl bg-card shadow-xl border border-border" onClick={e => e.stopPropagation()}>
-              <div className="flex items-center justify-between border-b border-border px-5 py-4 shrink-0">
-                <div>
-                  <h2 className="text-lg font-bold flex items-center gap-2"><FileText size={18} /> DDL Patches</h2>
-                  <p className="text-[11px] text-muted-foreground">
-                    {pendingDdlPatchCount} pending · {ddlPatches.filter(p => p.status === "applied").length} applied
-                  </p>
-                </div>
-                <button onClick={() => setShowDdlPatchesModal(false)} className="flex h-8 w-8 items-center justify-center rounded-lg bg-secondary"><X size={16} /></button>
-              </div>
-
-              <div className="flex-1 overflow-y-auto p-4 space-y-3 custom-scrollbar">
-                {ddlPatches.length === 0 ? (
-                  <div className="rounded-xl border border-dashed border-border p-8 text-center">
-                    <FileText size={22} className="mx-auto mb-2 text-muted-foreground" />
-                    <p className="text-sm font-semibold">No DDL patches</p>
-                    <p className="mt-1 text-xs text-muted-foreground">AI Chat and Batch Edit will add raw SQL patches here when schema JSON is not expressive enough.</p>
-                  </div>
-                ) : (
-                  ddlPatches.map((patch) => (
-                    <div key={patch.id} className={`rounded-xl border p-3 ${patch.status === "pending" ? "border-border bg-background" : "border-border/60 bg-secondary/20 opacity-80"}`}>
-                      <div className="mb-3 flex items-start gap-3">
-                        <div className="flex-1 min-w-0">
-                          <input
-                            value={patch.title}
-                            onChange={e => updateDdlPatch(patch.id, { title: e.target.value })}
-                            disabled={patch.status === "applied"}
-                            className="w-full bg-transparent text-sm font-bold outline-none disabled:opacity-80"
-                          />
-                          <div className="mt-1 flex flex-wrap items-center gap-1.5">
-                            <span className="rounded-md bg-secondary px-2 py-0.5 text-[10px] font-semibold text-muted-foreground">{ddlPatchSourceLabel(patch.source)}</span>
-                            <span className={`rounded-md px-2 py-0.5 text-[10px] font-semibold ${patch.status === "pending" ? "bg-amber-500/10 text-amber-600 dark:text-amber-400" : "bg-accent/10 text-accent"}`}>
-                              {patch.status === "pending" ? "Pending" : "Applied"}
-                            </span>
-                            {patch.warnings.map(warning => (
-                              <span key={warning} className="rounded-md bg-destructive/10 px-2 py-0.5 text-[10px] font-semibold text-destructive">{warning}</span>
-                            ))}
-                          </div>
-                        </div>
-                        <div className="flex items-center gap-1">
-                          {patch.status === "pending" && (
-                            <button onClick={() => markDdlPatchesApplied([patch.id])} className="flex items-center gap-1 rounded-lg bg-accent/10 px-2 py-1 text-[10px] font-semibold text-accent hover:bg-accent/20">
-                              <CheckCircle2 size={11} /> Mark Applied
-                            </button>
-                          )}
-                          <button onClick={() => removeDdlPatch(patch.id)} className="flex h-7 w-7 items-center justify-center rounded-lg bg-secondary text-muted-foreground hover:text-destructive">
-                            <Trash2 size={12} />
-                          </button>
-                        </div>
-                      </div>
-                      <textarea
-                        value={patch.sql}
-                        onChange={e => updateDdlPatch(patch.id, { sql: e.target.value })}
-                        readOnly={patch.status === "applied"}
-                        spellCheck={false}
-                        className="min-h-[150px] w-full resize-y rounded-lg border border-border bg-card p-3 font-mono text-xs leading-relaxed outline-none focus:border-primary read-only:opacity-80"
-                      />
-                    </div>
-                  ))
-                )}
-              </div>
-
-              <div className="flex items-center justify-between border-t border-border px-5 py-3 shrink-0">
-                <p className="text-[11px] text-muted-foreground">Pending patches are appended to SQL export, deploy, and Supabase sync review.</p>
-                <button onClick={() => setShowDdlPatchesModal(false)} className="rounded-lg bg-secondary px-4 py-2 text-sm font-semibold hover:bg-secondary/80">Close</button>
-              </div>
-            </motion.div>
-          </motion.div>
-        )}
-      </AnimatePresence>
 
       {/* Mock Data Modal */}
       <MockDataModal
@@ -4517,14 +4428,9 @@ const VibeDBPage = () => {
                         <p className="text-xs text-muted-foreground"><AlertCircle size={12} className="inline mr-1" />This will run CREATE TABLE statements. Existing tables with the same name may cause errors.</p>
                       )}
                       {hasPendingDdlPatches && (
-                        <div className="flex items-center justify-between rounded-lg border border-amber-500/25 bg-amber-500/10 px-3 py-2">
-                          <div className="flex items-center gap-2 text-xs text-amber-700 dark:text-amber-300">
-                            <FileText size={13} />
-                            {pendingDdlPatchCount} pending DDL patch{pendingDdlPatchCount !== 1 ? "es" : ""} will run after schema SQL.
-                          </div>
-                          <button onClick={() => setShowDdlPatchesModal(true)} className="text-[10px] font-bold text-amber-700 underline underline-offset-2 dark:text-amber-300">
-                            Review
-                          </button>
+                        <div className="flex items-center gap-2 rounded-lg border border-amber-500/25 bg-amber-500/10 px-3 py-2 text-xs text-amber-700 dark:text-amber-300">
+                          <FileText size={13} />
+                          {pendingDdlPatchCount} pending DDL patch{pendingDdlPatchCount !== 1 ? "es" : ""} will run after schema SQL (included automatically in the reviewed SQL).
                         </div>
                       )}
                     </div>
@@ -4886,7 +4792,7 @@ $$ LANGUAGE plpgsql SECURITY DEFINER;`}</pre>
         onApplySuggestion={handleApplySuggestion}
         onCreateDdlPatch={(patch) => {
           const created = addDdlPatch({ ...patch, source: "ai-chat" });
-          if (created) addToast(`Added DDL patch: ${created.title}`, "success");
+          if (created) addToast(`Added "${created.title}" — included in exported SQL`, "success");
         }}
       />
 
