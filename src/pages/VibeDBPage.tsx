@@ -1242,10 +1242,16 @@ function runForceLayout(nodes: TableNode[]): TableNode[] {
     return a.id.localeCompare(b.id);
   });
 
+  // Anchor the grid at the centroid of the tables' CURRENT positions so the
+  // layout happens in place — not teleported to world origin (which can be
+  // far outside the viewport after panning/zooming).
+  const anchorX = newNodes.reduce((s, n) => s + n.x + TABLE_WIDTH / 2, 0) / newNodes.length;
+  const anchorY = newNodes.reduce((s, n) => s + n.y + nodeH(n) / 2, 0) / newNodes.length;
+
   const cellOf = new Map<string, { col: number; row: number }>();
   const occupied = new Set<string>();
   const key = (c: number, r: number) => `${c},${r}`;
-  const cellWorld = (c: number, r: number) => ({ x: c * stepX, y: r * stepY });
+  const cellWorld = (c: number, r: number) => ({ x: anchorX + c * stepX, y: anchorY + r * stepY });
 
   ordered.forEach((n, i) => {
     if (i === 0) {
@@ -1927,11 +1933,19 @@ const VibeDBPage = () => {
         // Phase 2: generate every table simultaneously. Each call produces
         // ~one table of JSON (seconds, not minutes) so the edge function's
         // 150s wall-clock limit is never a factor.
+        let doneCount = 0;
+        const bumpProgress = () => {
+          doneCount++;
+          tracker.updateCurrentStep(`Generating all tables in parallel (${doneCount}/${tableNames.length})`);
+        };
+        tracker.updateCurrentStep(`Generating all tables in parallel (0/${tableNames.length})`);
+
         const generateOne = async (name: string): Promise<any> => {
           const resp = await callAIRaw("generate-table", name, blueprintJson, strategy);
           const parsed = robustJsonParse(resp.result);
           const table = parsed?.tables?.[0] ?? parsed?.table ?? (parsed?.name && parsed?.columns ? parsed : null);
           if (!table?.name || !Array.isArray(table.columns)) throw new Error(`Invalid table response for ${name}`);
+          bumpProgress();
           return table;
         };
 
@@ -2087,11 +2101,10 @@ const VibeDBPage = () => {
 
         // Resolve FK linkedTableId references bidirectionally
         tracker.advanceStep();
-        setCanvasItems(prev => {
-          return resolveCanvasFKsBidirectional(prev, compiled);
-        });
-        // Auto layout once the new tables (with resolved FKs) are on the canvas
-        setTimeout(() => setCanvasItems(prev => runForceLayout(prev)), 100);
+        // Resolve FKs and auto-layout in ONE commit. A deferred second
+        // setCanvasItems (setTimeout) holds a stale useHistory setter and
+        // wipes the just-committed tables — see the empty-canvas race.
+        setCanvasItems(prev => runForceLayout(resolveCanvasFKsBidirectional(prev, compiled)));
         tracker.complete();
         const fixCount = cReport.actions.length;
         const batchNote = continuationCount > 0 ? ` across ${continuationCount + 1} batches` : "";
@@ -2595,20 +2608,17 @@ const VibeDBPage = () => {
     const result = diagnoseAndFixSchema(canvasItems, allErrors, view);
     console.log("[VibeDB Fix] Fix result:", { actionCount: result.actions.length, actions: result.actions });
 
-    // Apply fixes to canvas
-    setCanvasItems(result.fixedItems);
+    // Apply fixes to canvas — auto-layout in the SAME commit when new tables
+    // were created. A deferred setTimeout(setCanvasItems...) holds a stale
+    // useHistory setter and silently wipes the commit it follows.
+    const createdTables = result.actions.filter(a => a.type === "create_table");
+    setCanvasItems(createdTables.length > 0 ? runForceLayout(result.fixedItems) : result.fixedItems);
 
     // Store fix result for summary display
     setDeployFixResult(result);
 
     // Clear old deploy results since schema has changed
     setDeployResults(null);
-
-    // Re-run force layout if new tables were added
-    const createdTables = result.actions.filter(a => a.type === "create_table");
-    if (createdTables.length > 0) {
-      setTimeout(() => setCanvasItems(prev => runForceLayout(prev)), 100);
-    }
 
     const fixableCount = result.actions.filter(a => a.type !== "unfixable" && a.type !== "skip_existing").length;
     addToast(
@@ -2686,7 +2696,9 @@ const VibeDBPage = () => {
   const handleAutoLayout = () => {
     if (canvasItems.length === 0) return;
     addToast("Optimizing layout...", "info");
-    setTimeout(() => setCanvasItems(runForceLayout(canvasItems)), 50);
+    // Synchronous commit — a deferred setCanvasItems risks running through a
+    // stale useHistory setter and rolling back whatever committed in between.
+    setCanvasItems(runForceLayout(canvasItems));
   };
 
   // ─── Smart Inference ──────────────────────────────────

@@ -53,6 +53,14 @@ export function createGenerationTracker(onProgress: ProgressCallback) {
       emit();
     },
 
+    // Update the ACTIVE step's label in place (e.g. live counters like
+    // "Generating tables (12/20)") without advancing the step.
+    updateCurrentStep(label: string) {
+      if (currentStepIndex < 0 || currentStepIndex >= steps.length) return;
+      steps[currentStepIndex].label = label;
+      emit();
+    },
+
     insertStep(label: string) {
       const newStep: GenerationStep = {
         id: `step-${steps.length}`,
