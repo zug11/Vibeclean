@@ -130,8 +130,8 @@ Never lose your work.
 
 ### 1. Clone & install
 ```bash
-git clone https://github.com/zug11/clone.git
-cd clone
+git clone https://github.com/zug11/Vibeclean.git
+cd Vibeclean
 npm install
 ```
 
@@ -210,32 +210,53 @@ supabase secrets set STRIPE_WEBHOOK_SECRET=whsec_...     # Webhooks
 ## Project Structure
 
 ```
-vibedb/
+Vibeclean/
+├── SPECIFICATION.md                  # Full repo specification (every file & folder)
+├── CTO_SPRINT_GUIDE.md               # Sprint plan: SQL overhaul + canvas auto-layout
 ├── src/
 │   ├── pages/
 │   │   ├── LandingPage.tsx           # Marketing landing page
 │   │   ├── AuthPage.tsx              # Login / signup
-│   │   ├── VibeDBPage.tsx            # Main canvas editor
+│   │   ├── VibeDBPage.tsx            # Main canvas editor (canvas, layout, AI handlers)
 │   │   ├── PricingPage.tsx           # Subscription plans
 │   │   └── NotFound.tsx              # 404
 │   ├── components/
 │   │   ├── vibedb/
-│   │   │   ├── ExportGenerators.ts   # SQL, Prisma, Drizzle, GraphQL export
+│   │   │   ├── ExportGenerators.ts   # SQL, Prisma, Drizzle, GraphQL, CSV export
 │   │   │   ├── AIChatPanel.tsx       # AI chat assistant
-│   │   │   ├── SchemaAuditModal.tsx  # Audit scoring + suggestions
-│   │   │   ├── SQLViewerModal.tsx    # SQL preview
+│   │   │   ├── AskDataPanel.tsx      # Natural-language data questions
+│   │   │   ├── DatabaseManagerPanel.tsx # Live database management
+│   │   │   ├── GenerationHistoryPanel.tsx # AI generation history
 │   │   │   ├── MockDataModal.tsx     # Mock data generator
+│   │   │   ├── QueryBuilderPanel.tsx # AI query generation
+│   │   │   ├── SchemaAuditModal.tsx  # Audit scoring + suggestions
+│   │   │   ├── SchemaCompareModal.tsx # Schema snapshot diff
+│   │   │   ├── SQLViewerModal.tsx    # SQL preview
+│   │   │   ├── SREModePanel.tsx      # SRE / observability mode
+│   │   │   ├── SupabasePanel.tsx     # Supabase connection, RLS + TS types
 │   │   │   └── VibeDBSidebar.tsx     # Table library sidebar
 │   │   └── ui/                       # shadcn/ui component library
+│   ├── lib/
+│   │   ├── types.ts                  # The IR: TableNode, Column, DDLPatch, ...
+│   │   ├── compiler-pass.ts          # 7-pass schema compiler
+│   │   ├── project-storage.ts        # IndexedDB project persistence
+│   │   ├── schema-diff.ts            # Schema diff (+ schema-diff.test.ts)
+│   │   ├── supabase-integration.ts   # Target-project introspection
+│   │   ├── database-connection.ts    # Direct DB connection helpers
+│   │   ├── generation-*.ts           # AI strategies, history, progress tracking
+│   │   ├── sre-types.ts              # SRE panel types
+│   │   └── domains/                  # Domain rule modules (healthcare, finance, PE/VC)
 │   ├── hooks/                        # Auth, mobile, toast hooks
 │   ├── integrations/supabase/        # Supabase client + types
 │   ├── App.tsx                       # Router + route guards
 │   └── main.tsx                      # Entry point
 ├── supabase/
 │   ├── migrations/                   # Database migrations
-│   └── functions/                    # 7 edge functions
+│   └── functions/                    # 7 edge functions (AI, deploy, Stripe, subscription)
 └── public/                           # Static assets
 ```
+
+For a complete description of every file, see [SPECIFICATION.md](SPECIFICATION.md). For the upcoming sprint plan, see [CTO_SPRINT_GUIDE.md](CTO_SPRINT_GUIDE.md).
 
 ---
 
@@ -245,8 +266,11 @@ vibedb/
 |---------|-------------|
 | `npm run dev` | Start dev server on port 8080 |
 | `npm run build` | Production build |
+| `npm run build:dev` | Development-mode build |
 | `npm run preview` | Preview production build locally |
 | `npm run lint` | Run ESLint |
+| `npm test` | Run vitest suite once |
+| `npm run test:watch` | Run vitest in watch mode |
 
 ---
 
