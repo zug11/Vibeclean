@@ -42,7 +42,7 @@ import {
 import type { Column, TableNode, SchemaEnum, SchemaFunction, Toast, Project, AuditReport, CompilerReport, SupabaseBaseline, DDLPatch } from "@/lib/types";
 
 // ─── Constants ──────────────────────────────────────────
-const COLUMN_TYPES = ["uuid", "varchar", "int", "timestamp", "boolean", "numeric", "text", "jsonb", "decimal", "float"];
+const COLUMN_TYPES = ["uuid", "varchar", "int", "timestamptz", "timestamp", "boolean", "numeric", "text", "jsonb", "decimal", "float"];
 const PROMPT_SUGGESTIONS = [
   "E-commerce with users, products, orders",
   "SaaS app with workspaces, subscriptions, billing",
@@ -360,7 +360,7 @@ function inferColumnType(values: string[]): string {
   if (isBoolean) return "boolean";
   if (isInteger) return "int";
   if (isNumeric) return "numeric";
-  if (isTimestamp) return "timestamp";
+  if (isTimestamp) return "timestamptz";
   if (isJsonb) return "jsonb";
   return "varchar";
 }
@@ -609,6 +609,7 @@ function parseSQLDDL(sql: string): { tables: Omit<TableNode, "x" | "y">[] } {
       let normalizedType = "varchar";
       if (rawType.includes("int")) normalizedType = "int";
       else if (rawType.includes("uuid")) normalizedType = "uuid";
+      else if (rawType.includes("timestamptz")) normalizedType = "timestamptz";
       else if (rawType.includes("time") || rawType.includes("date")) normalizedType = "timestamp";
       else if (rawType.includes("bool")) normalizedType = "boolean";
       else if (rawType.includes("decimal") || rawType.includes("numeric")) normalizedType = "numeric";
@@ -1043,14 +1044,14 @@ function inferCorrectType(colName: string, aiType: string, isForeignKey: boolean
     if (name.includes("price") || name.includes("amount") || name.includes("rate") || name.includes("fee") || name.includes("cost") || name.includes("balance") || name.includes("salary")) return "numeric";
     if (name.includes("rating") || name.includes("score") || name.includes("percent")) return "numeric";
     if (name.includes("is_") || name.includes("has_") || name.includes("enabled") || name.includes("active") || name.includes("verified") || name.includes("public") || name.includes("featured")) return "boolean";
-    if (name.includes("_at") || name.includes("date") || name.includes("time") || name.includes("expires") || name.includes("started") || name.includes("ended")) return "timestamp";
+    if (name.includes("_at") || name.includes("date") || name.includes("time") || name.includes("expires") || name.includes("started") || name.includes("ended")) return "timestamptz";
     if (name.includes("meta") || name.includes("config") || name.includes("settings") || name.includes("data") || name.includes("payload") || name.includes("options")) return "jsonb";
     // Default correction: uuid → varchar for unknown non-ID columns
     return "varchar";
   }
 
   // Fix timestamp used for non-date columns
-  if (aiType === "timestamp" && !name.includes("_at") && !name.includes("date") && !name.includes("time") && !name.includes("expires") && !name.includes("started") && !name.includes("ended") && !name.includes("created") && !name.includes("updated") && !name.includes("deleted") && !name.includes("published") && !name.includes("scheduled") && !name.includes("last_") && !name.includes("next_")) {
+  if ((aiType === "timestamp" || aiType === "timestamptz") && !name.includes("_at") && !name.includes("date") && !name.includes("time") && !name.includes("expires") && !name.includes("started") && !name.includes("ended") && !name.includes("created") && !name.includes("updated") && !name.includes("deleted") && !name.includes("published") && !name.includes("scheduled") && !name.includes("last_") && !name.includes("next_")) {
     if (name.includes("code") || name.includes("coupon") || name.includes("token") || name.includes("name") || name.includes("key") || name.includes("status") || name.includes("version")) return "varchar";
   }
 
@@ -1932,8 +1933,8 @@ const VibeDBPage = () => {
               columns: [
                 { name: "id", type: "uuid", constraints: [{ type: "primary" }, { type: "notNull" }] },
                 ...(e.attributes || []).map((a: any) => ({ name: a.name, type: a.type || "varchar", constraints: [{ type: "notNull" }] })),
-                { name: "created_at", type: "timestamp", constraints: [{ type: "default", value: "now()" }] },
-                { name: "updated_at", type: "timestamp", constraints: [{ type: "default", value: "now()" }] },
+                { name: "created_at", type: "timestamptz", constraints: [{ type: "default", value: "now()" }] },
+                { name: "updated_at", type: "timestamptz", constraints: [{ type: "default", value: "now()" }] },
               ],
               indexes: [],
               checkConstraints: [],
@@ -1965,8 +1966,8 @@ const VibeDBPage = () => {
             columns: [
               { name: "id", type: "uuid", constraints: [{ type: "primary" }, { type: "notNull" }] },
               ...(e.attributes || []).map((a: any) => ({ name: a.name, type: a.type || "varchar", constraints: [{ type: "notNull" }] })),
-              { name: "created_at", type: "timestamp", constraints: [{ type: "default", value: "now()" }] },
-              { name: "updated_at", type: "timestamp", constraints: [{ type: "default", value: "now()" }] },
+              { name: "created_at", type: "timestamptz", constraints: [{ type: "default", value: "now()" }] },
+              { name: "updated_at", type: "timestamptz", constraints: [{ type: "default", value: "now()" }] },
             ],
             indexes: [],
             checkConstraints: [],
@@ -3342,7 +3343,7 @@ const VibeDBPage = () => {
       x: -view.x / view.zoom + 200, y: -view.y / view.zoom + 200,
       columns: [
         { id: uuidv4(), name: "id", type: "uuid", constraints: [{ type: "primary" }], fkStatus: "resolved" },
-        { id: uuidv4(), name: "created_at", type: "timestamp", constraints: [{ type: "notNull" }], fkStatus: "resolved" },
+        { id: uuidv4(), name: "created_at", type: "timestamptz", constraints: [{ type: "notNull" }], fkStatus: "resolved" },
       ],
     };
     setCanvasItems(prev => [...prev, newTable]);

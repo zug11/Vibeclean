@@ -839,7 +839,7 @@ function ensureStandardColumns(tables: TableNode[]): { tables: TableNode[]; acti
       columns.push({
         id: `compiler-created-${t.name}`,
         name: "created_at",
-        type: "timestamp",
+        type: "timestamptz",
         isForeignKey: false,
         constraints: [{ type: "default", value: "now()" }],
       } as any);
@@ -847,7 +847,7 @@ function ensureStandardColumns(tables: TableNode[]): { tables: TableNode[]; acti
         pass: "standard-columns",
         table: t.name,
         description: `Injected missing created_at on ${t.name}`,
-        after: "TIMESTAMP DEFAULT now()",
+        after: "TIMESTAMPTZ DEFAULT now()",
       });
     }
 
@@ -857,7 +857,7 @@ function ensureStandardColumns(tables: TableNode[]): { tables: TableNode[]; acti
       columns.push({
         id: `compiler-updated-${t.name}`,
         name: "updated_at",
-        type: "timestamp",
+        type: "timestamptz",
         isForeignKey: false,
         constraints: [{ type: "default", value: "now()" }],
       } as any);
@@ -865,7 +865,7 @@ function ensureStandardColumns(tables: TableNode[]): { tables: TableNode[]; acti
         pass: "standard-columns",
         table: t.name,
         description: `Injected missing updated_at on ${t.name}`,
-        after: "TIMESTAMP DEFAULT now()",
+        after: "TIMESTAMPTZ DEFAULT now()",
       });
     }
 

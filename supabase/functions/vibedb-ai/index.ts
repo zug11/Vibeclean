@@ -124,7 +124,7 @@ Constraint types: [{"type":"primary"},{"type":"notNull"},{"type":"unique"},{"typ
 
 MANDATORY RULES — violating these makes the schema invalid:
 1. EVERY table MUST have exactly ONE "id" column as its FIRST column: {"name":"id","type":"uuid","constraints":[{"type":"primary"},{"type":"notNull"},{"type":"default","value":"gen_random_uuid()"}]}
-2. EVERY table MUST have created_at and updated_at timestamp columns with default now().
+2. EVERY table MUST have created_at and updated_at timestamptz columns with default now().
 3. NEVER duplicate column names within a table. Each column name must be unique.
 4. NEVER have more than one primary key per table (only the id column).
 5. Foreign key columns must reference a column that EXISTS. Always reference "id" on the target table.
@@ -134,8 +134,8 @@ MANDATORY RULES — violating these makes the schema invalid:
 9. Generate INDEXES for: every FK column, columns commonly used in WHERE/ORDER BY, email/username (unique), composite indexes for multi-column queries, partial indexes with WHERE clauses for filtered queries (e.g. active records only), GIN indexes on JSONB columns.
 10. Generate CHECK CONSTRAINTS for ALL bounded columns: status/role/type enums (IN list), positive amounts (> 0), percentage/rating ranges (BETWEEN 0 AND 100 or BETWEEN 1 AND 5), non-negative counts (>= 0), priority levels, currency codes (IN ('USD','EUR','GBP','JPY','CAD','AUD') or similar). Name format: chk_<table>_<column>.
 11. For junction/mapping tables (many-to-many), add a COMPOSITE UNIQUE index on the two FK columns to prevent duplicate associations.
-12. For tables involving financial records, legal data, or user-generated content, add a "deleted_at" TIMESTAMP column (nullable, default null) for soft deletes.
-13. For columns storing secrets, tokens, or API keys, add companion columns: "expires_at" (timestamp), "last_rotated_at" (timestamp).
+12. For tables involving financial records, legal data, or user-generated content, add a "deleted_at" TIMESTAMPTZ column (nullable, default null) for soft deletes.
+13. For columns storing secrets, tokens, or API keys, add companion columns: "expires_at" (timestamptz), "last_rotated_at" (timestamptz).
 14. For self-referential FK columns (e.g. parent_id referencing same table): make them NULLABLE (root records have no parent) and add a CHECK constraint: parent_id != id.
 15. Prefer timestamptz over plain timestamp for all date/time columns — ensures timezone-aware storage.
 16. Prefer text over varchar when no max-length constraint exists — avoids silent truncation.
@@ -251,7 +251,7 @@ ADDITIONAL CHECKS:
 Suggestion format — each must have "type", "target_table", "payload", "reason":
 - add_index: {"type":"add_index","target_table":"users","payload":{"columns":["email"],"unique":false,"name":"idx_users_email"},"reason":"..."}
 - add_index (partial): {"type":"add_index","target_table":"orders","payload":{"columns":["user_id","created_at DESC"],"unique":false,"name":"idx_orders_user","where":"status = 'active'"},"reason":"..."}
-- add_column: {"type":"add_column","target_table":"users","payload":{"name":"deleted_at","type":"timestamp"},"reason":"..."}
+- add_column: {"type":"add_column","target_table":"users","payload":{"name":"deleted_at","type":"timestamptz"},"reason":"..."}
 - add_table: {"type":"add_table","target_table":"","payload":{"name":"audit_logs","columns":[{"name":"id","type":"uuid","constraints":[{"type":"primary"}]}]},"reason":"..."}
 - rename_table: {"type":"rename_table","target_table":"User","payload":{"newName":"users"},"reason":"..."}
 - rename_column: {"type":"rename_column","target_table":"users","payload":{"targetColumn":"fname","newName":"first_name"},"reason":"..."}
@@ -279,11 +279,11 @@ Return exactly: {"name":"column_name","type":"varchar","description":"..."}`;
 Return: {"changes":[...]}
 
 Each change must have an "action" field. Supported actions and their formats:
-- {"action":"add_column","targetTable":"users","column":{"name":"deleted_at","type":"timestamp","constraints":[]}}
+- {"action":"add_column","targetTable":"users","column":{"name":"deleted_at","type":"timestamptz","constraints":[]}}
 - {"action":"remove_column","targetTable":"users","column":"temp_field"}
 - {"action":"rename_column","targetTable":"users","targetColumn":"fname","newName":"first_name"}
 - {"action":"change_type","targetTable":"users","targetColumn":"age","newType":"int"}
-- {"action":"add_table","table":{"name":"audit_logs","columns":[{"name":"id","type":"uuid","constraints":[{"type":"primary"}]},{"name":"created_at","type":"timestamp","constraints":[]}]}}
+- {"action":"add_table","table":{"name":"audit_logs","columns":[{"name":"id","type":"uuid","constraints":[{"type":"primary"}]},{"name":"created_at","type":"timestamptz","constraints":[]}]}}
 - {"action":"remove_table","targetTable":"temp_data"}
 - {"action":"rename_table","targetTable":"User","newName":"users"}
 - {"action":"add_fk","targetTable":"orders","column":"user_id","referencesTable":"users","referencesColumn":"id"}
@@ -297,7 +297,7 @@ Each change must have an "action" field. Supported actions and their formats:
 
 Rules:
 - Apply the command to ALL relevant tables. If they say "add X to all tables", emit one add_column per table.
-- Column types: uuid, varchar, int, timestamp, boolean, numeric, text, jsonb, decimal, float, or any custom enum type name.
+- Column types: uuid, varchar, int, timestamptz, timestamp, boolean, numeric, text, jsonb, decimal, float, or any custom enum type name.
 - Constraints: [{"type":"primary"},{"type":"notNull"},{"type":"unique"},{"type":"default","value":"now()"}]
 - For add_index: include "name" field, "columns" array (can include DESC/ASC), optional "where" for partial indexes.
 - For add_constraint: include CHECK expression without the CHECK keyword or outer parens.
@@ -352,7 +352,7 @@ Suggestion types and payload formats:
 - remove_column: {"action":"remove_column","targetTable":"...","column":"..."}
 - remove_table: {"action":"remove_table","targetTable":"..."}
 
-Column types: uuid, varchar, int, timestamp, boolean, numeric, text, jsonb, decimal, float, or custom enum type names.
+Column types: uuid, varchar, int, timestamptz, timestamp, boolean, numeric, text, jsonb, decimal, float, or custom enum type names.
 Constraint types: primary, notNull, unique, default (with value).
 For add_table, always include id (uuid, primary), created_at, updated_at columns.
 Use ddl_patch for edge cases that cannot be represented safely in schema JSON: RLS policies, triggers, views, grants, extensions, generated columns, expression indexes, data backfills, preserving table/column renames with ALTER ... RENAME, or complex ALTER COLUMN TYPE ... USING migrations.

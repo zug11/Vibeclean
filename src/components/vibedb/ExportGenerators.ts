@@ -515,8 +515,8 @@ export function diagnoseAndFixSchema(
       y: offsetY,
       columns: [
         { id: simpleId(), name: "id", type: idType, constraints: [{ type: "primary" }, { type: "notNull" }], fkStatus: "resolved" },
-        { id: simpleId(), name: "created_at", type: "timestamp", constraints: [{ type: "default", value: "now()" }], fkStatus: "resolved" },
-        { id: simpleId(), name: "updated_at", type: "timestamp", constraints: [{ type: "default", value: "now()" }], fkStatus: "resolved" },
+        { id: simpleId(), name: "created_at", type: "timestamptz", constraints: [{ type: "default", value: "now()" }], fkStatus: "resolved" },
+        { id: simpleId(), name: "updated_at", type: "timestamptz", constraints: [{ type: "default", value: "now()" }], fkStatus: "resolved" },
       ],
     };
 
@@ -1114,7 +1114,7 @@ export function generatePrismaSchema(tables: TableNode[]): string {
       if (type === "varchar" || type === "text") type = "String";
       else if (type === "int") type = "Int";
       else if (type === "uuid") type = "String";
-      else if (type === "timestamp") type = "DateTime";
+      else if (type === "timestamp" || type === "timestamptz") type = "DateTime";
       else if (type === "boolean") type = "Boolean";
       else if (type === "numeric" || type === "decimal" || type === "float") type = "Float";
       else if (type === "jsonb") type = "Json";
@@ -1147,13 +1147,13 @@ export function generateDrizzleSchema(tables: TableNode[]): string {
       let type = "varchar";
       if (col.type === "int") type = "integer";
       else if (col.type === "uuid") type = "uuid";
-      else if (col.type === "timestamp") type = "timestamp";
+      else if (col.type === "timestamp" || col.type === "timestamptz") type = "timestamp";
       else if (col.type === "boolean") type = "boolean";
       else if (col.type === "numeric") type = "numeric";
       else if (col.type === "text") type = "text";
       else if (col.type === "jsonb") type = "jsonb";
 
-      let chain = `${type}()`;
+      let chain = col.type === "timestamptz" ? `${type}({ withTimezone: true })` : `${type}()`;
       if (col.constraints?.some(c => c.type === "primary")) chain += ".primaryKey()";
       if (col.constraints?.some(c => c.type === "unique")) chain += ".unique()";
       if (col.constraints?.some(c => c.type === "notNull")) chain += ".notNull()";
@@ -1186,7 +1186,7 @@ export function generateGraphQLTypes(tables: TableNode[]): string {
         let type = "String";
         if (col.type === "int") type = "Int";
         else if (col.type === "boolean") type = "Boolean";
-        else if (col.type === "timestamp") type = "DateTime";
+        else if (col.type === "timestamp" || col.type === "timestamptz") type = "DateTime";
         else if (col.type === "numeric" || col.type === "float") type = "Float";
 
         const nullable = !col.constraints?.some(c => c.type === "notNull") ? "" : "!";
@@ -1241,8 +1241,10 @@ export function buildSchemaFromIntent(intent: SchemaIntent): TableNode[] {
     'integer': 'integer',
     'boolean': 'boolean',
     'bool': 'boolean',
-    'date': 'timestamp',
-    'datetime': 'timestamp',
+    'date': 'timestamptz',
+    'datetime': 'timestamptz',
+    'timestamp': 'timestamp',
+    'timestamptz': 'timestamptz',
     'json': 'jsonb',
   };
 
@@ -1326,8 +1328,8 @@ export function buildSchemaFromIntent(intent: SchemaIntent): TableNode[] {
         });
       }
 
-      baseColumns.push({ id: simpleId(), name: "created_at", type: "timestamp", constraints: [{ type: "default", value: "now()" }], fkStatus: "resolved" });
-      baseColumns.push({ id: simpleId(), name: "updated_at", type: "timestamp", constraints: [{ type: "default", value: "now()" }], fkStatus: "resolved" });
+      baseColumns.push({ id: simpleId(), name: "created_at", type: "timestamptz", constraints: [{ type: "default", value: "now()" }], fkStatus: "resolved" });
+      baseColumns.push({ id: simpleId(), name: "updated_at", type: "timestamptz", constraints: [{ type: "default", value: "now()" }], fkStatus: "resolved" });
 
       const table: TableNode = {
         id: simpleId(),
@@ -1450,7 +1452,7 @@ export function buildSchemaFromIntent(intent: SchemaIntent): TableNode[] {
                 id: simpleId(), name: `${targetTable.name.toLowerCase().replace(/s$/, "")}_id`, type: "uuid",
                 isForeignKey: true, linkedTable: targetTable.name, linkedTableId: targetTable.id, linkedColumn: "id", fkStatus: "resolved"
               },
-              { id: simpleId(), name: "created_at", type: "timestamp", constraints: [{ type: "default", value: "now()" }], fkStatus: "resolved" },
+              { id: simpleId(), name: "created_at", type: "timestamptz", constraints: [{ type: "default", value: "now()" }], fkStatus: "resolved" },
             ]
           };
           tables.push(junctionTable);
