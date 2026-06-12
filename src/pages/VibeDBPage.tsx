@@ -1548,11 +1548,12 @@ const VibeDBPage = () => {
         setProjectName(meta.name);
         // Load full project data (with definition + dataRows) from IndexedDB
         ProjectStorage.getProject(meta.id).then(full => {
-          if (full) {
-            setCanvasItems(full.definition);
-            setSupabaseBaseline(full.supabaseBaseline || null);
-            setDdlPatches(full.ddlPatches || []);
-          }
+          if (!full) return;
+          // This .then can resolve AFTER the user has already generated tables —
+          // never overwrite a populated canvas with the persisted definition.
+          setCanvasItems(prev => prev.length > 0 ? prev : full.definition);
+          if (full.supabaseBaseline) setSupabaseBaseline(full.supabaseBaseline);
+          setDdlPatches(prev => prev.length > 0 ? prev : (full.ddlPatches || []));
         });
       }
     }
