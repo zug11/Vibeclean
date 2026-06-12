@@ -519,8 +519,9 @@ Use realistic commands (systemctl, kubectl, docker, curl, psql, etc.) appropriat
       content = content.replace(/,\s*$/, "");
       for (let i = 0; i < openBrackets; i++) content += "]";
       for (let i = 0; i < openBraces; i++) content += "}";
-      // Signal frontend to issue continuation calls for inspect-schema
-      if (type === "inspect-schema") {
+      // Signal frontend: inspect-schema issues continuation calls; batch-command
+      // surfaces a partial-results warning.
+      if (type === "inspect-schema" || type === "batch-command") {
         truncated = true;
       }
     }
