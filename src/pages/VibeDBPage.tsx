@@ -12,6 +12,7 @@ import { Link } from "react-router-dom";
 import { v4 as uuidv4 } from "uuid";
 import { motion, AnimatePresence } from "framer-motion";
 import { ProjectStorage } from "@/lib/project-storage";
+import { useHistory } from "@/lib/use-history";
 import { createGenerationTracker, type GenerationProgress } from "@/lib/generation-tracker";
 import { STRATEGIES, getDefaultStrategy, setDefaultStrategy } from "@/lib/generation-strategies";
 import { GenerationHistoryStore, type GenerationRecord } from "@/lib/generation-history";
@@ -1311,26 +1312,6 @@ function runForceLayout(nodes: TableNode[]): TableNode[] {
 }
 
 // ─── Hook: History ──────────────────────────────────────
-function useHistory<T>(initial: T): [T, (action: T | ((prev: T) => T)) => void, () => void, () => void, boolean, boolean] {
-  const [history, setHistory] = useState([initial]);
-  const [idx, setIdx] = useState(0);
-  const state = history[idx];
-  const setState = useCallback((action: T | ((prev: T) => T)) => {
-    setHistory(prev => {
-      const slice = prev.slice(0, idx + 1);
-      const current = slice[slice.length - 1];
-      const next = typeof action === "function" ? (action as (prev: T) => T)(current) : action;
-      const cloned = JSON.parse(JSON.stringify(next));
-      const newH = [...slice, cloned];
-      setIdx(newH.length - 1);
-      return newH;
-    });
-  }, [idx]);
-  const undo = useCallback(() => setIdx(p => Math.max(0, p - 1)), []);
-  const redo = useCallback(() => setIdx(p => Math.min(history.length - 1, p + 1)), [history.length]);
-  return [state, setState, undo, redo, idx > 0, idx < history.length - 1];
-}
-
 // ─── Generation Progress UI ─────────────────────────────
 function GenerationProgressUI({ progress }: { progress: GenerationProgress }) {
   return (
@@ -1707,6 +1688,7 @@ const VibeDBPage = () => {
   const [auditReport, setAuditReport] = useState<AuditReport | null>(null);
   const [showBatchModal, setShowBatchModal] = useState(false);
   const [batchPrompt, setBatchPrompt] = useState("");
+  const [batchStrategy, setBatchStrategy] = useState(getDefaultStrategy);
   const [isBatchProcessing, setIsBatchProcessing] = useState(false);
   const [batchError, setBatchError] = useState<string | null>(null);
   const [showAddTableMenu, setShowAddTableMenu] = useState(false);
@@ -1986,13 +1968,17 @@ const VibeDBPage = () => {
 
         // Run deterministic compiler pipeline
         tracker.advanceStep();
+        console.log(`[generate] compiler in: ${positioned.length} tables`);
         const { tables: compiled, report: cReport } = runCompilerPass(positioned);
+        console.log(`[generate] compiler out: ${compiled.length} tables, ${cReport.actions.length} fixes`);
         setCompilerReport(cReport);
 
         // Resolve FK linkedTableId references bidirectionally
         tracker.advanceStep();
         setCanvasItems(prev => {
-          return resolveCanvasFKsBidirectional(prev, compiled);
+          const resolved = resolveCanvasFKsBidirectional(prev, compiled);
+          console.log(`[generate] merge: prev=${prev.length} -> resolved=${resolved.length}`);
+          return resolved;
         });
         tracker.complete();
         const fixCount = cReport.actions.length;
@@ -3019,7 +3005,7 @@ const VibeDBPage = () => {
         return `${t.name}(${cols})`;
       }).join("\n");
 
-      const resultStr = await callAI("batch-command", batchPrompt, compactSchema);
+      const { result: resultStr, truncated: batchTruncated } = await callAIRaw("batch-command", batchPrompt, compactSchema, batchStrategy);
       const result = robustJsonParse(resultStr);
       const ddlPatchResults = (result?.ddlPatches || result?.ddl_patches || result?.patches || []) as Array<Record<string, unknown>>;
       const changes = [
@@ -3193,7 +3179,11 @@ const VibeDBPage = () => {
         }
       }
 
-      addToast(`Batch edit: ${applied} change${applied !== 1 ? "s" : ""} applied`, "success");
+      if (batchTruncated) {
+        addToast(`Batch edit: ${applied} change${applied !== 1 ? "s" : ""} applied — AI response was truncated, some changes may be missing. Re-run for the rest.`, "warning");
+      } else {
+        addToast(`Batch edit: ${applied} change${applied !== 1 ? "s" : ""} applied`, "success");
+      }
       setShowBatchModal(false); setBatchPrompt("");
     } catch (e: any) {
       setBatchError(e.message || "Batch processing failed");
@@ -4319,6 +4309,31 @@ const VibeDBPage = () => {
               <textarea value={batchPrompt} onChange={e => setBatchPrompt(e.target.value)}
                 placeholder='e.g. "Add soft delete (deleted_at timestamp) to all tables"'
                 className="w-full rounded-xl border border-border bg-background p-4 text-sm outline-none focus:border-primary resize-none" rows={4} />
+              <div className="mt-3">
+                <div className="mb-1.5 text-left text-[10px] font-bold uppercase tracking-wider text-muted-foreground">Model</div>
+                <div className="grid grid-cols-3 gap-1 rounded-xl bg-secondary/70 p-1">
+                  {STRATEGIES.map(s => {
+                    const label = s.id === "v1-direct" ? "Direct" : s.id === "v2-pipeline" ? "Pipeline" : "Fast";
+                    const selected = batchStrategy === s.id;
+                    return (
+                      <button
+                        key={s.id}
+                        type="button"
+                        aria-pressed={selected}
+                        onClick={() => setBatchStrategy(s.id)}
+                        className={`rounded-lg px-3 py-2 text-xs font-bold transition ${
+                          selected
+                            ? "bg-background text-foreground shadow-sm"
+                            : "text-muted-foreground hover:bg-background/60 hover:text-foreground"
+                        }`}
+                        title={s.description}
+                      >
+                        {label}
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
               {batchError && <div className="mt-2 rounded-lg bg-destructive/10 border border-destructive/20 px-3 py-2 text-xs text-destructive">{batchError}</div>}
               <div className="mt-4 flex justify-end gap-2">
                 <button onClick={() => setShowBatchModal(false)} className="rounded-lg bg-secondary px-4 py-2 text-sm font-semibold hover:bg-secondary/80">Cancel</button>

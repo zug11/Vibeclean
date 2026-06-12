@@ -429,9 +429,12 @@ Use realistic commands (systemctl, kubectl, docker, curl, psql, etc.) appropriat
     // ─── Model selection + token limits ──────────────────
     const fastTypes = ["generate-mock-data", "generate-sql", "generate-query", "smart-add-column"];
     // Use Haiku for explicitly fast types OR when "v3-fast" strategy is requested
-    const useFastModel = fastTypes.includes(type) || (strategy === "v3-fast" && type === "generate-schema");
+    const useFastModel = fastTypes.includes(type) ||
+      (strategy === "v3-fast" && (type === "generate-schema" || type === "batch-command"));
     const model = useFastModel ? "claude-haiku-4-5-20251001" : "claude-sonnet-4-6";
-    const longOutputTypes = ["generate-mock-data", "generate-sql", "generate-schema", "normalize-csv"];
+    // batch-command gets the long budget too: multi-table commands were silently
+    // truncating at 8192 tokens.
+    const longOutputTypes = ["generate-mock-data", "generate-sql", "generate-schema", "normalize-csv", "batch-command"];
     // Supabase edge functions have a 150s wall-clock timeout.
     // Sonnet 4.6 at ~130 tok/s: 16384 tokens ≈ 126s → fits within timeout.
     // Reactive chaining handles overflow for complex schemas (20+ tables).
