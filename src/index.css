@@ -180,3 +180,64 @@
   #print-area { position: absolute !important; left: 0 !important; top: 0 !important; width: 100% !important; height: auto !important; max-width: none !important; padding: 0 !important; margin: 0 !important; overflow: visible !important; }
   #print-area [contenteditable] { color: black !important; text-shadow: none !important; }
 }
+
+/* ===== Landing page: Mazzard Soft M (self-hosted) ===== */
+@font-face {
+  font-family: "Mazzard Soft M";
+  src: url("/fonts/mazzardsoftm/MazzardSoftM-Thin.woff2") format("woff2");
+  font-weight: 100;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: "Mazzard Soft M";
+  src: url("/fonts/mazzardsoftm/MazzardSoftM-Light.woff2") format("woff2");
+  font-weight: 300;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: "Mazzard Soft M";
+  src: url("/fonts/mazzardsoftm/MazzardSoftM-Regular.woff2") format("woff2");
+  font-weight: 400;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: "Mazzard Soft M";
+  src: url("/fonts/mazzardsoftm/MazzardSoftM-Medium.woff2") format("woff2");
+  font-weight: 500;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: "Mazzard Soft M";
+  src: url("/fonts/mazzardsoftm/MazzardSoftM-SemiBold.woff2") format("woff2");
+  font-weight: 600;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: "Mazzard Soft M";
+  src: url("/fonts/mazzardsoftm/MazzardSoftM-Bold.woff2") format("woff2");
+  font-weight: 700;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: "Mazzard Soft M";
+  src: url("/fonts/mazzardsoftm/MazzardSoftM-ExtraBold.woff2") format("woff2");
+  font-weight: 800;
+  font-style: normal;
+  font-display: swap;
+}
+
+/* Landing hero: faint blueprint grid, radially masked */
+.landing-grid-bg {
+  background-image:
+    linear-gradient(rgba(255, 255, 255, 0.04) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(255, 255, 255, 0.04) 1px, transparent 1px);
+  background-size: 44px 44px;
+  mask-image: radial-gradient(ellipse 80% 60% at 50% 30%, black 25%, transparent 75%);
+  -webkit-mask-image: radial-gradient(ellipse 80% 60% at 50% 30%, black 25%, transparent 75%);
+}

@@ -17,6 +17,7 @@ export default {
         sans: ["Space Grotesk", "sans-serif"],
         mono: ["JetBrains Mono", "monospace"],
         nunito: ["Nunito", "sans-serif"],
+        mazzard: ['"Mazzard Soft M"', "Space Grotesk", "sans-serif"],
       },
       colors: {
         border: "hsl(var(--border))",
@@ -53,6 +54,10 @@ export default {
           foreground: "hsl(var(--card-foreground))",
         },
         surface: "hsl(var(--surface))",
+        vibe: {
+          green: "#2eb889",
+          orange: "#E87A31",
+        },
         sidebar: {
           DEFAULT: "hsl(var(--sidebar-background))",
           foreground: "hsl(var(--sidebar-foreground))",
