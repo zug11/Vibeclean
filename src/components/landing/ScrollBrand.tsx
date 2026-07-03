@@ -110,23 +110,33 @@ export function useScrollBrand(
   };
 }
 
-/** The fixed-position logo that flies from the hero slot into the topbar. */
-export const FlyingLogo = ({ brand }: { brand: ScrollBrand }) => {
+/**
+ * The fixed-position logo that flies from the hero slot into the topbar.
+ * `visible` gates the intro handoff: hidden while the intro video plays,
+ * fading in as the video fades out.
+ */
+export const FlyingLogo = ({ brand, visible = true }: { brand: ScrollBrand; visible?: boolean }) => {
   if (brand.staticMode || !brand.ready) return null;
   return (
-    <motion.img
-      src="/vibedb-logo.svg"
-      alt=""
-      aria-hidden="true"
+    <motion.div
       className="pointer-events-none fixed left-0 top-0 z-[60]"
-      style={{
-        width: brand.heroW,
-        x: brand.x,
-        y: brand.y,
-        scale: brand.scale,
-        opacity: brand.flyOpacity,
-        transformOrigin: "top left",
-      }}
-    />
+      initial={false}
+      animate={{ opacity: visible ? 1 : 0 }}
+      transition={{ duration: 0.6, ease: "easeOut" }}
+    >
+      <motion.img
+        src="/vibedb-logo.svg"
+        alt=""
+        aria-hidden="true"
+        style={{
+          width: brand.heroW,
+          x: brand.x,
+          y: brand.y,
+          scale: brand.scale,
+          opacity: brand.flyOpacity,
+          transformOrigin: "top left",
+        }}
+      />
+    </motion.div>
   );
 };

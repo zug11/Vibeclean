@@ -1,5 +1,6 @@
 import type { RefObject } from "react";
 import { Link } from "react-router-dom";
+import { AnimatePresence, motion } from "framer-motion";
 import { ArrowRight } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { HERO } from "./copy";
@@ -13,16 +14,45 @@ interface HeroSectionProps {
   logoSlotRef: RefObject<HTMLDivElement>;
   /** Reduced motion: render the logo statically in the slot instead of flying it. */
   showStaticLogo: boolean;
+  /** Play the intro video in the logo slot; crossfades into the SVG logo when done. */
+  introVideo: boolean;
+  onIntroEnd: () => void;
 }
 
-const HeroSection = ({ logoSlotRef, showStaticLogo }: HeroSectionProps) => (
+const HeroSection = ({ logoSlotRef, showStaticLogo, introVideo, onIntroEnd }: HeroSectionProps) => (
   <section className="relative overflow-hidden px-6 pb-20 pt-12 md:pb-28 md:pt-16">
     <div className="landing-grid-bg pointer-events-none absolute inset-0" />
     <div className="pointer-events-none absolute left-1/2 top-[26rem] h-[38rem] w-[70rem] -translate-x-1/2 rounded-full bg-[radial-gradient(ellipse_at_center,rgba(46,184,137,0.13),transparent_60%)] blur-2xl" />
 
     <div className="relative mx-auto max-w-4xl text-center">
-      <div ref={logoSlotRef} className="mx-auto mb-8 h-44 w-[157px] md:mb-12 md:h-64 md:w-[229px]">
+      <div ref={logoSlotRef} className="relative mx-auto mb-8 h-36 w-[129px] md:mb-12 md:h-52 md:w-[186px]">
         {showStaticLogo && <img src="/vibedb-logo.svg" alt="VibeDB" className="h-full w-full" />}
+        <AnimatePresence>
+          {introVideo && (
+            <motion.video
+              key="intro"
+              autoPlay
+              muted
+              playsInline
+              preload="auto"
+              onEnded={onIntroEnd}
+              onError={onIntroEnd}
+              exit={{ opacity: 0, transition: { duration: 0.6, ease: "easeOut" as const } }}
+              // The logo artwork fills only ~46.5% of the square video frame,
+              // centered at (46.8%, 49.1%) — oversize and offset it so the
+              // in-video logo lands exactly on the SVG logo it crossfades into.
+              // mix-blend-screen keeps the frame's black margins from occluding
+              // the headline below (black-on-black passes through).
+              className="absolute left-1/2 top-1/2 h-[215%] w-auto max-w-none -translate-x-[46.8%] -translate-y-[49.1%] mix-blend-screen"
+              aria-hidden="true"
+            >
+              <source src="/vibedb-intro.webm" type="video/webm" />
+              {/* error on the last <source> = all sources failed (the event does
+                  not bubble to the <video> element itself) */}
+              <source src="/vibedb-intro.mp4" type="video/mp4" onError={onIntroEnd} />
+            </motion.video>
+          )}
+        </AnimatePresence>
       </div>
       <h1 className="text-balance text-4xl leading-[1.08] tracking-tight sm:text-5xl lg:text-[64px]">
         <span className="block font-semibold text-white/70">{HERO.h1Line1}</span>
