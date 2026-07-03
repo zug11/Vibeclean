@@ -1,3 +1,4 @@
+import type { RefObject } from "react";
 import { Link } from "react-router-dom";
 import { ArrowRight } from "lucide-react";
 import { Button } from "@/components/ui/button";
@@ -7,12 +8,22 @@ import SchemaShowcase from "./SchemaShowcase";
 const GRADIENT_PHRASE = "survive contact with reality.";
 const h1Prefix = HERO.h1Line2.replace(GRADIENT_PHRASE, "").trimEnd();
 
-const HeroSection = () => (
-  <section className="relative overflow-hidden px-6 pb-20 pt-16 md:pb-28 md:pt-24">
+interface HeroSectionProps {
+  /** Reserves the space the big brand logo occupies before it flies to the topbar. */
+  logoSlotRef: RefObject<HTMLDivElement>;
+  /** Reduced motion: render the logo statically in the slot instead of flying it. */
+  showStaticLogo: boolean;
+}
+
+const HeroSection = ({ logoSlotRef, showStaticLogo }: HeroSectionProps) => (
+  <section className="relative overflow-hidden px-6 pb-20 pt-12 md:pb-28 md:pt-16">
     <div className="landing-grid-bg pointer-events-none absolute inset-0" />
     <div className="pointer-events-none absolute left-1/2 top-[26rem] h-[38rem] w-[70rem] -translate-x-1/2 rounded-full bg-[radial-gradient(ellipse_at_center,rgba(46,184,137,0.13),transparent_60%)] blur-2xl" />
 
     <div className="relative mx-auto max-w-4xl text-center">
+      <div ref={logoSlotRef} className="mx-auto mb-8 h-44 w-[157px] md:mb-12 md:h-64 md:w-[229px]">
+        {showStaticLogo && <img src="/vibedb-logo.svg" alt="VibeDB" className="h-full w-full" />}
+      </div>
       <h1 className="text-balance text-4xl leading-[1.08] tracking-tight sm:text-5xl lg:text-[64px]">
         <span className="block font-semibold text-white/70">{HERO.h1Line1}</span>
         <span className="mt-2 block font-extrabold">
