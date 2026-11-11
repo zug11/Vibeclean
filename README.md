@@ -1,352 +1,159 @@
-<p align="center">
-  <img src="public/favicon.png" alt="VibeDB" width="96" />
-</p>
-
-<h1 align="center">VibeDB</h1>
-
-<p align="center">
-  <strong>Speak it. See it. Ship it.</strong>
-  <br />
-  The AI-native database designer — from a sentence in plain English to a production Postgres schema, deployed, in under a minute.
-</p>
-
-<p align="center">
-  <img alt="React 18" src="https://img.shields.io/badge/React-18-61DAFB?logo=react&logoColor=white&labelColor=20232a" />
-  <img alt="TypeScript" src="https://img.shields.io/badge/TypeScript-5.8-3178C6?logo=typescript&logoColor=white&labelColor=20232a" />
-  <img alt="Vite 5" src="https://img.shields.io/badge/Vite-5-646CFF?logo=vite&logoColor=white&labelColor=20232a" />
-  <img alt="Supabase" src="https://img.shields.io/badge/Supabase-Postgres%20%2B%20Edge-3FCF8E?logo=supabase&logoColor=white&labelColor=20232a" />
-  <img alt="Claude" src="https://img.shields.io/badge/AI-Anthropic%20Claude-d4a27f?labelColor=20232a" />
-  <img alt="License" src="https://img.shields.io/badge/license-BSL-blue?labelColor=20232a" />
-</p>
-
-<p align="center">
-  <a href="#the-vision">Vision</a> &bull;
-  <a href="#features">Features</a> &bull;
-  <a href="#how-it-works">How It Works</a> &bull;
-  <a href="#getting-started">Get Started</a> &bull;
-  <a href="#roadmap">Roadmap</a> &bull;
-  <a href="#project-structure">Structure</a>
-</p>
-
----
-
-## The Vision
-
-> **Every great product starts with a data model. Almost nobody enjoys building one.**
-
-Schemas today are written in a 1970s text format, reviewed by squinting at diffs, and broken in production by a missing index nobody noticed. We think the database layer deserves what the frontend got a decade ago: a visual, intelligent, instantly-deployable design surface.
-
-VibeDB is building toward a world where:
-
-- **Natural language is the source format.** "A marketplace with vendors, listings, escrow payments and reviews" *is* the spec — the schema, constraints, indexes, and RLS policies follow from it.
-- **The canvas is the single source of truth.** Visual design, hand-written SQL, and AI edits all converge on one intermediate representation that round-trips losslessly to SQL, Prisma, Drizzle, and GraphQL.
-- **Mistakes are caught before they exist.** A static-analysis engine — think ESLint for your database — flags the missing primary key, the FK type mismatch, the btree index on jsonb, *while you design*, not at 2 a.m. during an incident.
-- **Deploy is a button, rollback is a guarantee.** Versioned schemas, dependency-ordered idempotent DDL, and dry-run validation make shipping a schema as safe as shipping a commit.
-
-The whiteboard era of database design is over.
-
----
-
-## Features
-
-### Visual Canvas Designer
-Design your schema the way you think about it — spatially.
-
-- **Infinite canvas** with pan, zoom, and drag-and-drop
-- **Auto-layout** untangles your schema with one click
-- **FK relationship lines** drawn as live bezier curves between the exact columns they connect
-- **Full undo/redo** history (Ctrl+Z / Ctrl+Y)
-
-### Complete Schema Modeling
-Production-grade Postgres, not a toy diagram.
-
-- **10+ column types** — `uuid`, `varchar`, `text`, `int`, `numeric`, `decimal`, `float`, `timestamp`, `boolean`, `jsonb`, custom enums
-- **Constraints** — primary keys, not-null, unique, defaults
-- **Foreign keys** — visual creation, status tracking, `DEFERRABLE` support
-- **Indexes** — standard, unique, and partial indexes with `WHERE` clauses
-- **Check constraints** — custom validation expressions
-- **Enum types** — `CREATE TYPE` for categorical data
-- **Functions & triggers** — `CREATE OR REPLACE FUNCTION` with `$$` block support
-
-### AI That Builds, Not Just Suggests
-Powered by **Anthropic Claude**, wired into every surface of the product.
-
-| | Feature | What it does |
-|---|---------|-------------|
-| **Generate** | Schema Generation | Describe your app → a complete, normalized schema appears on the canvas |
-| **Edit** | Batch Commands | "Add soft delete to all tables" — done in one command |
-| **Suggest** | Smart Columns | AI recommends columns from your table's context |
-| **Audit** | Schema Audit | A 0–100 quality score with a detailed rubric and one-click fixes |
-| **Chat** | AI Assistant | Brainstorm, refine, and apply schema changes conversationally |
-| **Query** | Query Generation | Describe what you want → get the SQL |
-| **Seed** | Mock Data | Realistic INSERTs that respect FK order and relationships |
-
-### Export Anywhere
-One design, every serialization your stack needs.
-
-- **SQL** — PostgreSQL DDL with tables, indexes, constraints, enums, and functions
-- **Prisma** — complete schema with models, relations, and type mappings
-- **Drizzle** — TypeScript ORM definitions ready to drop in
-- **GraphQL** — type definitions for your API layer
-- **CSV** — table and column metadata for documentation
-
-### One-Click Deploy to Supabase
-Design to production in seconds — safely.
-
-- Connect with URL + service role key
-- **Pre-deploy validation** catches issues before they touch your database
-- **Smart FK ordering** — tables created in dependency order
-- **Idempotent** — re-deploy without "already exists" errors
-- **DEFERRABLE constraints** and **dollar-quote-aware** function deployment
-
-### Schema Quality Tools
-Ship with receipts.
-
-- **AI Audit** — scoring rubric: −15 missing PKs, −5 missing indexes, −3 naming violations, and more
-- **Deduplication** — one-click cleanup of duplicate indexes and columns
-- **Linting** — automatic naming convention validation
-- **Schema Diff** — snapshot and compare your schema over time
-- **Auto-fix** — detect and resolve issues before deployment
-
-### Project Management
-Never lose work, never lose context.
-
-- **Cloud save** to Supabase + **auto-save** every 3 seconds
-- **Project browser** — search, create, and switch between schemas
-- **SQL Import** — load existing DDL straight onto the canvas
-
----
-
-## How It Works
-
-Everything converges on one intermediate representation — the IR (`TableNode[]`). Whatever the input, the canvas, the exports, and the deploy pipeline always agree.
-
-```mermaid
-flowchart LR
-    A["Plain English"] -->|Claude| IR
-    B["Hand-written SQL"] -->|Parser| IR
-    C["Visual canvas edits"] --> IR
-    IR[("Schema IR")] --> D["Canvas"]
-    IR --> E["SQL / Prisma / Drizzle / GraphQL"]
-    IR --> F["RLS policies + TS types"]
-    E -->|"validated, ordered, idempotent"| G[("Your Supabase project")]
-```
-
----
-
-## Roadmap
-
-The ambition: make VibeDB the most trustworthy way to design and ship a database. The current sprint (tracked in [CTO_SPRINT_GUIDE.md](CTO_SPRINT_GUIDE.md) and Jira) is laying the foundations.
-
-**Now — the trust release**
-- [ ] **Faithful compiler modes** — your SQL is *your* SQL: zero silent mutation on user-driven paths
-- [ ] **AST-based SQL parser** — lossless import of UNIQUE, CHECK, partial indexes, and ON DELETE
-- [ ] **Unified inline SQL editor** — CodeMirror-powered, two-way sync between SQL text and canvas
-- [ ] **`analyzeSchema` diagnostics engine** — 20+ static-analysis rules (ESLint for Postgres) with risk-aware one-click fixes
-- [ ] **Round-trip CI invariant** — import → export → re-import is provably lossless, enforced on every commit
-- [ ] **Next-generation auto-layout** — layered graph placement with guaranteed zero node overlap and routed, de-spaghettified bezier edges
-
-**Next**
-- [ ] Schema migrations — diff two versions, generate `ALTER` scripts
-- [ ] Per-table provenance — user-authored vs AI-generated vs imported, tracked forever
-- [ ] Domain intelligence as opt-in suggestion packs (healthcare, fintech, marketplaces)
-- [ ] Team workspaces — share, comment, and review schemas together
-
-**Beyond**
-- [ ] Live database sync — design against production, safely
-- [ ] Multi-engine targets — MySQL, SQLite, PlanetScale, Neon
-- [ ] Schema registry & versioned APIs — the data layer as a first-class artifact
-
----
-
-## Tech Stack
-
-| Layer | Technology |
-|-------|------------|
-| **Frontend** | React 18 + TypeScript |
-| **Build** | Vite 5 (SWC) |
-| **Styling** | Tailwind CSS 3 |
-| **Components** | shadcn/ui (Radix UI) |
-| **Animations** | Framer Motion |
-| **Icons** | Lucide React |
-| **Backend** | Supabase (Auth + Postgres + Edge Functions) |
-| **AI** | Anthropic Claude API |
-| **Payments** | Stripe |
-| **Routing** | React Router v6 |
-| **Server State** | TanStack React Query |
-
----
-
-## Getting Started
-
-### Prerequisites
-- **Node.js** 18+
-- A **Supabase** project ([supabase.com](https://supabase.com))
-- **Supabase CLI** (`npm install -g supabase`)
-- **Anthropic API key** for AI features ([console.anthropic.com](https://console.anthropic.com))
-
-### 1. Clone & install
-```bash
-git clone https://github.com/zug11/Vibeclean.git
-cd Vibeclean
-npm install
-```
-
-### 2. Configure environment
-```bash
-cp .env.example .env
-```
-
-Fill in your Supabase credentials:
-```env
-VITE_SUPABASE_URL=https://your-project.supabase.co
-VITE_SUPABASE_PUBLISHABLE_KEY=your-anon-public-key
-```
-
-### 3. Set up the database
-```bash
-supabase db push
-```
-
-This runs two migrations:
-- `001_initial_schema.sql` — `profiles` and `schemas` tables with RLS policies
-- `002_subscription_credits.sql` — subscription tier and credit columns
-
-### 4. Deploy edge functions
-```bash
-supabase functions deploy
-supabase secrets set ANTHROPIC_API_KEY=sk-ant-...
-```
-
-### 5. Start designing
-```bash
-npm run dev
-```
-
-Open **http://localhost:8080** — describe your app, and watch the schema build itself.
-
----
-
-## Supabase Setup
-
-### Database
-
-| Table | Purpose |
-|-------|---------|
-| `profiles` | User profiles — display name, avatar, subscription tier, AI credits |
-| `schemas` | Saved projects — name, JSONB schema definition, timestamps |
-
-Both tables enforce **Row Level Security** — users can only read and write their own data.
-
-### Auth
-- **Google OAuth** — one-click sign-in
-- **Email/Password** — traditional signup with email verification
-- Auto-creates a profile on first login
-
-### Edge Functions
-
-| Function | Purpose |
-|----------|---------|
-| `vibedb-ai` | AI gateway — routes to Claude for schema generation, audit, chat, batch commands, mock data, queries |
-| `vibedb-deploy` | Deploys SQL DDL to a target Supabase project |
-| `check-subscription` | Returns subscription status and remaining credits |
-| `create-checkout` | Creates Stripe checkout sessions |
-| `buy-credits` | Processes credit top-up purchases |
-| `customer-portal` | Opens Stripe customer portal |
-| `stripe-webhook` | Handles Stripe webhook events |
-
-### Secrets
-```bash
-supabase secrets set ANTHROPIC_API_KEY=sk-ant-...       # AI features
-supabase secrets set STRIPE_SECRET_KEY=sk_...            # Payments
-supabase secrets set STRIPE_WEBHOOK_SECRET=whsec_...     # Webhooks
-```
-
----
-
-## Project Structure
-
-```
-Vibeclean/
-├── SPECIFICATION.md                  # Full repo specification (every file & folder)
-├── CTO_SPRINT_GUIDE.md               # Sprint plan: SQL overhaul + canvas auto-layout
-├── src/
-│   ├── pages/
-│   │   ├── LandingPage.tsx           # Marketing landing page
-│   │   ├── AuthPage.tsx              # Login / signup
-│   │   ├── VibeDBPage.tsx            # Main canvas editor (canvas, layout, AI handlers)
-│   │   ├── PricingPage.tsx           # Subscription plans
-│   │   └── NotFound.tsx              # 404
-│   ├── components/
-│   │   ├── vibedb/
-│   │   │   ├── ExportGenerators.ts   # SQL, Prisma, Drizzle, GraphQL, CSV export
-│   │   │   ├── AIChatPanel.tsx       # AI chat assistant
-│   │   │   ├── AskDataPanel.tsx      # Natural-language data questions
-│   │   │   ├── DatabaseManagerPanel.tsx # Live database management
-│   │   │   ├── GenerationHistoryPanel.tsx # AI generation history
-│   │   │   ├── MockDataModal.tsx     # Mock data generator
-│   │   │   ├── QueryBuilderPanel.tsx # AI query generation
-│   │   │   ├── SchemaAuditModal.tsx  # Audit scoring + suggestions
-│   │   │   ├── SchemaCompareModal.tsx # Schema snapshot diff
-│   │   │   ├── SQLViewerModal.tsx    # SQL preview
-│   │   │   ├── SREModePanel.tsx      # SRE / observability mode
-│   │   │   ├── SupabasePanel.tsx     # Supabase connection, RLS + TS types
-│   │   │   └── VibeDBSidebar.tsx     # Table library sidebar
-│   │   └── ui/                       # shadcn/ui component library
-│   ├── lib/
-│   │   ├── types.ts                  # The IR: TableNode, Column, DDLPatch, ...
-│   │   ├── compiler-pass.ts          # 7-pass schema compiler
-│   │   ├── project-storage.ts        # IndexedDB project persistence
-│   │   ├── schema-diff.ts            # Schema diff (+ schema-diff.test.ts)
-│   │   ├── supabase-integration.ts   # Target-project introspection
-│   │   ├── database-connection.ts    # Direct DB connection helpers
-│   │   ├── generation-*.ts           # AI strategies, history, progress tracking
-│   │   ├── sre-types.ts              # SRE panel types
-│   │   └── domains/                  # Domain rule modules (healthcare, finance, PE/VC)
-│   ├── hooks/                        # Auth, mobile, toast hooks
-│   ├── integrations/supabase/        # Supabase client + types
-│   ├── App.tsx                       # Router + route guards
-│   └── main.tsx                      # Entry point
-├── supabase/
-│   ├── migrations/                   # Database migrations
-│   └── functions/                    # 7 edge functions (AI, deploy, Stripe, subscription)
-└── public/                           # Static assets
-```
-
-For a complete description of every file, see [SPECIFICATION.md](SPECIFICATION.md). For the upcoming sprint plan, see [CTO_SPRINT_GUIDE.md](CTO_SPRINT_GUIDE.md).
-
----
-
-## Scripts
-
-| Command | Description |
-|---------|-------------|
-| `npm run dev` | Start dev server on port 8080 |
-| `npm run build` | Production build |
-| `npm run build:dev` | Development-mode build |
-| `npm run preview` | Preview production build locally |
-| `npm run lint` | Run ESLint |
-| `npm test` | Run vitest suite once |
-| `npm run test:watch` | Run vitest in watch mode |
-
----
-
-## Environment Variables
-
-| Variable | Location | Description |
-|----------|----------|-------------|
-| `VITE_SUPABASE_URL` | `.env` | Your Supabase project URL |
-| `VITE_SUPABASE_PUBLISHABLE_KEY` | `.env` | Supabase anon/public key |
-| `ANTHROPIC_API_KEY` | Supabase secrets | Anthropic API key for Claude |
-| `STRIPE_SECRET_KEY` | Supabase secrets | Stripe secret key |
-| `STRIPE_WEBHOOK_SECRET` | Supabase secrets | Stripe webhook signing secret |
-
----
-
-## License
-
-BSL
-
-<p align="center">
-  <sub>Built for everyone who has ever drawn a database on a napkin.</sub>
-</p>
+# VibeDB
+
+**Design a database, bring your spreadsheets into it, and build useful dashboards over data you control.**
+
+VibeDB is being developed as a local-first, bring-your-own-key PostgreSQL and Supabase workspace. Its direction connects natural-language schema design, a visual editor, faithful SQL, reviewed database changes, conversational spreadsheet imports, and a management studio with saved dashboards.
+
+The intended experience is one continuous workflow: explain the business → establish the schema and meaning of its data → review the changes → use a supported customer-owned database → import and inspect records → save useful views → update the data without rebuilding everything.
+
+## Project status and this repository
+
+**This is a development roadmap, not a claim that the complete workflow is already available.** The development project is a hardened alpha, with further reliability work and end-to-end qualification required. The plans describe both findings from the audited development checkout and work proposed to address them.
+
+The documentation publication on **12 November 2026 changes Markdown only**. It does not publish the newer local application code. The source snapshot preceding this documentation update is [commit `46f2126`, dated 12 June 2026](https://github.com/zug11/Vibeclean/tree/46f21264cbf7486e4fa9d633a4ef70035380c034), and differs from the development checkout inspected for the October/November plans. Paths and capabilities described in those plans may therefore be absent from the published source.
+
+The [previous README](docs/history/README_BEFORE_ROADMAP_2026-11-12.md) is retained as historical context. It describes an older hosted product model. **The active direction is local-first and BYOK, without product accounts, product authentication, billing, or payments.** Customer-database roles, permissions, and row-level policies are a separate concern and remain part of correct database operation. Older root-level proposals should be read in this context.
+
+## Read the detailed plans
+
+| Document | Purpose and status |
+| --- | --- |
+| [Full implementation plan](docs/plans/IMPLEMENTATION_PLAN.md) | The main product roadmap: generation completion, connections, faithful design and deployment, conversational CSV imports, customer-database dashboards, repeat imports, scale, Excel, and studio improvements. Originally written 29 October 2026. |
+| [Phase 1: Schema History, Parallel Reading, and IR + DDL](docs/plans/PHASE_1_SCHEMA_HISTORY_AND_IR_DDL.md) | The focused foundation plan for durable before/after history, evidence-backed assistant reading, and complete structured-schema plus SQL proposals. Written 3 November 2026; it supplements the main roadmap. |
+| [Schema Control Hardening Specification](docs/plans/SCHEMA_CONTROL_HARDENING_SPECIFICATION.md) | A broader architectural proposal retained for its detailed fidelity and verification requirements. Parts are superseded: a wholesale schema-model replacement and hosted account/credit systems are not prerequisites of the active roadmap. |
+
+The main roadmap and focused Phase 1 plan take precedence where the historical hardening proposal conflicts with them. The focused Phase 1 preserves the existing authoritative `TableNode[]` / `SchemaDocument` representation; replacing it with a new canonical IR requires a separately scoped decision and migration plan.
+
+## Two ways into the same workflow
+
+### Design the system, then fit the data
+
+A business can first describe what it needs: customers, orders, order items, payments, returns, or a reporting workflow. VibeDB should help establish a coherent database design, explain relationships, preserve the accepted definitions, and produce reviewable SQL.
+
+Existing spreadsheets can then be mapped into that design. Source headings do not have to dictate the final database structure. The import plan can map fields, convert dates, preserve identifiers, reconcile keys, separate entities, or relate datasets when those operations have a clear business meaning. Ambiguities require focused decisions rather than invented values or silently discarded records.
+
+### Start with spreadsheets, then establish the design
+
+A business can instead add a CSV, preview it immediately, and describe what each row means. A conversation should establish the important choices alongside an editable grid and concrete import plan: headings, types, date formats, row grain, destination, keys, and how files relate.
+
+Importing one coherent spreadsheet as one table is a valid outcome. Splitting it into several tables is useful when the intended work and verified relationships justify it. Both entry points lead to the same schema, dataset identities, connection, saved metrics, dashboards, and recovery model.
+
+## First priority: generation that reaches a useful outcome
+
+Generation must finish with an accepted design or a retained candidate and a precise way to resolve the remaining issue. It must not lose useful work, repeatedly replay the same invalid answer, or leave a user guessing whether the model, transport, validator, or application failed.
+
+The generation work includes:
+
+- Visible effective blueprint and worker model selections, with actionable stage-specific provider failures.
+- Durable progress and candidate recovery across interruption and restart.
+- Correct validator behavior for supported constraints, composite keys, quoted identifiers, and other reproduced false blockers.
+- Separate blocking errors, unresolved requirements, and optional advisories.
+- Deterministic repairs when the intended change is fully specified; a focused question when a business choice is missing; bounded AI proposals where interpretation is useful.
+- Clearer generated relationship names, such as `parent_comment_id`, while preserving explicitly authored or imported names.
+- Explicit requirement accounting: successfully executing SQL does not establish that every requested feature was generated.
+
+Completion does not mean weakening the verification gate. A useful design can be retained and exported while unsupported automatic deployment remains blocked. Naming preferences and speculative performance advice must not become reasons for an otherwise usable design to disappear.
+
+## Phase 1: an assistant that understands what actually changed
+
+The assistant should reason from canonical schema state and recorded application outcomes. It needs four distinguishable states for each attempted edit: **before, proposed after, confirmed after, and current**. A suggestion, rejected operation, later manual edit, and successful application must not become interchangeable chat memories.
+
+Durable semantic versions and operation receipts should allow the assistant to explain an actual change, recognize that a repeated request is already satisfied, and notice when the document has changed since its proposal. Revision checks and a single application boundary remain responsible for preventing stale or duplicate writes. Undo changes the local design; it does not reverse an already executed database operation.
+
+For larger questions, the planned reading pipeline is:
+
+**Prompt → immutable schema snapshot → inspection blueprint → bounded parallel readers → evidence consolidation → one reviewed proposal → deterministic application → recorded outcome.**
+
+Readers inspect explicit objects and dependencies, report evidence and omissions, and do not mutate the schema. Small questions should use a smaller direct inspection. Whole-schema claims require complete declared coverage; an unavailable worker cannot silently become “everything checked.” Concurrency, time, token use, retries, and retained evidence all need bounds.
+
+### Structured schema and SQL must work together
+
+The intermediate representation (IR) handles the exact objects it supports. Functions, triggers, views, and other SQL objects outside that representation need stable, versioned SQL artifacts with ownership, dependency information, recovery text, and honest support status.
+
+Generation and assistant edits should use one explicit capability contract. A request for tables plus an audit trigger must account for both. The proposal must not omit the trigger, define the same object twice, or advertise an operation that the application cannot apply.
+
+The intended lifecycle is to retain structured and SQL artifacts together, assemble them in dependency order, show before/after changes, preserve them through restart and export, and verify what is actually supported. **Retained, exportable, executable, behaviorally verified, and confirmed live are different states.** Opaque SQL preservation alone does not establish safe deployment or correct behavior.
+
+## Faithful design, connections, and deployment
+
+The visual editor, SQL editor, import, export, comparison, and management studio must agree about the same design. Supported DDL should preserve exact names, namespaces and quoting, ordered key pairs, constraints, index definitions, expressions, and timing/action flags through parse → emit → parse. Canvas position and temporary UI state do not belong in semantic equality.
+
+Compiler analysis and repair have explicit roles. Faithful import, manual SQL editing, export, comparison, and deployment must not silently rewrite a schema. Unsupported syntax should retain its identity and verbatim recovery text; unsupported-only changes remain visible blocked work.
+
+Connection work must qualify the application people actually run, including the installed desktop artifact. One verified target identity and credential reference should carry through deployment, imports, browsing, and dashboards. Secret keys require the appropriate native execution path; changing a key's format is not proof of authority.
+
+Every live schema review should compare the last confirmed baseline, a fresh live catalog, and the intended design. Disjoint changes can be reconciled; overlapping changes require an explicit conflict. Immediately before mutation, recheck live state and journal the immutable reviewed SQL and fingerprints. An uncertain response must lead to reconciliation, not automatic replay.
+
+The baseline advances only after a fresh catalog proves the intended supported schema is present. Atomic execution is not a blanket rollback guarantee. The audited exact Supabase sync boundary is ordinary `public` tables, with `auth.users` only as an external foreign-key target; broader object or namespace management needs qualification before the product claims it.
+
+## Conversational CSV import with a concrete plan
+
+The main import interface should be a conversation beside a familiar preview, with direct controls available for every supported decision. Users should be able to say what the data means without learning database-normalization terminology.
+
+VibeDB should propose a typed, editable import plan covering source files, destination, field mappings, transformations, keys, access, and expected effects. Parsing, conversion, validation, upload, publication, and recovery remain deterministic operations. AI helps propose the plan; it is not the uploader or the source of arithmetic truth.
+
+The import path must preserve leading zeros, precise numeric values, NULL versus empty strings, quoted multiline fields, and approved date/time interpretation. Sampling helps propose definitions; full-dataset validation is required to establish keys, conversions, and relationships. Invalid records need specific, recoverable outcomes rather than silent deletion.
+
+After verified publication, the exact imported dataset should open automatically. Users can search, filter, sort, inspect records, and start a useful view without reconstructing the connection or finding the table manually.
+
+## Customer-owned storage and database-side computation
+
+The intended division is straightforward:
+
+| Information or work | Intended location |
+| --- | --- |
+| Original files | The user's existing storage or explicitly selected customer-controlled storage |
+| Staging rows, published datasets, and retained import recovery data | The chosen supported customer database |
+| Filtering, joins, grouping, aggregation, and heavy query work | The customer database |
+| Schema definitions, stable field/dataset identities, mappings, transformation plans, saved queries, and dashboard layouts | Lightweight versioned VibeDB project records |
+| Preview rows and chart results | Bounded temporary application memory by default |
+| Credentials | Native credential storage, referenced by scoped handles rather than embedded in projects |
+
+Files may be gigabytes in size, so loading must stream with bounded memory and backpressure. The application must not load the whole dataset into one browser array or a model context. Direct PostgreSQL bulk loading and the Supabase adapter need separate capability and recovery qualification.
+
+The app necessarily reads file chunks and displays query results. Metadata and aggregate values can also be sensitive. “Customer-owned data” is not a claim that no data ever leaves the device or that legal obligations disappear. BYOK credentials are sent to the selected provider or target; row samples and result values require a visible sharing choice before inclusion in AI context.
+
+The web surface can design, validate, preview within declared capabilities, compare, and export. Direct privileged database administration belongs behind the guarded desktop bridge. Initial database choice means supported PostgreSQL and Supabase connections; support for every database engine or cross-server analytics is not implied.
+
+## Dashboards that remain useful after the first import
+
+The first dashboard scope is private desktop dashboards with **number/KPI, table, bar chart, and time-series** components. Users should be able to request “monthly sales and top customers,” review the meaning of the measures, adjust filters and formatting, and save the result.
+
+Correctness depends on explicit row grain, keys, relationship cardinality, date/time rules, units, and currencies. Order count is not necessarily row count. Joining customers must not multiply sales. Totals must be computed over the intended full dataset, independently of the grid's visible page or a chart's top-N limit.
+
+Saved dashboards retain definitions and stable references, not full result arrays. They must survive restart, refresh without an AI call, preserve layouts after imports, and report missing permissions, changed fields, stale results, and failed queries distinctly. A query error must never appear as a zero-value result.
+
+The next file is part of the core product: reuse the approved mapping, show changed headings, review append/update/replace behavior, verify publication, and refresh the same dashboard. Repeated delivery must not duplicate publication; business-event deduplication needs its own explicit rules. Combining files, relating datasets, and splitting entities are different operations with different effects.
+
+## Delivery order and completion criteria
+
+The milestone names below follow the full plan. The focused Phase 1 work supports the early schema and assistant foundations; it does not replace these milestones or make every later feature a prerequisite for the first useful business workflow.
+
+| Milestone | Required outcome |
+| --- | --- |
+| **G0 — Generation completion** | Retain a failed candidate, explain the actual blocker, resolve it, recheck, and finish without losing work or looping indefinitely. |
+| **G1 — Generation quality** | Specific relationship names, correct contracts and advisories, bounded recovery, and explicit fulfillment of requested requirements. |
+| **C1 — Connections** | One reliable target/credential model, including a qualified secret-key path in the actual installed desktop build. |
+| **D1 — Design to database** | Faithful editing and persistence, immutable deployment review, verified live state, drift handling, and usable studio handoffs. |
+| **I1 — Conversational CSV** | Preview, material questions, a reviewed import plan, verified publication, and direct opening of the dataset. |
+| **Q1 — Browse and calculate** | Database-side filtering and pagination, saved queries/metrics, and calculations checked against independent SQL. |
+| **B1 — Saved dashboards** | Useful charts and KPIs that survive restart and refresh correctly using the customer database. |
+| **U1 — Update and consolidate** | Repeat imports, append/update/replace, and multi-file operations preserve identities and existing dashboards. |
+| **L1 — Large-file qualification** | Measured loading, bounded memory, complete row accounting, and interruption recovery; 1 GB and 5 GB fixtures are targets, not established performance claims. |
+| **X1 — Genuine Excel** | Sheet and header selection, workbook date systems, formatted identifiers, formula/cached-value handling, and separately measured workbook limits. |
+| **M1 — Daily management** | Durable SQL drafts, clear design-versus-live execution, qualified transaction behavior, and reviewed record maintenance with stable keys and conflict detection. |
+| **R1 — Release qualification** | Both end-to-end journeys work in the declared supported runtime, backend, and installed artifact, with external gates reported accurately. |
+
+The first business delivery target is deliberately concrete: **sales CSV → customer database → browse records → save monthly-sales and top-customer views → quit/reopen → import the next file → refresh the same dashboard with correct totals**. It includes an interrupted import and a lost-acknowledgement recovery case. The schema journey also needs prompt → accepted design → edit/save/restart → reviewed deploy → verified catalog → drift reconciliation.
+
+## Verification and research direction
+
+Progress should be judged by reproducible journeys and semantic evidence. Planned checks include real schema fixtures, executable PGlite verification, Chromium and WebKit behavior, real PostgreSQL round trips, explicitly disposable Supabase tests, permitted real-provider samples, and installed Tauri artifact checks. Local tests do not substitute for external gates, packaging, signing/notarization where required, or measured large-file behavior.
+
+The compiler-in-the-loop architecture also provides a possible research direction: how deterministic analysis, bounded repair, revision-aware context, parallel evidence gathering, and executable feedback affect intent fulfillment and reliable schema evolution. Useful evaluation would compare alternatives on completion, semantic correctness, unintended changes, cost, latency, and recovery. This is a proposed research program, not a claim of established novelty or a validated research result.
+
+## Deliberately later scope
+
+Additional SQL engines, cross-database analytics, public/shared web dashboards, scheduled work while the device is off, and customer-side materialized summaries need separate execution and access designs. ORM and other exports need explicit mappings and target-toolchain validation. Broader exact support for functions, triggers, extensions, namespaces, and advanced objects must extend representation, parser, emitter, catalog, comparison, persistence, and proof together.
+
+These possibilities remain visible without delaying generation reliability or the first complete spreadsheet-to-dashboard workflow. The detailed plans define the acceptance criteria; this documentation update does not implement them or change the repository's licensing terms.
